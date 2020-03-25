@@ -1,6 +1,3 @@
-[submodule "lib/--force"]
-	path = lib/--force
-	url = https://github.com/pavithra-mahamani/couchbase_sdk_client.git
 [submodule "lib/couchbase_sdk_client"]
 	path = lib/couchbase_sdk_client
 	url = https://github.com/pavithra-mahamani/couchbase_sdk_client.git
