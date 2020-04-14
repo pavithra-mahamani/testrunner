@@ -37,7 +37,7 @@ class basic_collections(BaseTestCase):
                                proxyPort=11220)
 
     def tearDown(self):
-        RestConnection(self.master).delete_all_buckets()
+        #RestConnection(self.master).delete_all_buckets()
 
     def suite_tearDown(self):
         pass
