@@ -134,12 +134,11 @@ class basic_collections(BaseTestCase):
         self.scope_num = self.input.param("num_scopes", 10)
         self.collection_num = self.input.param("num_collections", 10)
         self.bucket_name = self.input.param("bucket", self.default_bucket_name)
-
         try:
-		self.rest.async_create_scope_collection(self.scope_num, self.collection_num, self.bucket_name)
+	    self.rest.async_create_scope_collection(self.scope_num, self.collection_num, self.bucket_name)
         except:
             pass
-	create = time.time()
+        create = time.time()
         self.log.info("{} scopes with {} collections each created in {} s"
                       .format(self.scope_num, self.collection_num, round(create - start)))
         time.sleep(5)
