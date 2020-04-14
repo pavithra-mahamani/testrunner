@@ -2,6 +2,7 @@ package com.couchbase.javaclient;
 
 import java.time.Duration;
 
+import com.couchbase.client.core.env.CompressionConfig;
 import com.couchbase.client.core.env.LoggerConfig;
 import com.couchbase.client.core.env.TimeoutConfig;
 import com.couchbase.client.java.Bucket;
@@ -37,6 +38,8 @@ public class ConnectionFactory {
 	private Cluster connectCluster(String clusterName, String username, String password) {
 		try {
 			environment = ClusterEnvironment.builder()
+					.compressionConfig(CompressionConfig
+					        .enable(true))
 					.loggerConfig(LoggerConfig.fallbackToConsole(false).disableSlf4J(true))
 					.timeoutConfig(TimeoutConfig.kvTimeout(Duration.ofSeconds(5))).build();
 			cluster = Cluster.connect(clusterName,

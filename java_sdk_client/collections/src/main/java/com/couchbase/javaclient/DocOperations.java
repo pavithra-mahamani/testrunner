@@ -1,9 +1,7 @@
 package com.couchbase.javaclient;
 
-import java.util.concurrent.Executors;
 import java.util.concurrent.ForkJoinPool;
 import java.util.concurrent.ForkJoinTask;
-import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.TimeUnit;
 
 import com.couchbase.client.java.Bucket;
@@ -12,9 +10,6 @@ import com.couchbase.client.java.Collection;
 import com.couchbase.javaclient.doc.DocSpec;
 import com.couchbase.javaclient.doc.DocSpecBuilder;
 import com.couchbase.javaclient.reactive.DocCreate;
-import com.couchbase.javaclient.reactive.DocDelete;
-import com.couchbase.javaclient.reactive.DocRetrieve;
-import com.couchbase.javaclient.reactive.DocUpdate;
 
 import net.sourceforge.argparse4j.ArgumentParsers;
 import net.sourceforge.argparse4j.inf.ArgumentParser;
@@ -27,8 +22,8 @@ public class DocOperations {
 				.defaultHelp(true).description("Standalone SDK Client");
 		// Connection params
 		parser.addArgument("-i", "--cluster").required(true).help("Couchbase cluster address");
-		parser.addArgument("-u", "--username").setDefault("Administrator").help("Username of Couchbase user");
-		parser.addArgument("-p", "--password").setDefault("password").help("Password of Couchbase user");
+//		parser.addArgument("-u", "--username").required(false).setDefault("Administrator").help("Username of Couchbase user");
+//		parser.addArgument("-p", "--password").required(false).setDefault("password").help("Password of Couchbase user");
 		parser.addArgument("-b", "--bucket").setDefault("default").help("Name of existing Couchbase bucket");
 		parser.addArgument("-s", "--scope").setDefault("_default").help("Name of existing scope");
 		parser.addArgument("-c", "--collection").setDefault("default").help("Name of existing collection");
@@ -41,6 +36,8 @@ public class DocOperations {
 		.help("Percentage of updates out of num_ops");
 		parser.addArgument("-pd", "--percent_delete").type(Integer.class).setDefault(10)
 		.help("Percentage of deletes out of num_ops");
+		parser.addArgument("-pr", "--percent_read").type(Integer.class).setDefault(0)
+		.help("Percentage of reads out of num_ops");
 		parser.addArgument("-l", "--load_pattern").choices("uniform", "sparse", "dense").setDefault("uniform")
 		.help("uniform: load all collections with same number of docs, "
 				+ "sparse: load all collections with random number of docs closer to lower bound, "
@@ -59,16 +56,17 @@ public class DocOperations {
 
 		try {
 			Namespace ns = parser.parseArgs(args);
+			System.out.println(parser.parseArgs(args));
 			run(ns);
 		} catch (ArgumentParserException e) {
-			parser.handleError(e);
+			//parser.handleError(e);
 		}
 	}
 
 	private static void run(Namespace ns) {
 		String clusterName = ns.getString("cluster");
-		String username = ns.getString("username");
-		String password = ns.getString("password");
+		String username = "Administrator";
+		String password = "password";
 		String bucketName = ns.getString("bucket");
 		String scopeName = ns.getString("scope");
 		String collectionName = ns.getString("collection");
