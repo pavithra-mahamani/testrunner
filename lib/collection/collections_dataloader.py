@@ -20,13 +20,16 @@ class DockerManager(object):
                                                         detach=True)
             for line in self.handle.logs(stream=True):
                 print(line.strip())
-            #self.handle.wait()
+            self.client.wait(self.handle.id)
+            self.client.remove_container(self.handle.id)
         except ConnectionError as e:
             print('Error connecting to docker service, please start/restart it:', e)    
 
-    def _list_images(self):
+    def _list_containers(self):
+        images = []
         for image in self.client.images.list():
-            print(image.id)
+            images.append(image.id)
+        return images
 
     def check_status(self):
         pass
@@ -35,14 +38,15 @@ class DockerManager(object):
         pass
 
     def terminate(self):
-        pass
+        for container in self._list_images():
+            container.stop()
 
 class JavaSDKClient(object):
     def __init__(self, server, bucket, params):
         self.server = server
         self.bucket = bucket
         self.params = params
-        self.do_ops()
+
 
     def params_to_environment(self):
         _environment = {}
@@ -68,27 +72,5 @@ class JavaSDKClient(object):
     def do_ops(self):
         # 1 docker image per bucket, identified by server_bucket tag
         self.docker_instance = DockerManager(self.server.ip + '_' + self.bucket)
-        self.docker_instance._list_images()
         env = self.params_to_environment()
         self.docker_instance.start(env)
-
-
-# environment = {"CLUSTER":"172.23.106.121",
-#                "BUCKET":"default",
-#                "SCOPE":"_default",
-#                "COLLECTION":"default",
-#                "OP":"verify",
-#                "N":1000
-#                }
-# client = docker.from_env()
-# res = client.containers.run("cb:latest", environment=environment,detach=True)
-#
-#
-# blocking_events=["EndpointConnectionFailedEvent", "SelectBucketFailedEvent"]
-# #res.wait()
-# for line in res.logs(stream=True):
-#     print(line.strip())
-#     for event in blocking_events:
-#         if event in line.decode():
-#             print("exiting because of ", event)
-#             exit(-1)
