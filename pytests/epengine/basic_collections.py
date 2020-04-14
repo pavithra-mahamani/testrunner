@@ -135,7 +135,8 @@ class basic_collections(BaseTestCase):
         create = time.time()
         self.log.info("{} scopes with {} collections each created in {} s"
                       .format(self.scope_num, self.collection_num, round(create - start)))
-        if load:
+        time.sleep(5)
+	if load:
             self.enable_bloom_filter = self.input.param("enable_bloom_filter", False)
             self.buckets = RestConnection(self.master).get_buckets()
             self.cluster = Cluster()
