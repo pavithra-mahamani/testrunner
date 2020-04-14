@@ -106,7 +106,7 @@ class BaseTestCase(unittest.TestCase):
             self.cbas_node = self.cbas_servers[0]
 
         try:
-            self.skip_setup_cleanup = self.input.param("skip_setup_cleanup", False)
+            self.skip_setup_cleanup = self.input.param("skip_setup_cleanup", True)
             self.vbuckets = self.input.param("vbuckets", 1024)
             self.collection=self.input.param("collection", False)
             self.scope_num=self.input.param("scope_num", 4)

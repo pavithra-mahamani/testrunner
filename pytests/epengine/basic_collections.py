@@ -27,17 +27,20 @@ class basic_collections(BaseTestCase):
         self.master = self.servers[0]
         self.use_rest = self.input.param("use_rest", True)
         self.use_cli = self.input.param("use_cli", False)
-        self.num_items = self.input.param("items", 10000)
+        self.num_items = self.input.param("items", 100000)
         self.value_size = self.input.param("value_size", 512)
         self.rest = Collections_Rest(self.master)
         self.cli = Collections_CLI(self.master)
         #self.cli.enable_dp()
         self.conn = RestConnection(self.master)
-        self.conn.delete_all_buckets()
+        #self.conn.delete_all_buckets()
         time.sleep(5)
-        self.conn.create_bucket(bucket=self.default_bucket_name,
+        try:
+            self.conn.create_bucket(bucket=self.default_bucket_name,
                                ramQuotaMB=256,
                                proxyPort=11220)
+        except Exception as e:
+            pass
         time.sleep(5)
 
     def tearDown(self):
@@ -182,8 +185,8 @@ class basic_collections(BaseTestCase):
         self.cluster = Cluster()
         self.active_resident_threshold = 100
 
-        self.gen_create = SDKDataLoader(num_ops=self.num_items, percent_create=100, percent_update=0,
-                                        percent_delete=0)
+        self.gen_create = SDKDataLoader(num_ops=self.num_items, percent_create=80, percent_update=20,
+                                        percent_delete=20)
         self._load_all_buckets(self.master, self.gen_create)
         load = time.time()
         self.log.info("Done loading {} collections in bucket {} in {}s"
