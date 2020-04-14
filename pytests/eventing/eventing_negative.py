@@ -98,6 +98,7 @@ class EventingNegative(EventingBaseTest):
                                                                     bucket_params=bucket_params))
         for task in tasks:
             task.result()
+        self.sleep(10)
         body = self.create_save_function_body(self.function_name, HANDLER_CODE.BUCKET_OPS_ON_UPDATE, worker_count=3)
         try:
             self.rest.save_function(body['appname'], body)
@@ -148,10 +149,10 @@ class EventingNegative(EventingBaseTest):
             self.pause_function(body)
         # delete source, metadata and destination buckets when eventing is processing_mutations
         for bucket in self.buckets:
-                self.log.info("deleting bucket: %s",bucket.name)
+                self.log.info("deleting bucket: %s", bucket.name)
                 self.rest.delete_bucket(bucket.name)
         # Wait for function to get undeployed automatically
-        self.wait_for_handler_state(body['appname'],"undeployed")
+        self.wait_for_handler_state(body['appname'], "undeployed")
         # Delete the function
         self.delete_function(body)
         self.sleep(60)
@@ -173,7 +174,7 @@ class EventingNegative(EventingBaseTest):
             self.log.info("deleting bucket: %s", bucket.name)
             self.rest.delete_bucket(bucket.name)
         # Wait for function to get undeployed automatically
-        self.wait_for_handler_state(body['appname'],"undeployed")
+        self.wait_for_handler_state(body['appname'], "undeployed")
         # Delete the function
         self.delete_function(body)
         self.sleep(60)
@@ -191,10 +192,10 @@ class EventingNegative(EventingBaseTest):
         # delete source, metadata and destination buckets when eventing is processing_mutations
         for bucket in self.buckets:
             if bucket.name == "src_bucket":
-                self.log.info("deleting bucket: %s",bucket.name)
+                self.log.info("deleting bucket: %s", bucket.name)
                 self.rest.delete_bucket(bucket.name)
         # Wait for function to get undeployed automatically
-        self.wait_for_handler_state(body['appname'],"undeployed")
+        self.wait_for_handler_state(body['appname'], "undeployed")
         # Delete the function
         self.delete_function(body)
         self.sleep(60)
@@ -212,10 +213,10 @@ class EventingNegative(EventingBaseTest):
         # delete source, metadata and destination buckets when eventing is processing_mutations
         for bucket in self.buckets:
             if bucket.name == "metadata":
-                self.log.info("deleting bucket: %s",bucket.name)
+                self.log.info("deleting bucket: %s", bucket.name)
                 self.rest.delete_bucket(bucket.name)
         # Wait for function to get undeployed automatically
-        self.wait_for_handler_state(body['appname'],"undeployed")
+        self.wait_for_handler_state(body['appname'], "undeployed")
         # Delete the function
         self.delete_function(body)
         self.sleep(60)
@@ -379,7 +380,7 @@ class EventingNegative(EventingBaseTest):
         body = self.create_save_function_body(self.function_name, HANDLER_CODE.BUCKET_OPS_ON_UPDATE)
         self.deploy_function(body)
         self.pause_function(body)
-        self.resume_function(body,wait_for_resume=False)
+        self.resume_function(body, wait_for_resume=False)
         try:
             self.delete_function(body)
             self.fail("application is paused even before deployment")

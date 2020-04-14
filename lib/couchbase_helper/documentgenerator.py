@@ -7,18 +7,44 @@ from string import ascii_lowercase
 from string import digits
 import gzip
 from testconstants import DEWIKI, ENWIKI, ESWIKI, FRWIKI
-from data import FIRST_NAMES, LAST_NAMES, DEPT, LANGUAGES
+from .data import FIRST_NAMES, LAST_NAMES, DEPT, LANGUAGES
 
 class KVGenerator(object):
     def __init__(self, name, start, end):
         self.name = name
-        self.start = start
-        self.end = end
-        self.itr = start
+        try:
+            self.start = int(start)
+        except ValueError:
+            self.start = 0
+            pass
+
+        try:
+            self.end = int(end)
+        except ValueError:
+            self.end = 0
+            pass
+
+        try:
+            self.itr = int(start)
+        except ValueError:
+            self.itr = 0
+            pass
+
     def has_next(self):
+        try:
+            self.itr = int(self.itr)
+        except ValueError:
+            self.itr = 0
+            pass
+        try:
+            self.end = int(self.end)
+        except ValueError:
+            self.end = 0
+            pass
+
         return self.itr < self.end
 
-    def next(self):
+    def __next__(self):
         raise NotImplementedError
 
     def reset(self):
@@ -29,6 +55,10 @@ class KVGenerator(object):
 
     def __len__(self):
         return self.end - self.start
+
+    # is a python generator function
+    def isGenerator(self):
+        return True
 
 class DocumentGenerator(KVGenerator):
     """ An idempotent document generator."""
@@ -74,18 +104,20 @@ class DocumentGenerator(KVGenerator):
 
     Returns:
         The document generated"""
-    def next(self):
+    def __next__(self):
         if self.itr >= self.end:
             raise StopIteration
         seed = self.itr
         doc_args = []
         for arg in self.args:
-            value = arg[seed % len(arg)]
+            value = arg[int(seed % len(arg))]
             doc_args.append(value)
-            seed /= len(arg)
+            seed //= len(arg)
         doc = self.template.format(*doc_args).replace('\'', '"').replace('True',
                              'true').replace('False', 'false').replace('\\', '\\\\')
+
         json_doc = json.loads(doc)
+
         if self.name == "random_keys":
             """ This will generate a random ascii key with 12 characters """
             json_doc['_id'] = ''.join(choice(ascii_uppercase+ascii_lowercase+digits) \
@@ -93,7 +125,8 @@ class DocumentGenerator(KVGenerator):
         else:
             json_doc['_id'] = self.name + '-' + str(self.itr)
         self.itr += 1
-        return json_doc['_id'], json.dumps(json_doc).encode("ascii", "ignore")
+        #print("-->json dumps#{}:{}:{}".format(self.itr, json_doc['_id'],jsondumps))
+        return json_doc['_id'], json.dumps(json_doc)
 
 class SubdocDocumentGenerator(KVGenerator):
     """ An idempotent document generator."""
@@ -118,7 +151,7 @@ class SubdocDocumentGenerator(KVGenerator):
         self.args = args
         self.template = template
 
-        print type(self.template)
+        print(type(self.template))
 
         size = 0
         if not len(self.args) == 0:
@@ -139,7 +172,7 @@ class SubdocDocumentGenerator(KVGenerator):
 
     Returns:
         The document generated"""
-    def next(self):
+    def __next__(self):
         if self.itr >= self.end:
             raise StopIteration
 
@@ -153,7 +186,7 @@ class BlobGenerator(KVGenerator):
         self.value_size = value_size
         self.itr = self.start
 
-    def next(self):
+    def __next__(self):
         if self.itr >= self.end:
             raise StopIteration
 
@@ -186,7 +219,7 @@ class BatchedDocumentGenerator(object):
         count = 0
         key_val = {}
         while count < self._batch_size and self.has_next():
-            key, val = self._doc_gen.next()
+            key, val = next(self._doc_gen)
             key_val[key] = val
             count += 1
         return key_val
@@ -200,7 +233,7 @@ class JSONNonDocGenerator(KVGenerator):
         self.values = values
         self.itr = self.start
 
-    def next(self):
+    def __next__(self):
         if self.itr >= self.end:
             raise StopIteration
 
@@ -218,7 +251,7 @@ class Base64Generator(KVGenerator):
         self.values = values
         self.itr = self.start
 
-    def next(self):
+    def __next__(self):
         if self.itr >= self.end:
             raise StopIteration
 
@@ -282,7 +315,7 @@ class JsonDocGenerator(KVGenerator):
                 size *= len(arg)
 
         KVGenerator.__init__(self, name, 0, size)
-        random.seed(0)
+        random.seed(0,1)
 
         if 'start' in kwargs:
             self.start = int(kwargs['start'])
@@ -291,7 +324,7 @@ class JsonDocGenerator(KVGenerator):
             self.end = int(kwargs['end'])
 
         if op_type == "create":
-            for count in xrange(self.start+1, self.end+1, 1):
+            for count in range(self.start+1, self.end+1, 1):
                 emp_name = self.generate_name()
                 doc_dict = {
                             'emp_id': str(10000000+int(count)),
@@ -309,12 +342,12 @@ class JsonDocGenerator(KVGenerator):
                 if doc_dict["is_manager"]:
                     doc_dict['manages'] = {'team_size': random.randint(5, 10)}
                     doc_dict['manages']['reports'] = []
-                    for _ in xrange(0, doc_dict['manages']['team_size']):
+                    for _ in range(0, doc_dict['manages']['team_size']):
                         doc_dict['manages']['reports'].append(self.generate_name())
                 self.gen_docs[count-1] = doc_dict
         elif op_type == "delete":
             # for deletes, just keep/return empty docs with just type field
-            for count in xrange(self.start, self.end):
+            for count in range(self.start, self.end):
                 self.gen_docs[count] = {'type': 'emp'}
 
     def update(self, fields_to_update=None):
@@ -324,8 +357,8 @@ class JsonDocGenerator(KVGenerator):
                    regenerate in a doc during update. If this is 'None', by
                    default for this dataset, 'salary' field is regenerated.
         """
-        random.seed(1)
-        for count in xrange(self.start, self.end):
+        random.seed(1,1)
+        for count in range(self.start, self.end):
             doc_dict = self.gen_docs[count]
             if fields_to_update is None:
                 doc_dict['salary'] = self.generate_salary()
@@ -339,7 +372,7 @@ class JsonDocGenerator(KVGenerator):
                     if doc_dict["is_manager"]:
                         doc_dict['manages'] = {'team_size': random.randint(5,10)}
                         doc_dict['manages']['reports'] = []
-                        for _ in xrange(0, doc_dict['manages']['team_size']):
+                        for _ in range(0, doc_dict['manages']['team_size']):
                             doc_dict['manages']['reports'].append(self.generate_name())
                 if 'languages_known' in fields_to_update:
                     doc_dict['languages_known'] = self.generate_lang_known()
@@ -352,11 +385,11 @@ class JsonDocGenerator(KVGenerator):
                     doc_dict['manages'] = {}
                     doc_dict['manages']['team_size'] = random.randint(5, 10)
                     doc_dict['manages']['reports'] = []
-                    for _ in xrange(0, doc_dict['manages']['team_size']):
+                    for _ in range(0, doc_dict['manages']['team_size']):
                         doc_dict['manages']['reports'].append(self.generate_name())
             self.gen_docs[count] = doc_dict
 
-    def next(self):
+    def __next__(self):
         if self.itr >= self.end:
             raise StopIteration
         doc = self.gen_docs[self.itr]
@@ -414,7 +447,7 @@ class WikiJSONGenerator(KVGenerator):
 
         {
            "revision": {
-              "comment": "robot Modifying: [[bar:Apr\u00fc]]",
+              "comment": "robot Modifying: [[bar:Apr\\u00fc]]",
               "timestamp": "2010-05-13T20:42:11Z",
               "text": {
                  "@xml:space": "preserve",
@@ -453,7 +486,7 @@ class WikiJSONGenerator(KVGenerator):
                 size *= len(arg)
 
         KVGenerator.__init__(self, name, 0, size)
-        random.seed(0)
+        random.seed(0,1)
 
         if 'start' in kwargs:
             self.start = int(kwargs['start'])
@@ -465,7 +498,7 @@ class WikiJSONGenerator(KVGenerator):
             self.read_from_wiki_dump()
         elif op_type == "delete":
             # for deletes, just keep/return empty docs with just type field
-            for count in xrange(self.start, self.end):
+            for count in range(self.start, self.end):
                 self.gen_docs[count] = {'type': 'wiki'}
 
     def read_from_wiki_dump(self):
@@ -486,16 +519,16 @@ class WikiJSONGenerator(KVGenerator):
             except IOError:
                 lang = self.lang.lower()
                 wiki = eval("{0}WIKI".format(self.lang))
-                print ("Unable to find file lib/couchbase_helper/wiki/"
+                print(("Unable to find file lib/couchbase_helper/wiki/"
                        "{0}wiki.txt.gz. Downloading from {1}...".
-                       format(lang, wiki))
-                import urllib
-                urllib.URLopener().retrieve(
+                       format(lang, wiki)))
+                import urllib.request, urllib.parse, urllib.error
+                urllib.request.URLopener().retrieve(
                     wiki,
                     "lib/couchbase_helper/wiki/{0}wiki.txt.gz".format(lang))
-                print "Download complete!"
+                print("Download complete!")
 
-    def next(self):
+    def __next__(self):
         if self.itr >= self.end:
             raise StopIteration
         doc = {}
@@ -560,7 +593,7 @@ class GeoSpatialDataLoader(KVGenerator):
                 size *= len(arg)
 
         KVGenerator.__init__(self, name, 0, size)
-        random.seed(0)
+        random.seed(0,1)
 
         if 'start' in kwargs:
             self.start = int(kwargs['start'])
@@ -572,7 +605,7 @@ class GeoSpatialDataLoader(KVGenerator):
             self.read_from_dump()
         elif op_type == "delete":
             # for deletes, just keep/return empty docs with just type field
-            for count in xrange(self.start, self.end):
+            for count in range(self.start, self.end):
                 self.gen_docs[count] = {'type': 'earthquake'}
 
     def read_from_dump(self):
@@ -600,7 +633,7 @@ class GeoSpatialDataLoader(KVGenerator):
             print ("Unable to find file lib/couchbase_helper/"
                        "geospatial/earthquakes.json, data not loaded!")
 
-    def next(self):
+    def __next__(self):
         if self.itr >= self.end:
             raise StopIteration
         doc = {}
@@ -612,3 +645,28 @@ class GeoSpatialDataLoader(KVGenerator):
         self.itr += 1
         return self.name+str(self.itr),\
                json.dumps(doc, indent=3).encode(self.encoding, "ignore")
+
+class SDKDataLoader(object):
+    # type: (int, int, int, int, str, int, str, str, list, list, str, bool)
+    def __init__(self, num_ops, percent_create, percent_update, percent_delete, load_pattern="uniform",
+                  start_seq_num=1, key_prefix="doc_", key_suffix=None,
+                 scope=["_default"], collection=["default"], json_template="Person", print_sdk_logs=True):
+        #TODO : doc_size, batch_size, pause_secs, timeout, expiry
+        self.num_ops = num_ops
+        self.percent_create = percent_create
+        self.percent_update = percent_update
+        self.percent_delete = percent_delete
+        self.load_pattern = load_pattern
+        self.start_seq_num = start_seq_num
+        self.key_prefix = key_prefix
+        self.key_suffix = key_suffix
+        self.scope = scope
+        self.collection = collection
+        self.json_template = json_template
+        self.print_sdk_logs = print_sdk_logs
+
+    def isGenerator(self):
+        return False
+
+
+
