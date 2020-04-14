@@ -38,7 +38,7 @@ class basic_collections(BaseTestCase):
         self.conn.create_bucket(bucket=self.default_bucket_name,
                                ramQuotaMB=256,
                                proxyPort=11220)
-	time.sleep(5)
+        time.sleep(5)
 
     def tearDown(self):
         self.conn.delete_all_buckets()
