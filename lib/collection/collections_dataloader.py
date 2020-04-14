@@ -17,7 +17,7 @@ class DockerManager(object):
             self.handle = self.client.containers.run("jsc:" + self.tag,
                                                         environment=self.environment,
                                                         detach=True)
-        
+            self.handle.wait()        
         except ConnectionError as e:
             print('Error connecting to docker service, please start/restart it:', e)    
 
