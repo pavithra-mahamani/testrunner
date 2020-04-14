@@ -6,19 +6,20 @@ class DockerManager(object):
     def __init__(self, tag):
         self.tag = tag
         self.environment = None
-        self.client = Client(base_url='unix://var/run/docker.sock')
+        self.client = docker.from_env()
         self.handle = None
 
     def start(self, env):
         self.environment = env
         try:
-            self.client = docker.from_env()
-            self.client.cre
-            self.handle = self.client.containers.run("cb:latest",
+            image = self.client.images.get("jsc:latest")
+            image.tag("jsc", tag=self.tag)
+            self.handle = self.client.containers.run("jsc:" + self.tag,
                                                         environment=self.environment,
                                                         detach=True)
+        
         except ConnectionError as e:
-            print('Error connecting to docker service, please start/restart it:', e)
+            print('Error connecting to docker service, please start/restart it:', e)    
 
     def _list_images(self):
         for image in self.client.images.list():
@@ -42,6 +43,7 @@ class JavaSDKClient(object):
         self.docker_instance = DockerManager(server.ip + '_' + bucket)
         env = self.params_to_environment()
         self.docker_instance.start(env)
+        self.docker_instance._list_images()
 
     def params_to_environment(self):
         _environment = {}
