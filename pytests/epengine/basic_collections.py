@@ -9,6 +9,7 @@ from TestInput import TestInputSingleton, TestInputServer
 from membase.api.rest_client import RestConnection
 from couchbase_helper.cluster import Cluster
 import logger
+import time
 
 from lib.couchbase_helper.documentgenerator import SDKDataLoader
 
@@ -31,14 +32,21 @@ class basic_collections(BaseTestCase):
         self.rest = Collections_Rest(self.master)
         self.cli = Collections_CLI(self.master)
         #self.cli.enable_dp()
-        RestConnection(self.master).delete_all_buckets()
-        RestConnection(self.master).create_bucket(bucket=self.default_bucket_name,
+        self.conn = RestConnection(self.master)
+        self.conn.delete_all_buckets()
+        time.sleep(5)
+        self.conn.create_bucket(bucket=self.default_bucket_name,
                                ramQuotaMB=256,
                                proxyPort=11220)
+        buckets = self.conn.get_buckets()
+        while self.default_bucket_name not in buckets:
+            time.sleep(1)
+            buckets = self.conn.get_buckets()
+            if self.default_bucket_name in buckets:
+                break
 
     def tearDown(self):
-        pass
-        #RestConnection(self.master).delete_all_buckets()
+        self.conn.delete_all_buckets()
 
     def suite_tearDown(self):
         pass
@@ -139,7 +147,7 @@ class basic_collections(BaseTestCase):
         time.sleep(5)
         if load:
             self.enable_bloom_filter = self.input.param("enable_bloom_filter", False)
-            self.buckets = RestConnection(self.master).get_buckets()
+            self.buckets = self.conn.get_buckets()
             self.cluster = Cluster()
             self.active_resident_threshold = 100
 
@@ -209,3 +217,4 @@ class basic_collections(BaseTestCase):
 
         except MemcachedError as exp:
             self.fail("Exception with setting and getting the key in collections {0}".format(exp))
+
