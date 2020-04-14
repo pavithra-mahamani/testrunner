@@ -1,5 +1,4 @@
 import docker
-from docker import Client
 from requests.exceptions import ConnectionError
 
 
