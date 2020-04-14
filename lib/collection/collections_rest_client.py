@@ -47,7 +47,6 @@ class Collections_Rest(object):
         for s in range(1, scope_num):
             scope = "scope_" + str(s)
             self.create_scope(bucket, scope)
-            time.sleep(5)
             for c in range(1, collection_num):
                 task = self.CollectionFactory(bucket, scope, "collection_" + str(c), self.rest)
                 task.start()

@@ -11,13 +11,16 @@ class DockerManager(object):
 
     def start(self, env):
         self.environment = env
+        print(self.environment)
         try:
             image = self.client.images.get("jsc:latest")
             image.tag("jsc", tag=self.tag)
             self.handle = self.client.containers.run("jsc:" + self.tag,
                                                         environment=self.environment,
                                                         detach=True)
-            self.handle.wait()        
+            for line in self.handle.logs(stream=True):
+                print(line.strip())
+            #self.handle.wait()
         except ConnectionError as e:
             print('Error connecting to docker service, please start/restart it:', e)    
 
@@ -39,17 +42,13 @@ class JavaSDKClient(object):
         self.server = server
         self.bucket = bucket
         self.params = params
-        # 1 docker image per bucket, identified by server_bucket tag
-        self.docker_instance = DockerManager(server.ip + '_' + bucket)
-        env = self.params_to_environment()
-        self.docker_instance.start(env)
-        self.docker_instance._list_images()
+        self.do_ops()
 
     def params_to_environment(self):
         _environment = {}
         _environment["CLUSTER"] = self.server.ip
-        _environment["USERNAME"] = self.server.rest_username
-        _environment["PASSWORD"] = self.server.rest_password
+        # _environment["USERNAME"] = self.server.rest_username
+        # _environment["PASSWORD"] = self.server.rest_password
         _environment["BUCKET"] = self.bucket
         _environment["SCOPE"] = self.params.scope
         _environment["COLLECTION"] = self.params.collection
@@ -58,6 +57,7 @@ class JavaSDKClient(object):
         _environment["PU"] = self.params.percent_update
         _environment["PD"] = self.params.percent_delete
         _environment["L"] = self.params.load_pattern
+        _environment["DSN"] = self.params.start_seq_num
         _environment["DPX"] = self.params.key_prefix
         _environment["DSX"] = self.params.key_suffix
         _environment["DT"] = self.params.json_template
@@ -66,7 +66,12 @@ class JavaSDKClient(object):
         return _environment
 
     def do_ops(self):
-        pass
+        # 1 docker image per bucket, identified by server_bucket tag
+        self.docker_instance = DockerManager(self.server.ip + '_' + self.bucket)
+        self.docker_instance._list_images()
+        env = self.params_to_environment()
+        self.docker_instance.start(env)
+
 
 # environment = {"CLUSTER":"172.23.106.121",
 #                "BUCKET":"default",

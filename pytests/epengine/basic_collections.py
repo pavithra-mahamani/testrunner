@@ -27,7 +27,7 @@ class basic_collections(BaseTestCase):
         self.master = self.servers[0]
         self.use_rest = self.input.param("use_rest", True)
         self.use_cli = self.input.param("use_cli", False)
-        self.num_items = self.input.param("items", 100000)
+        self.num_items = self.input.param("items", 10000)
         self.value_size = self.input.param("value_size", 512)
         self.rest = Collections_Rest(self.master)
         self.cli = Collections_CLI(self.master)
@@ -41,7 +41,8 @@ class basic_collections(BaseTestCase):
         time.sleep(5)
 
     def tearDown(self):
-        self.conn.delete_all_buckets()
+        pass
+        #self.conn.delete_all_buckets()
 
     def suite_tearDown(self):
         pass
@@ -128,7 +129,7 @@ class basic_collections(BaseTestCase):
                 else:
                     self.log.info("Collection creation failed as expected for name={}".format(name))
 
-    def test_bulk_create_from_counts(self, load=False):
+    def test_bulk_create_from_counts(self):
         import time
         start = time.time()
         self.scope_num = self.input.param("num_scopes", 10)
@@ -142,18 +143,6 @@ class basic_collections(BaseTestCase):
         self.log.info("{} scopes with {} collections each created in {} s"
                       .format(self.scope_num, self.collection_num, round(create - start)))
         time.sleep(5)
-        if load:
-            self.enable_bloom_filter = self.input.param("enable_bloom_filter", False)
-            self.buckets = self.conn.get_buckets()
-            self.cluster = Cluster()
-            self.active_resident_threshold = 100
-
-            self.gen_create = SDKDataLoader(num_ops=self.num_items, percent_create=100, percent_update=0, percent_delete=0)
-            self._load_all_buckets(self.master, self.gen_create)
-            load = time.time()
-            self.log.info("Done loading {} collections in bucket {} in {}s"
-                          .format(self.collection_num, self.bucket_name, round(load - create)))
-
 
     def test_bulk_create_from_map(self):
         import time
@@ -174,7 +163,31 @@ class basic_collections(BaseTestCase):
             self.log.info("default collection delete failed as expected")
 
     def test_load_collection(self):
-        self.test_bulk_create_from_counts(load=True)
+        import time
+        start = time.time()
+        self.scope_num = self.input.param("num_scopes", 5)
+        self.collection_num = self.input.param("num_collections", 5)
+        self.bucket_name = self.input.param("bucket", self.default_bucket_name)
+        try:
+            self.rest.async_create_scope_collection(self.scope_num, self.collection_num, self.bucket_name)
+        except:
+            pass
+        create = time.time()
+        self.log.info("{} scopes with {} collections each created in {} s"
+                      .format(self.scope_num, self.collection_num, round(create - start)))
+        time.sleep(5)
+
+        self.enable_bloom_filter = self.input.param("enable_bloom_filter", False)
+        self.buckets = self.conn.get_buckets()
+        self.cluster = Cluster()
+        self.active_resident_threshold = 100
+
+        self.gen_create = SDKDataLoader(num_ops=self.num_items, percent_create=100, percent_update=0,
+                                        percent_delete=0)
+        self._load_all_buckets(self.master, self.gen_create)
+        load = time.time()
+        self.log.info("Done loading {} collections in bucket {} in {}s"
+                      .format(self.collection_num, self.bucket_name, round(load - create)))
 
     def test_load_collections_in_scope(self):
         pass
