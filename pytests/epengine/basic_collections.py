@@ -27,7 +27,7 @@ class basic_collections(BaseTestCase):
         self.master = self.servers[0]
         self.use_rest = self.input.param("use_rest", True)
         self.use_cli = self.input.param("use_cli", False)
-        self.num_items = self.input.param("items", 1000)
+        self.num_items = self.input.param("items", 100000)
         self.value_size = self.input.param("value_size", 512)
         self.rest = Collections_Rest(self.master)
         self.cli = Collections_CLI(self.master)
