@@ -20,7 +20,7 @@ class DockerManager(object):
                                                         detach=True)
             for line in self.handle.logs(stream=True):
                 print(line.strip())
-            self.client.remove_container(self.handle.id)
+            #self.client.remove_container(self.handle.id)
         except ConnectionError as e:
             print('Error connecting to docker service, please start/restart it:', e)    
 
