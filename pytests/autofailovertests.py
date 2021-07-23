@@ -134,6 +134,12 @@ class AutoFailoverTests(unittest.TestCase):
     def tearDown(self):
         AutoFailoverBaseTest.common_tearDown(self.servers, self)
 
+    def suite_tearDown(self):
+        pass
+
+    def suite_setUp(self):
+        pass
+
     def sleep(self, timeout=1, message=""):
         self.log.info("sleep for {0} secs. {1} ...".format(timeout, message))
         time.sleep(timeout)
@@ -336,6 +342,7 @@ class AutoFailoverTests(unittest.TestCase):
         replicas = self.input.param("replicas", 1)
         keys_count = self.input.param("keys-count", 0)
         num_buckets = self.input.param("num-buckets", 1)
+        bucket_storage = self.input.param("bucket_storage", 'couchstore')
 
         bucket_name = "default"
         master = self.servers[0]
@@ -353,10 +360,12 @@ class AutoFailoverTests(unittest.TestCase):
             rest.create_bucket(bucket=bucket_name,
                                ramQuotaMB=bucket_ram,
                                replicaNumber=replicas,
-                               proxyPort=info.moxi)
+                               proxyPort=info.moxi,
+                               storageBackend=bucket_storage)
         else:
             created = BucketOperationHelper.create_multiple_buckets(self.master, replicas, howmany=num_buckets,
-                                                                    bucket_ram_ratio=(1.0 / 4.0))
+                                                                    bucket_ram_ratio=(1.0 / 4.0),
+                                                                    bucket_storage=bucket_storage)
             self.assertTrue(created, "unable to create multiple buckets")
 
         buckets = rest.get_buckets()

@@ -13,8 +13,7 @@ from pprint import pprint
 sys.path = ["lib", "pytests", "pysystests"] + sys.path
 
 if sys.hexversion < 0x30706f0:
-    print("Testrunner requires version 3.7.6+ of python")
-    sys.exit()
+    sys.exit("Testrunner requires version 3.7.6+ of python (found: " + sys.version + ")")
 
 import re
 import time
@@ -72,7 +71,7 @@ def parse_args(argv):
                            "jenkins_build_url>' (or) 'file=<filename>' (or) '<regular "
                            "expression>' to include tests in the run. Use -g option to search "
                            "entire conf files. e.g. -d 'failed' or -d 'failed=report.xml' or -d "
-                           "'^2i.*nodes_init=2.*'")
+                           "'^gsi.*nodes_init=2.*'")
     tgroup.add_option("-e", "--exclude_tests", dest="exclude_tests",
                       help="Value can be 'failed' (or) 'passed' (or) 'failed=<junit_xml_path (or) "
                            "jenkins_build_url>' (or) 'passed=<junit_xml_path (or) "
@@ -163,12 +162,17 @@ def process_include_or_filter_exclude_tests(filtertype, option, tests, options):
                     tp, tf = parse_testreport_result_xml(passfail[1])
                 else:
                     tp, tf = parse_junit_result_xml(passfail[1])
+                    if not tp and not tf:
+                        tp, tf = parse_testreport_result_xml(passfail[1])
             elif option.startswith("http://") or option.startswith("https://"):
                 tp, tf = parse_testreport_result_xml(option)
                 tests_list=tp+tf
             else:
                 tp, tf = parse_junit_result_xml()
-
+                if not tp and not tf:
+                    tp, tf = parse_testreport_result_xml()
+            if tp is None and tf is None:
+                return tests
             if option.startswith('failed') and tf:
                 tests_list = tf
             elif option.startswith('passed') and tp:
@@ -351,7 +355,10 @@ def getNodeText(nodelist):
 
 def parse_testreport_result_xml(filepath=""):
     if filepath.startswith("http://") or filepath.startswith("https://"):
-        url_path = filepath+"/testReport/api/xml?pretty=true"
+        if filepath.endswith(".xml"):
+            url_path = filepath
+        else:
+            url_path = filepath+"/testReport/api/xml?pretty=true"
         jobnamebuild = filepath.split('/')
         if not os.path.exists('logs'):
             os.mkdir('logs')
@@ -364,9 +371,10 @@ def parse_testreport_result_xml(filepath=""):
             with open(filepath, 'wb') as f:
                 f.write(datatowrite)
         except Exception as ex:
-            log.error("Error:: "+str(ex)+"! Please check if " + url_path + " URL is accessible!! "
-                                                                        "Exiting...")
-            sys.exit(1)
+            log.error("Error:: "+str(ex)+"! Please check if " +
+                      url_path + " URL is accessible!!")
+            log.info("Running all the tests instead for now.")
+            return None, None
     if filepath == "":
         filepath = "logs/**/*.xml"
     log.info("Loading result data from "+filepath)
@@ -400,8 +408,7 @@ def parse_testreport_result_xml(filepath=""):
 
 def parse_junit_result_xml(filepath=""):
     if filepath.startswith("http://") or filepath.startswith("https://"):
-        parse_testreport_result_xml(filepath)
-        return
+        return parse_testreport_result_xml(filepath)
     if filepath == "":
         filepath = "logs/**/*.xml"
     log.info("Loading result data from "+filepath)
@@ -453,7 +460,7 @@ def get_server_logs(input, path):
             req.headers = create_headers(input.membase_settings.rest_username,
                                          input.membase_settings.rest_password)
             filename = "{0}/{1}-diag.txt".format(path, server.ip)
-            page = urllib.request.urlopen(req)
+            page = urllib.request.urlopen(req, timeout=60)
             with open(filename, 'wb') as output:
                 os.write(1, "downloading {0} ...".format(str(server.ip)).encode())
                 while True:
@@ -487,14 +494,10 @@ def get_logs_cluster_run(input, path, ns_server_path):
         log.error("NOT POSSIBLE TO GRAB LOGS (CLUSTER_RUN)")
 
 def get_cbcollect_info(input, path):
-    for server in input.servers:
-        print(("grabbing cbcollect from {0}".format(server.ip)))
-        path = path or "."
-        try:
-            print(("-->get_cbcollect_info: {}:{},{}:{}".format(type(server),server,type(path),path)))
-            cbcollectRunner(server, path).run()
-        except Exception as e:
-            log.error("NOT POSSIBLE TO GRAB CBCOLLECT FROM {0}: {1}".format(server.ip, e))
+    runner = cbcollectRunner(input.servers, path)
+    runner.run()
+    for (server, e) in runner.fail:
+        log.error("NOT POSSIBLE TO GRAB CBCOLLECT FROM {0}: {1}".format(server.ip, e))
 
 def get_couch_dbinfo(input, path):
     for server in input.servers:
@@ -555,7 +558,7 @@ class StoppableThreadWithResult(Thread):
 
 
 def runtests(names, options, arg_i, arg_p, runtime_test_params):
-    log.info("\nNumber of tests to be executed: " + str(len(names)))
+    log.info("\nNumber of tests initially selected before GROUP filters: " + str(len(names)))
     BEFORE_SUITE = "suite_setUp"
     AFTER_SUITE = "suite_tearDown"
     xunit = XUnitTestResult()
@@ -587,6 +590,8 @@ def runtests(names, options, arg_i, arg_p, runtime_test_params):
        hanging_threads_test_interval = int(TestInputSingleton.input.param("test_interval", 1000))
        monitoring_thread = start_monitoring(seconds_frozen=hanging_threads_frozen_time, test_interval=hanging_threads_test_interval) 
 
+    logs_folder="."
+    test_exec_count=0
     for name in names:
         start_time = time.time()
         argument_split = [a.strip() for a in re.split("[,]?([^,=]+)=", name)[1:]]
@@ -613,9 +618,11 @@ def runtests(names, options, arg_i, arg_p, runtime_test_params):
                 set(runtime_test_params["EXCLUDE_GROUP"].split(";")).issubset(set(params["GROUP"].split(";"))):
                     print(("test '{0}' skipped, is in an excluded group".format(name)))
                     continue
-
+        log.info("--> Running test: {}".format(name))
+        test_exec_count += 1
         # Create Log Directory
         logs_folder = os.path.join(root_log_dir, "test_%s" % case_number)
+        log.info("Logs folder: {}".format(logs_folder))
         os.mkdir(logs_folder)
         test_log_file = os.path.join(logs_folder, "test.log")
         log_config_filename = r'{0}'.format(os.path.join(logs_folder, "test.logging.conf"))
@@ -636,7 +643,7 @@ def runtests(names, options, arg_i, arg_p, runtime_test_params):
         if "get-coredumps" in TestInputSingleton.input.test_params:
             if TestInputSingleton.input.param("get-coredumps", True):
                 clear_old_core_dumps(TestInputSingleton.input, logs_folder)
-        if case_number == 1:
+        if case_number == 1 and "upgrade" not in name and "xdcr" not in name:
             before_suite_name = "%s.%s" % (name[:name.rfind('.')], BEFORE_SUITE)
             try:
                 print(("Run before suite setup for %s" % name))
@@ -696,7 +703,7 @@ def runtests(names, options, arg_i, arg_p, runtime_test_params):
         if TestInputSingleton.input.test_params:
             for key, value in list(TestInputSingleton.input.test_params.items()):
                 if key and value:
-                    params += "," + str(key) + ":" + str(value)
+                    params += "," + str(key) + "=" + str(value)
 
         if result.failures or result.errors:
             # Immediately get the server logs, if
@@ -743,13 +750,39 @@ def runtests(names, options, arg_i, arg_p, runtime_test_params):
             print("test fails, all of the following tests will be skipped!!!")
             break
 
-    after_suite_name = "%s.%s" % (name[:name.rfind('.')], AFTER_SUITE)
-    try:
-        print(("Run after suite setup for %s" % name))
-        suite = unittest.TestLoader().loadTestsFromName(after_suite_name)
-        result = unittest.TextTestRunner(verbosity=2).run(suite)
-    except AttributeError as ex:
-        pass
+    print("\n*** Tests executed count: {}\n".format(test_exec_count))
+    if test_exec_count > 0 and "upgrade" not  in name:
+        after_suite_name = "%s.%s" % (name[:name.rfind('.')], AFTER_SUITE)
+        try:
+            print(("Run after suite setup for %s" % name))
+            suite = unittest.TestLoader().loadTestsFromName(after_suite_name)
+            result = unittest.TextTestRunner(verbosity=2).run(suite)
+        except AttributeError as ex:
+            pass
+    if "makefile" not in TestInputSingleton.input.test_params:
+        print("During the test, Remote Connections: %s, Disconnections: %s" %
+                (RemoteMachineShellConnection.connections,
+                RemoteMachineShellConnection.disconnections))
+
+        if TestInputSingleton.input.param("get-delays", False):
+            sd.stop_measure_sched_delay()
+            sd.fetch_logs()
+
+    # terminate any non main thread - these were causing hangs
+    for t in threading.enumerate():
+        if t.name != 'MainThread' and t.is_alive():
+            print(('Thread', t, 'was not properly terminated, will be terminated now.'))
+            if hasattr(t, 'shutdown'):
+                print("Shutting down the thread...")
+                t.shutdown(True)
+            else:
+                print("Stopping the thread...")
+                try:
+                    t._stop()
+                except Exception as e:
+                    print("Unable to stop hung thread, killing python process")
+                    os.kill(os.getpid(), signal.SIGKILL)
+    
     if "makefile" in TestInputSingleton.input.test_params:
         # print out fail for those tests which failed and do sys.exit() error code
         fail_count = 0
@@ -762,47 +795,42 @@ def runtests(names, options, arg_i, arg_p, runtime_test_params):
         if fail_count > 0:
             sys.exit(1)
 
-    print("During the test, Remote Connections: %s, Disconnections: %s" %
-              (RemoteMachineShellConnection.connections,
-               RemoteMachineShellConnection.disconnections))
-
-    if TestInputSingleton.input.param("get-delays", False):
-        sd.stop_measure_sched_delay()
-        sd.fetch_logs()
-
-    # terminate any non main thread - these were causing hangs
-    for t in threading.enumerate():
-        if t.name != 'MainThread' and t.isAlive():
-            print(('Thread', t, 'was not properly terminated, will be terminated now.'))
-            if hasattr(t, 'shutdown'):
-                print("Shutting down the thread...")
-                t.shutdown(True)
-            else:
-                print("Stopping the thread...")
-                try:
-                    t._stop()
-                except Exception as e:
-                    pass
-
     return results, xunit, "{0}{2}report-{1}".format(os.path.dirname(logs_folder), str_time, os.sep)
 
 
-
 def filter_fields(testname):
-    testwords = testname.split(",")
-    line = ""
-    for fw in testwords:
-        if not fw.startswith("logs_folder") and not fw.startswith("conf_file") \
-                and not fw.startswith("cluster_name:") \
-                and not fw.startswith("ini:") \
-                and not fw.startswith("case_number:") \
-                and not fw.startswith("num_nodes:") \
-                and not fw.startswith("spec:"):
-            line = line + fw.replace(":", "=", 1)
-            if fw != testwords[-1]:
-                line = line + ","
+    # TODO: Fix for old xml style
+    if "logs_folder:" in testname:
+        testwords = testname.split(",")
+        line = ""
+        for fw in testwords:
+            if not fw.startswith("logs_folder") and not fw.startswith("conf_file") \
+                    and not fw.startswith("cluster_name:") \
+                    and not fw.startswith("ini:") \
+                    and not fw.startswith("case_number:") \
+                    and not fw.startswith("num_nodes:") \
+                    and not fw.startswith("spec:"):
+                if not "\":" in fw or "query:" in fw:
+                    #log.info("Replacing : with ={}".format(fw))
+                    line = line + fw.replace(":", "=", 1)
+                else:
+                    line = line + fw
+                if fw != testwords[-1]:
+                    line = line + ","
 
-    return line
+        return line    
+    else:
+        testwords = testname.split(",")
+        line = []
+        for fw in testwords:
+            if not fw.startswith("logs_folder=") and not fw.startswith("conf_file=") \
+                    and not fw.startswith("cluster_name=") \
+                    and not fw.startswith("ini=") \
+                    and not fw.startswith("case_number=") \
+                    and not fw.startswith("num_nodes=") \
+                    and not fw.startswith("spec="):
+                line.append(fw)
+        return ",".join(line)
 
 def compare_with_sort(dict, key):
     for k in list(dict.keys()):

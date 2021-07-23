@@ -41,7 +41,7 @@ class RbacBase:
     user_role_list = list of user information and role assignment
                      [{'id':ritam,'name'=ritamsharma,'roles'='cluster_admin:admin'}]
     '''
-    def add_user_role(self,user_role_list,rest,source=None):
+    def add_user_role(self,user_role_list,rest,source=None, collection_rbac=False):
         if source:
             self.source = source
         response_return = []
@@ -49,12 +49,20 @@ class RbacBase:
             final_roles = ""
             userid = user_role['id']
             username = user_role['name']
-            user_role_param = user_role['roles'].split(":")
+            user_role_param = user_role['roles'].split("]:")
             if len(user_role_param) == 1:
                 final_roles = user_role_param[0]
             else:
                 for role in user_role_param:
-                    final_roles = role + "," + final_roles
+                    if ']' not in role and '[' in role:
+                        final_roles = role + "]," + final_roles
+                    # TODO: this elif has to me eliminated in favor of correct lists of roles usage.
+                    elif ':' in role:
+                        if not collection_rbac:
+                            role = role.replace(":", ",")
+                        final_roles = role + "," + final_roles
+                    else:
+                        final_roles = role + "," + final_roles
             payload="name="+username+"&roles="+final_roles
             if self.source == "ldap":
                 response = rest.set_user_roles(userid, payload)

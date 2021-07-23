@@ -14,38 +14,47 @@ import com.couchbase.client.java.manager.collection.ScopeSpec;
 import com.couchbase.javaclient.doc.DocSpec;
 import com.couchbase.javaclient.doc.Person;
 
+import org.apache.log4j.Logger;
 import reactor.core.publisher.Flux;
 import reactor.core.scheduler.Schedulers;
 
 public class DocRetrieve implements Callable<String> {
-	private DocSpec ds;
-	private Bucket bucket;
-	private Collection collection;
+
+	private final static Logger log = Logger.getLogger(DocRetrieve.class);
+
+	private static DocSpec ds;
+	private static Bucket bucket;
+	private static Collection collection;
+	private static int nThreads; 
 	private static int num_docs = 0;
 	private boolean done = false;
 
-	public DocRetrieve(DocSpec _ds, Bucket _bucket) {
+	public DocRetrieve(DocSpec _ds, Bucket _bucket, int _nThreads) {
 		ds = _ds;
 		bucket = _bucket;
+		nThreads = _nThreads;
 	}
 
-	public DocRetrieve(DocSpec _ds, Collection _collection) {
+	public DocRetrieve(DocSpec _ds, Collection _collection, int _nThreads) {
 		ds = _ds;
 		collection = _collection;
+		nThreads = _nThreads;
 	}
 
 	@Override
 	public String call() throws Exception {
 		if (collection != null) {
-			printCollection(ds, collection);
+			log.info("Retrieve collection " + collection.bucketName() + "." + collection.scopeName() + "." + collection.name());
+			printCollection(collection);
 		} else {
-			printBucketCollections(ds, bucket);
+			log.info("Retrieve bucket collections");
+			printBucketCollections();
 		}
 		done = true;
 		return num_docs + " DOCS PRESENT!";
 	}
 
-	public static void printBucketCollections(DocSpec ds, Bucket bucket) {
+	public static void printBucketCollections() {
 		List<Collection> bucketCollections = new ArrayList<>();
 		List<ScopeSpec> bucketScopes = bucket.collections().getAllScopes();
 		for (ScopeSpec scope : bucketScopes) {
@@ -56,51 +65,51 @@ public class DocRetrieve implements Callable<String> {
 				}
 			}
 		}
-		System.out.println("Collections in " + bucket + ' ' + bucketCollections);
-		bucketCollections.parallelStream().forEach(c -> printCollection(ds, c));
+		log.info("Collections in " + bucket + ' ' + bucketCollections);
+		bucketCollections.parallelStream().forEach(c -> printCollection(c));
 	}
 
-	public static void printCollection(DocSpec ds, Collection collection) {
+	public static void printCollection(Collection collection) {
 		ReactiveCollection rcollection = collection.reactive();
-		int created_docs = (int) (ds.get_num_ops()*((float) ds.get_percent_create()/100));
-		int deleted_docs = (int) (ds.get_num_ops()*((float) ds.get_percent_delete()/100));
+		int created_docs = (int) (ds.get_num_ops() * ((float) ds.get_percent_create() / 100));
+		int deleted_docs = (int) (ds.get_num_ops() * ((float) ds.get_percent_delete() / 100));
 		int expected_docs = created_docs - deleted_docs;
-	
-		System.out.println("deleted docs " + deleted_docs);
-		System.out.println("expected docs " + expected_docs);
-		
+
+		log.info("deleted docs " + deleted_docs);
+		log.info("expected docs " + expected_docs);
+
 		List<String> docsToDeleteList = new ArrayList<>();
 		String key = null;
 		try {
-			for(int id=ds.get_startSeqNum(); id < ds.get_startSeqNum() + num_docs; id++) {
+			for (int id = ds.get_startSeqNum(); id < ds.get_startSeqNum() + num_docs; id++) {
 				key = ds.get_prefix() + id + ds.get_suffix();
 				GetResult found = collection.get(key);
 				docsToDeleteList.add(key);
 			}
-		}catch(Exception e) {
-			System.out.println(key + " not found. Skipping delete");
+		} catch (Exception e) {
+			log.error(key + " not found. Skipping delete");
 		}
 		Flux<String> docsToDelete = Flux.fromIterable(docsToDeleteList);
-		
-		
-		
-		
-		
-		
 		List<String> docsToFetchList = new ArrayList<>();
-		
-		for(int id=ds.get_startSeqNum() + deleted_docs; id<=created_docs; id++) {
+
+		for (int id = ds.get_startSeqNum() + deleted_docs; id <= created_docs; id++) {
 			key = ds.get_prefix() + id + ds.get_suffix();
 			docsToFetchList.add(key);
 		}
+		if(ds.get_shuffle_docs()){
+			java.util.Collections.shuffle(docsToFetchList);
+		}
 		List<GetResult> actual_docs = Flux.fromIterable(docsToFetchList)
+				.publishOn(Schedulers
+				.newBoundedElastic(nThreads, 100, "catapult-read"))
 				.flatMap(id -> rcollection.get(id))
-				.log()
+				// Num retries
+				.retry(20)
 				.collectList()
 				// Block until last value, complete or timeout expiry
 				.block(Duration.ofMinutes(10));
-		System.out.println(
-				expected_docs + " keys expected, " + actual_docs.size() + " keys present in collection " + collection);
+		log.info(
+				expected_docs + " keys expected, " + actual_docs.size() + " keys present in collection");
 	}
 
 	public boolean isDone() {

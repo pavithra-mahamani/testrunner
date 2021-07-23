@@ -49,30 +49,71 @@ def do_install_task(task, node):
         traceback.print_exc()
 
 
-def validate_install(version):
+def validate_install(params):
     log.info("-" * 100)
+    cluster_nodes = {}
     for node in install_utils.NodeHelpers:
-        node.install_success = False
-        if node.rest:
-            try:
-                node_status = node.rest.cluster_status()["nodes"]
-            except:
-                continue
-            for item in node_status:
-                if version in item['version'] and item['status'] == "healthy":
-                    node.install_success = True
+        version = params["version"]
+        if node.install_success is None:
+            node.install_success = False
+            if params["cluster_version"]:
+                if node.ip != params["bkrs_client"].ip:
+                    version = params["cluster_version"]
+            if node.rest:
+                try:
+                    node_status = node.rest.cluster_status()["nodes"]
+                except:
+                    continue
+                for item in node_status:
+                    if node.ip not in item["hostname"]:
+                        continue
+                    if version in item['version'] and item['status'] == "healthy":
+                        node.install_success = True
 
-                if node.enable_ipv6 and not item["addressFamily"] == "inet6":
-                    node.install_success = False
+                    if node.enable_ipv6 and not item["addressFamily"] == "inet6":
+                        node.install_success = False
 
-                afamily = "Unknown"
-                if 'addressFamily' in list(item.keys()):
-                    afamily = item['addressFamily']
+                    afamily = "Unknown"
+                    if 'addressFamily' in list(item.keys()):
+                        afamily = item['addressFamily']
 
-                log.info("node:{0}\tversion:{1}\taFamily:{2}\tservices:{3}".format(item['hostname'],
-                                                                              item['version'],
-                                                                              afamily,
-                                                                              item['services']))
+                    cluster_nodes[node.ip] = {
+                        "hostname": item["hostname"],
+                        "version": item["version"],
+                        "afamily": afamily,
+                        "services": item["services"]
+                    }
+
+                # check cluster has correct number of nodes
+                if params.get("init_clusters", False):
+                    selected_cluster = None
+                    for cluster in params["clusters"].values():
+                        for server in cluster:
+                            if server.ip == node.ip:
+                                selected_cluster = cluster
+                    if selected_cluster is not None:
+                        if len(node_status) != len(selected_cluster):
+                            node.install_success = False
+
+    clusters = []
+
+    if params.get("init_clusters", False):
+        for cluster in params["clusters"].values():
+            nodes = { node.ip: cluster_nodes[node.ip] for node in cluster}
+            for [ip, node] in nodes.items():
+                del cluster_nodes[ip]
+            clusters.append(list(nodes.values()))
+
+    for node in cluster_nodes.values():
+        clusters.append([node])
+
+    for [i, cluster] in enumerate(clusters):
+        for node in cluster:
+            log.info("cluster:C{0}\tnode:{1}\tversion:{2}\taFamily:{3}\tservices:{4}".format(i + 1, node['hostname'],
+                                                                                    node['version'],
+                                                                                    node['afamily'],
+                                                                                    node['services']))
+
     install_utils.print_result_and_exit()
 
 def do_install(params):
@@ -101,12 +142,52 @@ def do_install(params):
                 log.error("INSTALL TIMED OUT AFTER {0}s.VALIDATING..".format(params["timeout"]))
                 break
     if "init" in params["install_tasks"]:
-        validate_install(params["version"])
+        if params.get("init_clusters", False) and len(params["clusters"]) > 0:
+            timeout = force_stop - time.time()
+            install_utils.init_clusters(timeout)
+        validate_install(params)
 
+
+def do_uninstall(params):
+    # Per node, spawn one thread, which will process a queue of
+    # uninstall tasks
+    for server in params["servers"]:
+        node_helper = install_utils.get_node_helper(server.ip)
+        install_tasks = ['uninstall']
+        q = queue.Queue()
+        for _ in install_tasks:
+            q.put(_)
+        t = threading.Thread(target=node_installer,
+                             args=(node_helper, q))
+        t.daemon = True
+        t.start()
+        node_helper.queue = q
+        node_helper.thread = t
+    force_stop = start_time + params["timeout"]
+    for node in install_utils.NodeHelpers:
+        try:
+            while node.queue.unfinished_tasks and time.time() < \
+                    force_stop:
+                time.sleep(install_constants.INSTALL_POLL_INTERVAL)
+            else:
+                raise InstallException
+        except InstallException:
+            if time.time() >= force_stop:
+                log.error(
+                    "Uninstall TIMED OUT AFTER {0}s. "
+                    "VALIDATING..".format(
+                        params["timeout"]))
+                break
 
 def main():
     params = install_utils.process_user_input()
     install_utils.pre_install_steps()
+    if 'uninstall' in params['install_tasks']:
+        # Do uninstallation of products first before downloading the
+        # builds.
+        do_uninstall(params)
+        params['install_tasks'].remove('uninstall')
+    install_utils.download_build()
     do_install(params)
 
 

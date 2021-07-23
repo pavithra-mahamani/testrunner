@@ -177,7 +177,7 @@ class x509tests(BaseTestCase):
         elif self.sdk_version == 'vulcan':
             key_file = x509main.CACERTFILEPATH + self.ip_address + ".key"
             chain_file = x509main.CACERTFILEPATH + "/long_chain" + self.ip_address + ".pem"
-            connection_string = 'couchbases://' + host_ip + '/?certpath=' + chain_file + "&keypath=" + key_file
+            connection_string = 'couchbases://' + host_ip + '/?ipv6=allow&certpath=' + chain_file + "&keypath=" + key_file
             self.log.info("Connection string is -{0}".format(connection_string))
             try:
                 cluster = Cluster(connection_string);
@@ -243,15 +243,17 @@ class x509tests(BaseTestCase):
     def test_error_without_node_chain_certificates(self):
         x509main(self.master)._upload_cluster_ca_certificate("Administrator", 'password')
         status, content = x509main(self.master)._reload_node_certificate(self.master)
+        content = str(content)
         self.assertEqual(status['status'], '400', "Issue with status with node certificate are missing")
-        self.assertTrue('Unable to read certificate chain file' in content, "Incorrect message from the system")
+        self.assertTrue('Unable to read certificate chain file' in str(content), "Incorrect message from the system")
 
     def test_error_without_chain_cert(self):
         x509main(self.master)._upload_cluster_ca_certificate("Administrator", 'password')
         x509main(self.master)._setup_node_certificates(chain_cert=False)
         status, content = x509main(self.master)._reload_node_certificate(self.master)
+        content = str(content)
         self.assertEqual(status['status'], '400', "Issue with status with node certificate are missing")
-        self.assertTrue('Unable to read certificate chain file' in content, "Incorrect message from the system")
+        self.assertTrue('Unable to read certificate chain file' in str(content) , "Incorrect message from the system")
 
     def test_error_without_node_key(self):
         x509main(self.master)._upload_cluster_ca_certificate("Administrator", 'password')
@@ -868,13 +870,13 @@ class x509tests(BaseTestCase):
         self.sleep(20)
         
         if self.client_cert_state == 'enable':
-            output = x509main()._execute_command_clientcert(host.ip, url='/query/service', port=18093, headers='--http1.1', client_cert=True, curl=True, verb='GET', data="statement='create index idx1 on default(name)'")
+            output = x509main()._execute_command_clientcert(host.ip, url='/query/service', port=18093, headers='', client_cert=True, curl=True, verb='GET', data="statement='create index idx1 on default(name)'")
         else:
-            output = x509main()._execute_command_clientcert(host.ip, url='/query/service', port=18093, headers='--http1.1 -u Administrator:password ', client_cert=False, curl=True, verb='GET', data="statement='create index idx1 on default(name)'")
-        
+            output = x509main()._execute_command_clientcert(host.ip, url='/query/service', port=18093, headers='-u Administrator:password ', client_cert=False, curl=True, verb='GET', data="statement='create index idx1 on default(name)'")
+
         self.assertEqual(json.loads(output)['status'], "success", "Create Index Failed on port 18093")
-        
-        output = x509main()._execute_command_clientcert(host.ip, url='/query/service', port=8093, headers='--http1.1 -u Administrator:password ', client_cert=False, curl=True, verb='GET', plain_curl=True, data="statement='create index idx2 on default(name)'")
+
+        output = x509main()._execute_command_clientcert(host.ip, url='/query/service', port=8093, headers='-u Administrator:password ', client_cert=False, curl=True, verb='GET', plain_curl=True, data="statement='create index idx2 on default(name)'")
         self.assertEqual(json.loads(output)['status'], "success", "Create Index Failed on port 8093")
 
     def check_fts_service(self, host):
@@ -898,11 +900,11 @@ class x509tests(BaseTestCase):
         else:
             output = x509main()._execute_command_clientcert(host.ip, url='/api/index/default_idx', port=18094, headers=" -XPUT -H \"Content-Type: application/json\" -u Administrator:password ",
                                                             client_cert=False, curl=True, verb='GET', data="'" + json.dumps(idx) + "'")
-        self.assertEqual(json.loads(output), {"status":"ok"}, "Issue with creating FTS index with client Cert")
+        self.assertEqual(json.loads(output)['status'], "ok", "Issue with creating FTS index with client Cert")
         
         output = x509main()._execute_command_clientcert(host.ip, url='/api/index/default_idx01', port=8094, headers=" -XPUT -H \"Content-Type: application/json\" -u Administrator:password ",
                                                         client_cert=False, curl=True, verb='GET', data="'" + json.dumps(idx) + "'", plain_curl=True)
-        self.assertEqual(json.loads(output), {"status":"ok"}, "Issue with creating FTS index with client Cert")
+        self.assertEqual(json.loads(output)['status'], "ok", "Issue with creating FTS index with client Cert")
         
         if self.client_cert_state == 'enable':
             output = x509main()._execute_command_clientcert(host.ip, url='/api/index/default_idx', port=18094, headers=" -H \"Content-Type: application/json\" ",
@@ -910,11 +912,11 @@ class x509tests(BaseTestCase):
         else:
             output = x509main()._execute_command_clientcert(host.ip, url='/api/index/default_idx', port=18094, headers=" -H \"Content-Type: application/json\" -u Administrator:password ",
                                                             client_cert=False, curl=True, verb='DELETE')
-        self.assertEqual(json.loads(output), {"status":"ok"}, "Issue with deleteing FTS index with client Cert")
+        self.assertEqual(json.loads(output)['status'], "ok", "Issue with deleteing FTS index with client Cert")
         
         output = x509main()._execute_command_clientcert(host.ip, url='/api/index/default_idx01', port=8094, headers=" -H \"Content-Type: application/json\" -u Administrator:password ",
                                                         client_cert=False, curl=True, verb='DELETE', plain_curl=True)
-        self.assertEqual(json.loads(output), {"status":"ok"}, "Issue with deleteing FTS index on 8094")
+        self.assertEqual(json.loads(output)['status'], "ok", "Issue with deleteing FTS index on 8094")
             
         ''' - Check with FTS team on this        
         if self.client_cert_state == 'enable':

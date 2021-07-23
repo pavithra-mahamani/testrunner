@@ -1,6 +1,7 @@
 import random
 import time
 import uuid
+import math
 
 import mc_bin_client
 import memcacheConstants as constants
@@ -14,7 +15,6 @@ from membase.helper.bucket_helper import BucketOperationHelper
 from memcached.helper.data_helper import MemcachedClientHelper
 from remote.remote_util import RemoteMachineShellConnection
 from dcp_bin_client import DcpClient
-
 
 class EvictionKV(EvictionBase):
     def verify_all_nodes(self):
@@ -63,7 +63,7 @@ class EvictionKV(EvictionBase):
         compacted = self.cluster.compact_bucket(self.master, 'default')
 
         self.verify_all_nodes()
-
+    
     """
     add new keys at the same rate as keys are expiring
     Here is the algorithm:
@@ -78,7 +78,7 @@ class EvictionKV(EvictionBase):
     def test_steady_state_eviction(self):
         # serverInfo = self.master
         client = MemcachedClientHelper.direct_client(self.master, 'default')
-
+        self.sleep(1, "Wait for Memcached Direct Client to come online")
         expiry_time = self.input.param("expiry_time", 30)
         keys_expired_per_interval = self.input.param("keys_expired_per_interval", 100)
         key_float = self.input.param("key_float", 1000)
@@ -87,10 +87,12 @@ class EvictionKV(EvictionBase):
         init_time_delay = self.input.param("init_time_delay", 30)
         initial_key_set_time = []
         # rampup - create a certain number of keys
-        float_creation_chunks = key_float / keys_expired_per_interval
+        float_creation_chunks = math.ceil(key_float / keys_expired_per_interval)
 
         for i in range(float_creation_chunks):
-            for j in range(keys_expired_per_interval):
+            leftover_keys = key_float - (keys_expired_per_interval * i)
+            keys_in_chunk = keys_expired_per_interval if leftover_keys > keys_expired_per_interval else leftover_keys
+            for j in range(keys_in_chunk):
                 key = str(uuid.uuid4()) + str(i) + str(j)
                 client.set(key, init_time_delay + expiry_time * (i + 1), 0, key)
             #pause before second chunk gets set 
@@ -100,8 +102,9 @@ class EvictionKV(EvictionBase):
                    "Waiting for first chunk to expire")
         for chunk in range(float_creation_chunks):
             key_set_time = int(time.time())
-
-            keys = ["key_%s_%d" % (uuid.uuid4(), i) for i in range(keys_expired_per_interval)]
+            leftover_keys = key_float - (keys_expired_per_interval * chunk)
+            keys_in_chunk = keys_expired_per_interval if leftover_keys > keys_expired_per_interval else leftover_keys
+            keys = ["key_%s_%d" % (uuid.uuid4(), i) for i in range(keys_in_chunk)]
             self.log.info("pushing keys with expiry set to {0}".format(expiry_time * float_creation_chunks))
             for key in keys:
                 try:
@@ -124,6 +127,7 @@ class EvictionKV(EvictionBase):
             self.cluster.wait_for_stats([self.master], "default", "", "curr_items", "==", key_float, timeout=30)
             exp_time = expiry_time - (time.time() - key_set_time)
             self.sleep(exp_time)
+        client.close()
 
     def test_verify_expiry(self):
         """
@@ -251,7 +255,7 @@ class EvictionKV(EvictionBase):
         output, error = shell.execute_command("/opt/couchbase/bin/cbstats localhost:11210 -b default "
                                               "vbucket-details -u Administrator -p password "
                                               "| grep seqlist_deleted_count")
-        self.assertEqual(' vb_0:seqlist_deleted_count:              0', output[0])
+        self.assertEqual(' vb_0:seqlist_deleted_count:            0', output[0])
 
         item_count = rest.get_bucket(self.buckets[0]).stats.itemCount
         self.log.info('rest.get_bucket(self.buckets[0]).stats.itemCount: %s' % item_count)
@@ -286,10 +290,11 @@ class EvictionKV(EvictionBase):
                                               "vbucket-details -u Administrator -p password "
                                               "| grep seqlist_deleted_count")
         if self.input.param('eviction_policy', 'noEviction') == 'noEviction':
-            self.assertEqual(' vb_0:seqlist_deleted_count:              0', output[0], 'have deleted items!')
+            self.assertEqual(' vb_0:seqlist_deleted_count:            0', output[0], 'have deleted items!')
         else:
             self.assertTrue(int(output[0].replace('vb_0:seqlist_deleted_count:', '').strip()) > 0,
                             'no deleted items!')
+        shell.disconnect()
 
     # https://issues.couchbase.com/browse/MB-23988
     def test_ephemeral_bucket_views(self):
@@ -305,7 +310,7 @@ class EvictionKV(EvictionBase):
                 self.fail("Views not allowed for ephemeral buckets")
             except DesignDocCreationException as e:
                 self.assertEqual(e._message,
-                                  'Error occured design document _design/ddoc1: {"error":"not_found","reason":"views are supported only on couchbase buckets"}\n')
+                                  'Error occured design document _design/ddoc1: b\'{"error":"not_found","reason":"views are supported only on couchbase buckets"}\\n\'')
 
 
 class EphemeralBackupRestoreTest(EvictionBase):
@@ -335,7 +340,7 @@ class EphemeralBackupRestoreTest(EvictionBase):
             "/opt/couchbase/bin/cbbackupmgr backup --archive /tmp/backups --repo example "
             "--cluster couchbase://127.0.0.1 --username Administrator --password password")
         self.log.info(output)
-        self.assertEqual('Backup successfully completed', output[1])
+        self.assertTrue(" ".join(output).find("Backup completed successfully") != -1)
         BucketOperationHelper.delete_all_buckets_or_assert(self.servers, self)
         imp_rest = RestConnection(self.master)
         info = imp_rest.get_nodes_self()
@@ -346,13 +351,16 @@ class EphemeralBackupRestoreTest(EvictionBase):
                                                    enable_replica_index=self.enable_replica_index,
                                                    eviction_policy=self.eviction_policy)
         self.cluster.create_default_bucket(bucket_params)
+        
         output, error = self.shell.execute_command('ls /tmp/backups/example')
+        #bug fix:
+        #removed --start flag from the below command because --end is forced to use with --start
+        #As /tmp/backups/example is being created in this test itself, no need for --start and --end flags
         output, error = self.shell.execute_command("/opt/couchbase/bin/cbbackupmgr restore --archive /tmp/backups"
                                                    " --repo example --cluster couchbase://127.0.0.1 "
-                                                   "--username Administrator --password password --start %s" % output[
-                                                       0])
+                                                   "--username Administrator --password password")
         self.log.info(output)
-        self.assertEqual('Restore completed successfully', output[1])
+        self.assertEqual('Restore completed successfully', output[-1])
         self._verify_all_buckets(self.master)
 
 

@@ -261,12 +261,17 @@ class N1qlFTSIntegrationTest(QueryTests):
     test_bucket_size = 999
     users = {}
     fts_indexes = {}
-    cbcluster = None
 
 
     def setUp(self):
         super(N1qlFTSIntegrationTest, self).setUp()
+        self.cbcluster = CouchbaseCluster(name='cluster', nodes=self.servers, log=self.log)
+        self.users = {}
         self._init_nodes()
+
+        fts_node = self.cbcluster.get_fts_nodes()
+        RestConnection(fts_node[0]).set_fts_ram_quota(700)
+
         self._load_test_data(number_of_records=self.test_bucket_size)
         self._open_curl_access()
         self._create_all_indexes()
@@ -274,7 +279,6 @@ class N1qlFTSIntegrationTest(QueryTests):
         self.log_config_info()
         self.log.info("==============  N1qlFTSIntegrationTest setup has started ==============")
         self.log.info("==============  N1qlFTSIntegrationTest setup has completed ==============")
-
 
     def tearDown(self):
         self.log_config_info()
@@ -311,7 +315,6 @@ class N1qlFTSIntegrationTest(QueryTests):
         fts_node_result = self._validate_query_against_node(self.servers[1], services_map, self.test_fts_alias_query, self.test_n1ql_query, username=username, password=password)
         self.assertEqual(master_result, True, username+" alias query run failed on non-fts node")
         self.assertEqual(fts_node_result, True, username+" alias query run failed on fts node")
-
 
     ''' Test for user permissions - user is granted to run select queries and is not granted to run fts searches'''
     def test_rbac_not_granted_fts(self):
@@ -493,7 +496,11 @@ class N1qlFTSIntegrationTest(QueryTests):
                              + operator + a_d + \
                              "select * from ( select raw meta().id from test_bucket where string_field like '"+right_set_value+"') q1) a order by q1"
                 for node in self.get_nodes_in_cluster():
-                    test_result = self._validate_query_against_node(node, services_map, fts_query, n1ql_query)
+                    try:
+                        test_result = self._validate_query_against_node(node, services_map, fts_query, n1ql_query)
+                    except AssertionError as err:
+                        self.log.info(err)
+                        test_result = False
                     self.assertEqual(test_result, False, "Node " + str(node) + " test is not failed.")
 
 
@@ -598,8 +605,9 @@ class N1qlFTSIntegrationTest(QueryTests):
         idx_result_node4_after_rebalance = self._run_query_against_node(self.servers[3], self.test_fts_query)
         alias_result_node4_after_rebalance = self._run_query_against_node(self.servers[3], self.test_fts_alias_query)
 
-        self.assertEuqals(idx_result_node2_before_failover == idx_result_node4_after_rebalance and
+        self.assertEqual(idx_result_node2_before_failover == idx_result_node4_after_rebalance and
                           idx_result_node2_before_failover == alias_result_node4_after_rebalance, True, "Results after rebalance are not the same.")
+
 
 
     ''' Non-parameterized prepared statement call against fts and non-fts nodes. '''
@@ -700,8 +708,7 @@ class N1qlFTSIntegrationTest(QueryTests):
                 n1ql_result = self.run_cbq_query(query=n1ql_query, server=node, username=username, password=password)
                 diffs = DeepDiff(fts_result['results'], n1ql_result['results'], ignore_order=True)
                 if diffs:
-                    self.log.info("Diffs: "+diffs)
-                    return False
+                    self.assertTrue(False, diffs)
 
         return True
 
@@ -730,7 +737,7 @@ class N1qlFTSIntegrationTest(QueryTests):
                 initial_statement = (" INSERT INTO {0} (KEY, VALUE) VALUES ('primary_key_"+str(i)+"',").format(bucket_name)
                 initial_statement += "{"
                 initial_statement += "'primary_key':'primary_key_"+str(i) + "','string_field': 'string data " + str(i) + "','int_field':"+str(i)+"})"
-            self.run_cbq_query(initial_statement)
+            self.run_cbq_query(initial_statement, debug_query=False)
 
         shell = RemoteMachineShellConnection(self.master)
         shell.execute_cbworkloadgen(self.username, self.password, 15000, 100, "big_bucket", 1024, '-j')
@@ -756,8 +763,7 @@ class N1qlFTSIntegrationTest(QueryTests):
 
 
     def _create_fts_index(self, index_name='idx_test_bucket_fts', doc_count=0, source_name='test_bucket'):
-        cbcluster = CouchbaseCluster(name='cluster', nodes=self.servers, log=self.log)
-        fts_index = cbcluster.create_fts_index(name=index_name, source_name=source_name)
+        fts_index = self.cbcluster.create_fts_index(name=index_name, source_name=source_name)
 
         indexed_doc_count = 0
         while indexed_doc_count < doc_count:
@@ -769,10 +775,9 @@ class N1qlFTSIntegrationTest(QueryTests):
         return fts_index
 
     def _create_alias(self, target_index, name):
-        cbcluster = CouchbaseCluster(name='cluster', nodes=self.servers, log=self.log)
         alias_def = {"targets": {}}
         alias_def['targets'][target_index.name] = {}
-        return cbcluster.create_fts_index(name=name, index_type='fulltext-alias', index_params=alias_def)
+        return self.cbcluster.create_fts_index(name=name, index_type='fulltext-alias', index_params=alias_def)
 
     def _update_replica_for_fts_index(self, idx, replicas):
         idx.update_num_replicas(replicas)

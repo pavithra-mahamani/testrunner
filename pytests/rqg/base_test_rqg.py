@@ -19,6 +19,13 @@ from os.path import isfile, join
 import traceback
 from .rqg_postgres_client import RQGPostgresClient
 from membase.api.exception import CBQError
+from fts.random_query_generator.rand_query_gen import FTSFlexQueryGenerator
+from pytests.fts.fts_base import FTSIndex
+from pytests.fts.random_query_generator.rand_query_gen import DATASET
+from deepdiff import DeepDiff
+from pytests.fts.fts_base import CouchbaseCluster
+import uuid
+import re
 
 class BaseRQGTests(BaseTestCase):
     def setUp(self):
@@ -29,6 +36,10 @@ class BaseRQGTests(BaseTestCase):
             self.check_covering_index = self.input.param("check_covering_index", True)
             self.skip_setup_cleanup = True
             self.crud_ops = self.input.param("crud_ops", False)
+            self.use_fts = self.input.param("use_fts", False)
+            self.use_sdk = self.input.param("use_sdk", False)
+            self.use_analytics = self.input.param("use_analytics", False)
+            self.shell = RemoteMachineShellConnection(self.master)
             self.ansi_joins = self.input.param("ansi_joins", False)
             self.with_let = self.input.param("with_let", False)
             self.ansi_transform = self.input.param("ansi_transform", False)
@@ -43,6 +54,8 @@ class BaseRQGTests(BaseTestCase):
             self.number_of_buckets = self.input.param("number_of_buckets", 5)
             self.crud_type = self.input.param("crud_type", "update")
             self.populate_with_replay = self.input.param("populate_with_replay", False)
+            self.use_default_collection = self.input.param("use_default_collection", False)
+            self.use_query_context = self.input.param("use_query_context", False)
             self.crud_batch_size = self.input.param("crud_batch_size", 1)
             self.record_failure = self.input.param("record_failure", False)
             self.failure_record_path = self.input.param("failure_record_path", "/tmp")
@@ -59,6 +72,8 @@ class BaseRQGTests(BaseTestCase):
             self.password_cluster = self.input.param("password_cluster", "password")
             self.generate_input_only = self.input.param("generate_input_only", False)
             self.using_gsi = self.input.param("using_gsi", True)
+            self.use_txns = self.input.param("use_txns", False)
+            self.num_txns = self.input.param("num_txns", 1)
             self.reset_database = self.input.param("reset_database", True)
             self.create_primary_index = self.input.param("create_primary_index", False)
             self.create_secondary_indexes = self.input.param("create_secondary_indexes", False)
@@ -101,7 +116,10 @@ class BaseRQGTests(BaseTestCase):
             self.use_secondary_index = self.run_query_with_secondary or self.run_explain_with_hints
             self.check_explain_plan = self.input.param("explain_plan", False)
             self.index_limit = self.input.param("index_limit", 5)
-
+            self.float_round_level = self.input.param("float_round_level", 0)
+            self.delta = self.input.param("delta", 0)
+            self.window_function_test = self.input.param("window_function_test", False)
+            self.randomize = self.input.param("randomize", False)
             self.advise_server = self.input.advisor
             self.advise_buckets = ["bucket_01", "bucket_02", "bucket_03", "bucket_04", "bucket_05", "bucket_06", "bucket_07", "bucket_08", "bucket_09", "bucket_10"]
             self.advise_dict={}
@@ -151,20 +169,134 @@ class BaseRQGTests(BaseTestCase):
                 client._db_execute_query(query=query)
         client.drop_database(self.database)
 
+    def create_fts_index(self, name, source_type='couchbase',
+                         source_name=None, index_type='fulltext-index',
+                         index_params=None, plan_params=None,
+                         source_params=None, source_uuid=None, doc_count=1000):
+        """Create fts index/alias
+        @param node: Node on which index is created
+        @param name: name of the index/alias
+        @param source_type : 'couchbase' or 'files'
+        @param source_name : name of couchbase bucket or "" for alias
+        @param index_type : 'fulltext-index' or 'fulltext-alias'
+        @param index_params :  to specify advanced index mapping;
+                                dictionary overriding params in
+                                INDEX_DEFAULTS.BLEVE_MAPPING or
+                                INDEX_DEFAULTS.ALIAS_DEFINITION depending on
+                                index_type
+        @param plan_params : dictionary overriding params defined in
+                                INDEX_DEFAULTS.PLAN_PARAMS
+        @param source_params: dictionary overriding params defined in
+                                INDEX_DEFAULTS.SOURCE_CB_PARAMS or
+                                INDEX_DEFAULTS.SOURCE_FILE_PARAMS
+        @param source_uuid: UUID of the source, may not be used
+        """
+        self.cbcluster = CouchbaseCluster(name='cluster', nodes=self.servers, log=self.log)
+        index_params = {"default_analyzer": "keyword",
+            "default_mapping": {
+                "enabled": True,
+                "dynamic": True,
+            }
+        }
+
+        plan_params = {'numReplicas': 0}
+
+        fts_index = FTSIndex(
+            self.cbcluster,
+            name,
+            source_type,
+            source_name,
+            index_type,
+            index_params,
+            plan_params,
+            source_params,
+            source_uuid)
+        fts_index.create()
+
+        indexed_doc_count = 0
+        retry_count = 10
+        while indexed_doc_count < doc_count and retry_count > 0:
+            try:
+                self.sleep(10)
+                indexed_doc_count = fts_index.get_indexed_doc_count()
+            except KeyError as k:
+                continue
+            retry_count -= 1
+
+        if indexed_doc_count != doc_count:
+            self.fail(
+                "FTS indexing did not complete. FTS index count : {0}, Bucket count : {1}".format(indexed_doc_count,
+                                                                                                  doc_count))
+
     def test_rqg(self):
         try:
             # Get Data Map
+            run_seed = random.seed(uuid.uuid4())
+            self.log.info("SEED: {0}".format(run_seed))
             table_list = self.client._get_table_list()
             table_map = self.client._get_values_with_type_for_fields_in_table()
+            if self.use_txns:
+                failures = {}
+                passes = 0
+                fails = 0
+                update_query_template_list = []
+                delete_query_template_list = []
+                select_query_template_list = []
+            i = 1
+            for table_name in table_list:
+                if self.use_fts:
+                    fts_index = self.create_fts_index(name="default_index" + str(i), source_name=self.database+"_"+table_name)
+                    i = i + 1
+                if self.use_txns:
+                    results = self.n1ql_helper.run_cbq_query(query="CREATE PRIMARY INDEX ON {0}".format(self.database + "_" + table_name))
             if self.remove_alias:
                 table_map = self.remove_aliases_from_table_map(table_map)
+            if self.use_analytics:
+                data = 'use Default;'
+                bucket_username = "cbadminbucket"
+                bucket_password = "password"
+                for bucket in self.buckets:
+                    data = 'create dataset {1} on {0}; '.format(bucket.name,
+                                                                bucket.name + "_shadow")
+                    filename = "file.txt"
+                    f = open(filename, 'w')
+                    f.write(data)
+                    f.close()
+                    url = 'http://{0}:8095/analytics/service'.format(self.master.ip)
+                    cmd = 'curl -s --data pretty=true --data-urlencode "statement@file.txt" ' + url + " -u " + bucket_username + ":" + bucket_password
+                    os.system(cmd)
+                    os.remove(filename)
+                data = 'connect link Local;'
+                filename = "file.txt"
+                f = open(filename, 'w')
+                f.write(data)
+                f.close()
+                url = 'http://{0}:8095/analytics/service'.format(self.master.ip)
+                cmd = 'curl -s --data pretty=true --data-urlencode "statement@file.txt" ' + url + " -u " + bucket_username + ":" + bucket_password
+                os.system(cmd)
+                os.remove(filename)
 
             if self.crud_ops:
                 table_list.remove("copy_simple_table")
 
             query_template_list = self.extract_query_templates()
+            if self.use_txns:
+                for query in query_template_list:
+                    if "fields_asc_desc" in query[0]:
+                        select_query_template_list.append(query[1])
+                    elif "update" in query[0]:
+                        update_query_template_list.append(query[1])
+                    elif "delete" in query[0]:
+                        delete_query_template_list.append(query[1])
+
+                random.shuffle(select_query_template_list)
+                random.shuffle(update_query_template_list)
+                random.shuffle(delete_query_template_list)
             # Generate the query batches based on the given template file and the concurrency count
-            batches = self.generate_batches(table_list, query_template_list)
+            else:
+                if self.randomize:
+                    random.shuffle(query_template_list)
+                batches = self.generate_batches(table_list, query_template_list)
 
             result_queue = queue.Queue()
             failure_queue = queue.Queue()
@@ -176,13 +308,127 @@ class BaseRQGTests(BaseTestCase):
                 for table_name in table_list:
                     if len(batches[table_name]) > 0:
                         self._crud_ops_worker(batches[table_name], table_name, table_map, result_queue, failure_queue)
-                        #t = threading.Thread(target=self._crud_ops_worker, args=(
-                        #batches[table_name], table_name, table_map, result_queue, failure_queue))
-                        #t.daemon = True
-                        #t.start()
-                        #thread_list.append(t)
-                #for t in thread_list:
-                    #t.join()
+            elif self.use_txns:
+                for x in range(0, self.num_txns):
+                    rollback_exists = False
+                    savepoints = []
+                    txn_queries = []
+                    savepoint = 0
+                    test_batch = []
+                    rollback_point = 0
+
+                    select_batches = self.generate_batches(table_list, select_query_template_list)
+                    update_batches = self.generate_batches(table_list, update_query_template_list)
+                    delete_batches = self.generate_batches(table_list, delete_query_template_list)
+
+                    i = 0
+                    self.log.info("-----------------------------------------------------------------STARTING TRANSACTION txn {0}-----------------------------------------------------------------".format(x))
+                    results = self.n1ql_helper.run_cbq_query(query="START TRANSACTION", txtimeout="4m")
+                    txn_id = results['results'][0]['txid']
+                    self.log.info("TXN ID {0}".format(txn_id))
+                    txn_queries.append("START TRANSACTION")
+                    while not (select_batches.empty() and update_batches.empty() and delete_batches.empty()):
+                        # Split up the batches and send them to the worker threads
+                        try:
+                            select_batch = select_batches.get(False)
+                            update_batch = update_batches.get(False)
+                            delete_batch = delete_batches.get(False)
+                        except Exception as ex:
+                            self.log.error(str(ex))
+                            break
+                        random.seed(uuid.uuid4())
+                        percentage = random.randint(1, 100)
+                        if percentage <= 50:
+                            query_type = random.choice(['select','select','select','select','select','select','update','update','update', 'update'])
+                            if query_type == 'select':
+                                test_batch = select_batch
+                            elif query_type == 'update':
+                                test_batch = update_batch
+                                self.crud_type = "update"
+                            elif query_type == 'delete':
+                                test_batch = delete_batch
+                                self.crud_type = "delete"
+                            test_query_template_list = [test_data[list(test_data.keys())[0]] for test_data in test_batch]
+                            table_name_description_map = {'simple_table': table_map['simple_table']}
+                            # create strings for queries and indexes but doesnt send indexes to Couchbase
+                            if query_type == 'update' or query_type == 'delete':
+                                sql_n1ql_index_map_list = self.convert_crud_ops_query(table_name, test_query_template_list, table_name_description_map)
+                            else:
+                                sql_n1ql_index_map_list = self.client._convert_template_query_info(table_map=table_name_description_map,
+                                                                                               n1ql_queries=test_query_template_list,
+                                                                                               define_gsi_index=self.use_secondary_index,
+                                                                                               aggregate_pushdown=self.aggregate_pushdown,
+                                                                                               partitioned_indexes=self.partitioned_indexes,
+                                                                                               ansi_joins=self.ansi_joins,
+                                                                                               with_let=self.with_let)
+
+                            for sql_n1ql_index_map in sql_n1ql_index_map_list:
+                                if not query_type == 'select':
+                                    sql_n1ql_index_map["n1ql_query"] = sql_n1ql_index_map['n1ql_query'].replace("simple_table",
+                                                                                                    self.database + "_" + "simple_table")
+                                    if query_type == 'delete':
+                                        sql_n1ql_index_map['n1ql_query'] = sql_n1ql_index_map['n1ql_query'].split(";")[0] + " LIMIT 10;" + sql_n1ql_index_map['n1ql_query'].split(";")[1]
+                                        sql_n1ql_index_map['sql_query'] = sql_n1ql_index_map['sql_query'].split(";")[0] + " LIMIT 10;" + sql_n1ql_index_map['sql_query'].split(";")[1]
+
+                                else:
+                                    sql_n1ql_index_map["n1ql"] = sql_n1ql_index_map['n1ql'].replace("simple_table", self.database+"_"+"simple_table")
+                            # build indexes
+                            if self.use_secondary_index:
+                                self._generate_secondary_indexes_in_batches(sql_n1ql_index_map_list)
+                            for test_case_input in sql_n1ql_index_map_list:
+                                # if self.use_advisor:
+                                #     self.create_secondary_index(n1ql_query=test_case_input['n1ql'])
+                                if not query_type == 'select':
+                                    self.n1ql_helper.run_cbq_query(query=test_case_input['n1ql_query'], txnid=txn_id)
+                                    txn_queries.append(test_case_input['sql_query'])
+                                else:
+                                    self.n1ql_helper.run_cbq_query(query=test_case_input['n1ql'], txnid=txn_id)
+                                    txn_queries.append(test_case_input['sql'])
+                            percentage2 = random.randint(1, 100)
+                            if percentage2 <= 10:
+                                savepoint = i
+                                self.log.info("CREATING SAVEPOINT s{0}".format(savepoint))
+                                results = self.n1ql_helper.run_cbq_query(query="SAVEPOINT s{0}".format(savepoint), txnid=txn_id)
+                                txn_queries.append("SAVEPOINT s{0}".format(savepoint))
+                                savepoints.append("s{0}".format(savepoint))
+                                i = i + 1
+                        if savepoints:
+                            percentage3 = random.randint(1, 100)
+                            if percentage3 <= 10:
+                                rollback_point = random.randint(0, savepoint)
+                                for txns in txn_queries:
+                                    if "ROLLBACK" in txns:
+                                        rollback_exists = True
+                                        break
+                                if not rollback_exists:
+                                    self.log.info("ROLLING BACK")
+                                    results = self.n1ql_helper.run_cbq_query(query=f"ROLLBACK TO SAVEPOINT s{savepoint}", txnid=txn_id)
+                                    txn_queries.append(f"ROLLBACK TO SAVEPOINT s{savepoint}")
+
+                    self.log.info("-----------------------------------------------------------------COMMITING TRANSACTION {0}-----------------------------------------------------------------".format(x))
+                    results = self.n1ql_helper.run_cbq_query(query="COMMIT TRANSACTION", txnid=txn_id)
+                    txn_queries.append("COMMIT")
+                    self.log.info("txn {0} : {1}".format(x, txn_queries))
+
+                    client = RQGMySQLClient(database=self.database, host=self.mysql_url, user_id=self.user_id,
+                                                password=self.password)
+                    cursor = client.mysql_connector_client.cursor(buffered=True)
+                    for sql_query in txn_queries:
+                        cursor.execute(sql_query)
+                    client.mysql_connector_client.commit()
+
+                    n1ql_result = self.n1ql_helper.run_cbq_query('select bool_field1,char_field1,datetime_field1,decimal_field1,int_field1,primary_key_id,varchar_field1 FROM {0}'.format(self.database+"_"+"simple_table"))
+                    columns, rows = client._execute_query(query='SELECT * FROM simple_table')
+                    sql_result = client._gen_json_from_results(columns, rows)
+                    client._close_connection()
+                    diffs = DeepDiff(sql_result, n1ql_result['results'], ignore_order=True,
+                                     ignore_numeric_type_changes=True)
+                    if diffs:
+                        txn_no = 'txn {0}'.format(x)
+                        failures[txn_no] = (diffs, txn_queries)
+                        fails += 1
+                    else:
+                        passes += 1
             else:
                 while not batches.empty():
                     # Split up the batches and send them to the worker threads
@@ -199,18 +445,17 @@ class BaseRQGTests(BaseTestCase):
                     # Create threads based on number of tables (each table has its own thread)
                     self._rqg_worker(table_name, table_map, input_queue, result_queue,
                                                failure_queue)
-                    #t = threading.Thread(target=self._rqg_worker,
-                    #                     args=(table_name, table_map, input_queue, result_queue,
-                    #                           failure_queue))
-                    #t.daemon = True
-                    #t.start()
-                    #thread_list.append(t)
-                #for t in thread_list:
-                #    if(t.is_alive()):
-                #        t.join()
-
-            # Analyze the results for the failure and assert on the run
-            self.analyze_test(result_queue, failure_queue)
+            if not self.use_txns:
+                # Analyze the results for the failure and assert on the run
+                self.analyze_test(result_queue, failure_queue)
+            else:
+                self.log.info("Txns Passed: {0} Txn Failed: {1}".format(passes, fails))
+                if not fails == 0:
+                    self.log.error("Failures were seen, the number of documents in the bucket is not the same in mysql and n1ql after transactions!")
+                    for failure in failures:
+                        self.log.info("----------------------------------------------------------------{0}-----------------------------------------------------------------------------".format(failure))
+                        self.log.info("diffs: {0}  txn: {1}".format(failures[failure][0], failure))
+                    self.fail()
         except Exception as ex:
             traceback.print_exc()
             self.log.info(ex)
@@ -262,62 +507,118 @@ class BaseRQGTests(BaseTestCase):
                 if count > 1000:
                     return
 
-    def n1ql_query_runner_wrapper(self, n1ql_query="", server=None, query_params={}, scan_consistency=None, verbose=True):
+    def n1ql_query_runner_wrapper(self, n1ql_query="", server=None, query_params={}, scan_consistency=None, verbose=True, query_context=None):
         if self.use_advisor:
-            self.create_secondary_index(n1ql_query=n1ql_query)
-        result = self.n1ql_helper.run_cbq_query(query=n1ql_query, server=server, query_params=query_params, scan_consistency=scan_consistency, verbose=verbose)
+            queries = n1ql_query.split(' UNION ')
+            for q in queries:
+                query = re.sub(r"^\((.*?)\)$", r"\1", q.strip())
+                self.create_secondary_index(n1ql_query=query)
+        if self.use_query_context:
+            result = self.n1ql_helper.run_cbq_query(query=n1ql_query, server=server, query_params=query_params,
+                                                    scan_consistency=scan_consistency, verbose=verbose,query_context=query_context,use_sdk=self.use_sdk)
+        else:
+            result = self.n1ql_helper.run_cbq_query(query=n1ql_query, server=server, query_params=query_params, scan_consistency=scan_consistency, verbose=verbose,use_sdk=self.use_sdk)
         return result
 
     def prepare_advise_query(self, n1ql_query=""):
         for bucket in self.advise_dict.keys():
             n1ql_query = n1ql_query.replace(bucket, self.advise_dict[bucket])
+            n1ql_query = n1ql_query.replace("._default._default", '')
+            if self.use_query_context:
+                n1ql_query = n1ql_query.replace("_default", self.advise_dict[bucket])
+            n1ql_query = n1ql_query.replace("PREPARE", "")
         return n1ql_query
 
     def translate_index_statement(self, n1ql_query=""):
+        index_name = ""
+        index_bucket = ""
         for key in self.advise_dict.keys():
             n1ql_query = n1ql_query.replace(self.advise_dict[key], key)
-        return n1ql_query
+        # remote util shell strips all spaces out of returns, need to readd them
+        if not self.use_rest:
+            n1ql_query = n1ql_query.replace("CREATE", "CREATE ")
+            n1ql_query = n1ql_query.replace("INDEX", "INDEX ")
+            n1ql_query = n1ql_query.replace("ON", " ON ")
+            n1ql_query = n1ql_query.replace("(", " ( ")
+            n1ql_query = n1ql_query.replace(")", " ) ")
+            n1ql_query = n1ql_query.replace("`", "\`")
+        index_parts = n1ql_query.split("ON")
+        for statement in index_parts:
+            if "adv" in statement:
+                index_name = statement.replace("CREATE INDEX ", "").strip()
+            elif "`" in statement:
+                if not self.use_rest:
+                    index_bucket = statement.split("(")[0].replace("\`", "").strip()
+                else:
+                    index_bucket = statement.split("(")[0].replace("`", "").strip()
+        return n1ql_query,index_name,index_bucket
 
     def create_secondary_index(self, n1ql_query=""):
-        if self.count_secondary_indexes() >= self.index_limit:
-            self.remove_all_secondary_indexes()
-        self.n1ql_helper.wait_for_all_indexes_online()
-        advise_query = self.prepare_advise_query(n1ql_query=n1ql_query)
+        use_partitioned = False
+        if "EXECUTE" not in n1ql_query:
+            if self.count_secondary_indexes() >= self.index_limit:
+                self.remove_all_secondary_indexes()
+            self.n1ql_helper.wait_for_all_indexes_online()
+            advise_query = self.prepare_advise_query(n1ql_query=n1ql_query)
 
-        advise_result = self.n1ql_helper.run_cbq_query(query="ADVISE " + advise_query,
-                                                       server=self.advise_server)
-        if len(advise_result["results"][0]["advice"]["adviseinfo"]) == 0:
-            return
-        if "index recommendation at this time" not in str(
-                str(advise_result["results"][0]["advice"]["adviseinfo"][0]["recommended_indexes"])):
-            if "indexes" in advise_result["results"][0]["advice"]["adviseinfo"][0][
-                "recommended_indexes"].keys():
-                for index_statement_array in advise_result["results"][0]["advice"]["adviseinfo"][0]["recommended_indexes"]["indexes"]:
-                    index_statement = index_statement_array["index_statement"]
-                    if index_statement != "":
-                        self.n1ql_helper.wait_for_all_indexes_online()
-                        try:
-                            prepared_index_statement = self.translate_index_statement(index_statement)
-                            self.n1ql_helper.run_cbq_query(prepared_index_statement)
-                            self.n1ql_helper.wait_for_all_indexes_online()
-                        except CBQError as ex:
-                            if "already exists" in str(ex):
-                                continue
+            advise_result = self.n1ql_helper.run_cbq_query(query="ADVISE " + advise_query,
+                                                           server=self.n1ql_server)
+            if len(advise_result["results"][0]["advice"]["adviseinfo"]) == 0:
+                self.log.info("No advise for index")
+                return
+            if "index recommendation at this time" not in str(advise_result["results"][0]["advice"]["adviseinfo"]["recommended_indexes"]):
+                if "indexes" in advise_result["results"][0]["advice"]["adviseinfo"][
+                    "recommended_indexes"].keys():
+                    for index_statement_array in advise_result["results"][0]["advice"]["adviseinfo"]["recommended_indexes"]["indexes"]:
+                        index_statement = index_statement_array["index_statement"]
+                        if index_statement != "":
+                            try:
+                                prepared_index_statement, index_name, index_bucket = self.translate_index_statement(index_statement)
+                                # insert randomization logic for partitioned vs non_partitioned indexes
+                                chance_of_partitioned = random.randint(1, 100)
+                                if chance_of_partitioned <= 30:
+                                    use_partitioned = True
+                                    self.log.info("Using partitioned index for this query: {0}".format(n1ql_query))
+                                if self.use_txns:
+                                    if use_partitioned:
+                                        prepared_index_statement = prepared_index_statement + " PARTITION BY HASH(META().id)"
+                                    self.n1ql_helper.run_cbq_query(prepared_index_statement)
+                                    self.n1ql_helper._wait_for_index_online(index_bucket,index_name)
+                                else:
+                                    if use_partitioned:
+                                        prepared_index_statement = prepared_index_statement + " PARTITION BY HASH(META().id)"
+                                        self.log.info(prepared_index_statement)
+                                    self.n1ql_helper.run_cbq_query(prepared_index_statement)
+                                    self.n1ql_helper._wait_for_index_online(index_bucket,index_name)
+                            except CBQError as ex:
+                                if "already exists" in str(ex) or "alreadyexists" in str(ex):
+                                    continue
 
-            if "covering_indexes" in advise_result["results"][0]["advice"]["adviseinfo"][0][
-                "recommended_indexes"].keys():
-                for index_statement_array in advise_result["results"][0]["advice"]["adviseinfo"][0]["recommended_indexes"]["covering_indexes"]:
-                    index_statement = index_statement_array["index_statement"]
-                    if index_statement != "":
-                        self.n1ql_helper.wait_for_all_indexes_online()
-                        try:
-                            prepared_index_statement = self.translate_index_statement(index_statement)
-                            self.n1ql_helper.run_cbq_query(prepared_index_statement)
-                            self.n1ql_helper.wait_for_all_indexes_online()
-                        except CBQError as ex:
-                            if "already exists" in str(ex):
-                                continue
-
+                if "covering_indexes" in advise_result["results"][0]["advice"]["adviseinfo"][
+                    "recommended_indexes"].keys():
+                    for index_statement_array in advise_result["results"][0]["advice"]["adviseinfo"]["recommended_indexes"]["covering_indexes"]:
+                        index_statement = index_statement_array["index_statement"]
+                        if index_statement != "":
+                            try:
+                                prepared_index_statement, index_name, index_bucket = self.translate_index_statement(index_statement)
+                                chance_of_partitioned = random.randint(1, 100)
+                                if chance_of_partitioned <= 30:
+                                    use_partitioned = True
+                                    self.log.info("Using partitioned index for this query: {0}".format(n1ql_query))
+                                if self.use_txns:
+                                    if use_partitioned:
+                                        prepared_index_statement = prepared_index_statement + " PARTITION BY HASH(META().id)"
+                                    self.n1ql_helper.run_cbq_query(prepared_index_statement)
+                                    self.n1ql_helper._wait_for_index_online(index_bucket,index_name)
+                                else:
+                                    if use_partitioned:
+                                        prepared_index_statement = prepared_index_statement + " PARTITION BY HASH(META().id)"
+                                        self.log.info(prepared_index_statement)
+                                    self.n1ql_helper.run_cbq_query(prepared_index_statement)
+                                    self.n1ql_helper._wait_for_index_online(index_bucket,index_name)
+                            except CBQError as ex:
+                                if "already exists" in str(ex) or "alreadyexists" in str(ex):
+                                    continue
 
     def count_secondary_indexes(self):
         count = self.n1ql_helper.run_cbq_query("select count(*) from system:indexes")
@@ -343,6 +644,9 @@ class BaseRQGTests(BaseTestCase):
         result_run["n1ql_query"] = n1ql_query
         result_run["sql_query"] = sql_query
         result_run["test_case_number"] = test_case_number
+
+        # create a randomized set of params to pass to run_queries_and verify, decide prepared or not, partitioned or not, and execution type
+        # store these params in a dictionary (possibly extend result_run to contain these choices
 
         if self.ansi_transform:
             result = self._run_explain_queries(n1ql_query=n1ql_query, keyword="u'outer':u'True'", present=False)
@@ -438,8 +742,10 @@ class BaseRQGTests(BaseTestCase):
             with open(file_path) as f:
                 cur_queries_list = f.readlines()
             for q in cur_queries_list:
-                query_template_list.append(q)
-
+                if self.use_txns:
+                    query_template_list.append((file_path,q))
+                else:
+                    query_template_list.append(q)
         if self.total_queries is None:
             self.total_queries = len(query_template_list)
         return query_template_list
@@ -734,11 +1040,70 @@ class BaseRQGTests(BaseTestCase):
             return {"success": True, "result": "Pass"}
 
     def _run_queries_and_verify(self, aggregate=False, subquery=False, n1ql_query=None, sql_query=None, expected_result=None):
+        query_context = ""
+        skip = False
+        use_prepared = False
+        fts_explain_query = ""
+        chance_of_prepared = random.randint(1, 100)
+        if chance_of_prepared <= 20:
+            use_prepared = True
+            self.log.info("Preparing query {0}".format(n1ql_query))
         if not self.create_primary_index:
             n1ql_query = n1ql_query.replace("USE INDEX(`#primary` USING GSI)", " ")
-        if self.prepared:
+        if self.prepared or use_prepared:
             n1ql_query = "PREPARE " + n1ql_query
-        self.log.info(" SQL QUERY :: {0}".format(sql_query))
+            self.log.info("Prepared query {0}".format(n1ql_query))
+        if self.use_default_collection:
+            n1ql_query = n1ql_query.replace("table_10", "table_010")
+            for bucket in self.advise_dict.keys():
+                n1ql_query = n1ql_query.replace(bucket, bucket+"._default._default")
+            n1ql_query = n1ql_query.replace("table_010", "table_10._default._default")
+        if self.use_query_context:
+            n1ql_query = n1ql_query.replace("table_10", "table_010")
+            # So that query context works for multiple buckets, replace the first matching bucket and leave the rest as full paths
+            for bucket in self.advise_dict.keys():
+                if bucket in n1ql_query and not skip:
+                    n1ql_query = n1ql_query.replace(bucket, "_default")
+                    query_context = "default:"+bucket+"._default"
+                    skip = True
+                else:
+                    n1ql_query = n1ql_query.replace(bucket, bucket + "._default._default")
+            n1ql_query = n1ql_query.replace("table_010", "table_10._default._default")
+
+        fts_query = n1ql_query
+        cbas_query = n1ql_query
+        if self.use_fts:
+            if not "JOIN" in n1ql_query:
+                add_hint = n1ql_query.split("WHERE")
+                fts_query = add_hint[0] + " USE INDEX (USING FTS, USING GSI) WHERE " + add_hint[1]
+                if "BETWEEN" in n1ql_query:
+                    fts_query = add_hint[0] + " USE INDEX (USING FTS) WHERE " + add_hint[1]
+            else:
+                split_list = n1ql_query.split("JOIN")
+                i = 0
+                new_n1ql = ""
+                for items in split_list:
+                    if "ON" in items:
+                        items = items.replace("ON", "USE INDEX (USING FTS) ON")
+                    else:
+                        items = items.replace("INNER",  "USE INDEX (USING FTS) INNER")
+                        items = items.replace("LEFT",  "USE INDEX (USING FTS) LEFT")
+                    if i == 0:
+                        new_n1ql = new_n1ql + items
+                    else:
+                        new_n1ql = new_n1ql + " JOIN " + items
+                    i = i + 1
+                fts_query = new_n1ql
+            fts_explain_query = fts_query
+            self.log.info(" FTS QUERY :: {0}".format(fts_query))
+        elif self.use_analytics:
+            cbas_query = cbas_query.replace("ANY ", "(ANY ")
+            cbas_query = cbas_query.replace("EVERY ", "(EVERY ")
+            cbas_query = cbas_query.replace("SOME ", "(SOME ")
+            cbas_query = cbas_query.replace("END", "END)")
+            cbas_query = cbas_query.replace("type", "`type`")
+        else:
+            self.log.info(" SQL QUERY :: {0}".format(sql_query))
         self.log.info(" N1QL QUERY :: {0}".format(n1ql_query))
         # Run n1ql query
         hints = self.query_helper._find_hints(sql_query)
@@ -750,46 +1115,101 @@ class BaseRQGTests(BaseTestCase):
                 query_params = {'timeout': '1200s'}
             else:
                 query_params={}
-            actual_result = self.n1ql_query_runner_wrapper(n1ql_query=n1ql_query, server=self.n1ql_server, query_params=query_params, scan_consistency="request_plus")
-            if self.prepared:
+            if self.use_fts:
+                fts_result = self.n1ql_query_runner_wrapper(n1ql_query=fts_query, server=self.n1ql_server,
+                                                               query_params=query_params,query_context=query_context)
+                if self.use_query_context:
+                    if "PREPARE" in fts_query:
+                        fts_explain_query = fts_query.replace("PREPARE","")
+                    fts_explain = self.n1ql_helper.run_cbq_query(query="EXPLAIN " + fts_explain_query, server=self.n1ql_server,
+                                                                 query_params=query_params,query_context=query_context,use_sdk=self.use_sdk)
+                else:
+                    if "PREPARE" in fts_query:
+                        fts_explain_query = fts_query.replace("PREPARE","")
+                    fts_explain = self.n1ql_helper.run_cbq_query(query="EXPLAIN " + fts_explain_query, server=self.n1ql_server,query_params=query_params,use_sdk=self.use_sdk)
+                if not (fts_explain['results'][0]['plan']['~children'][0]['#operator'] == 'IndexFtsSearch' or fts_explain['results'][0]['plan']['~children'][0]['~children'][0]['#operator'] == 'IndexFtsSearch'):
+                    return {"success": False, "result": str("Query does not use fts index {0}".format(fts_explain))}
+            elif self.use_analytics:
+                analytics_result = self.n1ql_query_runner_wrapper(n1ql_query=cbas_query, server=self.n1ql_server,
+                                                               query_params=query_params,query_context=query_context)
+
+            actual_result = self.n1ql_query_runner_wrapper(n1ql_query=n1ql_query, server=self.n1ql_server, query_params=query_params, scan_consistency="request_plus",query_context=query_context)
+            if self.prepared or use_prepared:
                 name = actual_result["results"][0]['name']
                 prepared_query = "EXECUTE '%s'" % name
                 self.log.info(" N1QL QUERY :: {0}".format(prepared_query))
-                actual_result = self.n1ql_query_runner_wrapper(n1ql_query=prepared_query, server=self.n1ql_server, query_params=query_params, scan_consistency="request_plus")
+                actual_result = self.n1ql_query_runner_wrapper(n1ql_query=prepared_query, server=self.n1ql_server, query_params=query_params, scan_consistency="request_plus",query_context=query_context)
+                if self.use_fts:
+                    fts_result = self.n1ql_query_runner_wrapper(n1ql_query=prepared_query, server=self.n1ql_server, query_params=query_params, scan_consistency="request_plus",query_context=query_context)
             n1ql_result = actual_result["results"]
+            if self.use_fts:
+                fts_result = fts_result["results"]
+            elif self.use_analytics:
+                analytics_result = analytics_result['results']
 
             # Run SQL Query
-            sql_result = expected_result
-            client = None
-            if self.use_mysql:
-                client = RQGMySQLClient(database=self.database, host=self.mysql_url, user_id=self.user_id, password=self.password)
-            elif self.use_postgres:
-                client = RQGPostgresClient()
+            if not self.use_fts and not self.use_analytics:
+                sql_result = expected_result
+                client = None
+                if self.use_mysql:
+                    client = RQGMySQLClient(database=self.database, host=self.mysql_url, user_id=self.user_id, password=self.password)
+                elif self.use_postgres:
+                    client = RQGPostgresClient()
 
-            if expected_result is None:
-                columns, rows = client._execute_query(query=sql_query)
-                if self.aggregate_pushdown:
-                    sql_result = client._gen_json_from_results_repeated_columns(columns, rows)
-                else:
-                    sql_result = client._gen_json_from_results(columns, rows)
-            client._close_connection()
+                if expected_result is None:
+                    columns, rows = client._execute_query(query=sql_query)
+                    if self.aggregate_pushdown:
+                        sql_result = client._gen_json_from_results_repeated_columns(columns, rows)
+                    else:
+                        sql_result = client._gen_json_from_results(columns, rows)
+                client._close_connection()
+                self.log.info(" result from sql query returns {0} items".format(len(sql_result)))
+            elif self.use_fts:
+                self.log.info(" result from fts query returns {0} items".format(len(fts_result)))
+            elif self.use_analytics:
+                self.log.info(" result from analytics query returns {0} items".format(len(analytics_result)))
             self.log.info(" result from n1ql query returns {0} items".format(len(n1ql_result)))
-            self.log.info(" result from sql query returns {0} items".format(len(sql_result)))
 
-            if len(n1ql_result) != len(sql_result):
-                self.log.info("number of results returned from sql and n1ql are different")
-                self.log.info("sql query is {0}".format(sql_query))
-                self.log.info("n1ql query is {0}".format(n1ql_query))
+            if self.use_fts:
+                if len(n1ql_result) != len(fts_result):
+                    self.log.info("number of results returned from sql and n1ql are different")
+                    self.log.info("fts query is {0}".format(fts_query))
+                    self.log.info("n1ql query is {0}".format(n1ql_query))
 
-                if (len(sql_result) == 0 and len(n1ql_result) == 1) or (len(n1ql_result) == 0 and len(sql_result) == 1) or (len(sql_result) == 0):
+                    if (len(fts_result) == 0 and len(n1ql_result) == 1) or (
+                            len(n1ql_result) == 0 and len(fts_result) == 1) or (len(fts_result) == 0):
                         return {"success": True, "result": "Pass"}
-                return {"success": False, "result": str("different results")}
+                    return {"success": False, "result": str("different results")}
+            elif self.use_analytics:
+                if len(n1ql_result) != len(analytics_result):
+                    self.log.info("number of results returned from analytics and n1ql are different")
+                    self.log.info("analytics query is {0}".format(cbas_query))
+                    self.log.info("n1ql query is {0}".format(n1ql_query))
+
+                    if (len(analytics_result) == 0 and len(n1ql_result) == 1) or (
+                            len(n1ql_result) == 0 and len(analytics_result) == 1) or (len(analytics_result) == 0):
+                        return {"success": True, "result": "Pass"}
+                    return {"success": False, "result": str("different results")}
+            else:
+                if len(n1ql_result) != len(sql_result):
+                    self.log.info("number of results returned from sql and n1ql are different")
+                    self.log.info("sql query is {0}".format(sql_query))
+                    self.log.info("n1ql query is {0}".format(n1ql_query))
+
+                    if (len(sql_result) == 0 and len(n1ql_result) == 1) or (len(n1ql_result) == 0 and len(sql_result) == 1) or (len(sql_result) == 0):
+                            return {"success": True, "result": "Pass"}
+                    return {"success": False, "result": str("different results")}
             try:
-                self.n1ql_helper._verify_results_rqg(subquery, aggregate, sql_result=sql_result, n1ql_result=n1ql_result, hints=hints, aggregate_pushdown=self.aggregate_pushdown)
+                if self.use_fts:
+                    self.n1ql_helper._verify_results_rqg(subquery, aggregate, sql_result=fts_result, n1ql_result=n1ql_result, hints=hints, aggregate_pushdown=self.aggregate_pushdown,use_fts=self.use_fts)
+                elif self.use_analytics:
+                    self.n1ql_helper._verify_results_rqg(subquery, aggregate, sql_result=analytics_result, n1ql_result=n1ql_result, hints=hints, aggregate_pushdown=self.aggregate_pushdown)
+                else:
+                    self.n1ql_helper._verify_results_rqg(subquery, aggregate, sql_result=sql_result, n1ql_result=n1ql_result, hints=hints, aggregate_pushdown=self.aggregate_pushdown)
             except Exception as ex:
                 self.log.info(ex)
                 traceback.print_exc()
-                return {"success": False, "result": str(ex)}
+                return {"success": False, "result": str(ex) }
             return {"success": True, "result": "Pass"}
         except Exception as ex:
             self.log.info(ex)
@@ -986,7 +1406,14 @@ class BaseRQGTests(BaseTestCase):
     def _load_bulk_data_in_buckets_using_n1ql(self, bucket, data_set):
         try:
             n1ql_query = self.query_helper._builk_insert_statement_n1ql(bucket.name, data_set)
-            self.n1ql_helper.run_cbq_query(query=n1ql_query, server=self.n1ql_server, verbose=False)
+            if not self.use_rest:
+                new_query_helper = N1QLHelper(version="sherlock", shell=self.shell, max_verify=self.max_verify,
+                           buckets=self.buckets, item_flag=None, n1ql_port=getattr(self.n1ql_server, 'n1ql_port', 8093),
+                           full_docs_list=[], log=self.log, input=self.input, master=self.master,
+                           database=self.database, use_rest=True)
+                new_query_helper.run_cbq_query(query=n1ql_query, server=self.n1ql_server, verbose=False)
+            else:
+                self.n1ql_helper.run_cbq_query(query=n1ql_query, server=self.n1ql_server, verbose=False)
         except Exception as ex:
             self.log.info('WARN=======================')
             self.log.info(ex)
@@ -1004,7 +1431,13 @@ class BaseRQGTests(BaseTestCase):
         return RQGQueryHelper()
 
     def _initialize_n1ql_helper(self):
-        return N1QLHelper(version="sherlock", shell=None, max_verify=self.max_verify,
+        use_engine = random.randint(1, 100)
+        if use_engine <= 20 and not self.use_analytics:
+            self.use_sdk = True
+        elif use_engine <= 40 and not self.use_analytics:
+            self.use_rest = False
+            self.log.info("We are using the CBQ engine to run queries for this run")
+        return N1QLHelper(version="sherlock", shell=self.shell, max_verify=self.max_verify,
                                       buckets=self.buckets, item_flag=None, n1ql_port=getattr(self.n1ql_server, 'n1ql_port', 8903),
                                       full_docs_list=[], log=self.log, input=self.input, master=self.master,
                                       database=self.database, use_rest=self.use_rest)
@@ -1479,3 +1912,11 @@ class BaseRQGTests(BaseTestCase):
                                       char_value, orderid1, qty1, price1, primary_key_value, orderid2, qty2,
                                       price2, primary_key_value)
             self.n1ql_helper.run_cbq_query(query=n1ql_insert_template, server=self.n1ql_server)
+
+    def _round_float_results(self, results, round_level=0):
+        if round_level > 0:
+            for res in results:
+                for key in res.keys():
+                    if isinstance(res[key], float):
+                        res[key] = round(res[key], round_level)
+        return results

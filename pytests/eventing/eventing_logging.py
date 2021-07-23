@@ -18,6 +18,7 @@ log = logging.getLogger()
 class EventingLogging(EventingBaseTest, LogRedactionBase):
     def setUp(self):
         super(EventingLogging, self).setUp()
+        self.rest.set_service_memoryQuota(service='memoryQuota', memoryQuota=1500)
         if self.create_functions_buckets:
             self.bucket_size = 100
             log.info(self.bucket_size)
@@ -37,6 +38,16 @@ class EventingLogging(EventingBaseTest, LogRedactionBase):
         log.info("Enabling Audit")
         auditing.setAuditEnable('true')
         self.sleep(30)
+        if self.non_default_collection:
+            self.create_scope_collection(bucket=self.src_bucket_name,scope=self.src_bucket_name,collection=self.src_bucket_name)
+            self.create_scope_collection(bucket=self.metadata_bucket_name,scope=self.metadata_bucket_name,collection=self.metadata_bucket_name)
+            self.create_scope_collection(bucket=self.dst_bucket_name,scope=self.dst_bucket_name,collection=self.dst_bucket_name)
+            expected_results_create_collection = {"real_userid:source": "builtin", "real_userid:user": "Administrator",
+                                       "id": 8261, "name": "create collection","description": "Collection was created",
+                                       "bucket_name": self.dst_bucket_name,"collection_name": self.dst_bucket_name,
+                                       "new_manifest_uid": RestConnection(self.master).get_bucket_manifest(self.dst_bucket_name)['uid'],
+                                       "scope_name": self.dst_bucket_name}
+            self.check_config(8261, self.master, expected_results_create_collection)
 
     def tearDown(self):
         super(EventingLogging, self).tearDown()
@@ -48,8 +59,10 @@ class EventingLogging(EventingBaseTest, LogRedactionBase):
 
     def test_eventing_audit_logging(self):
         eventing_node = self.get_nodes_from_services_map(service_type="eventing", get_all_nodes=False)
-        self.load(self.gens_load, buckets=self.src_bucket, flag=self.item_flag, verify_data=False,
-                  batch_size=self.batch_size)
+        if self.non_default_collection:
+            self.load_data_to_collection(self.docs_per_day * self.num_docs, "src_bucket.src_bucket.src_bucket")
+        else:
+            self.load_data_to_collection(self.docs_per_day * self.num_docs, "src_bucket._default._default")
         body = self.create_save_function_body(self.function_name, HANDLER_CODE.BUCKET_OPS_ON_UPDATE)
         self.deploy_function(body)
         expected_results_deploy = {"real_userid:source": "builtin", "real_userid:user": "Administrator",
@@ -58,7 +71,10 @@ class EventingLogging(EventingBaseTest, LogRedactionBase):
         # check audit log if the deploy operation is present in audit log
         self.check_config(32768, eventing_node, expected_results_deploy)
         # Wait for eventing to catch up with all the create mutations and verify results
-        self.verify_eventing_results(self.function_name, self.docs_per_day * 2016)
+        if self.non_default_collection:
+            self.verify_doc_count_collections("src_bucket.src_bucket.src_bucket", self.docs_per_day * self.num_docs)
+        else:
+            self.verify_doc_count_collections("src_bucket._default._default", self.docs_per_day * self.num_docs)
         self.undeploy_and_delete_function(body)
         expected_results_undeploy = {"real_userid:source": "builtin", "real_userid:user": "Administrator",
                                      "context": self.function_name, "id": 32779, "name": "Set Settings",
@@ -83,11 +99,16 @@ class EventingLogging(EventingBaseTest, LogRedactionBase):
         self.log_redaction_level = self.input.param("redaction_level", "partial")
         eventing_node = self.get_nodes_from_services_map(service_type="eventing", get_all_nodes=False)
         log.info("eventing_node : {0}".format(eventing_node))
-        self.load(self.gens_load, buckets=self.src_bucket, flag=self.item_flag, verify_data=False,
-                  batch_size=self.batch_size)
+        if self.non_default_collection:
+            self.load_data_to_collection(self.docs_per_day * self.num_docs, "src_bucket.src_bucket.src_bucket")
+        else:
+            self.load_data_to_collection(self.docs_per_day * self.num_docs, "src_bucket._default._default")
         body = self.create_save_function_body(self.function_name, HANDLER_CODE.BUCKET_OPS_ON_UPDATE)
         self.deploy_function(body)
-        self.verify_eventing_results(self.function_name, self.docs_per_day * 2016)
+        if self.non_default_collection:
+            self.verify_doc_count_collections("src_bucket.src_bucket.src_bucket", self.docs_per_day * self.num_docs)
+        else:
+            self.verify_doc_count_collections("src_bucket._default._default", self.docs_per_day * self.num_docs)
         self.undeploy_and_delete_function(body)
         self.set_redaction_level()
         self.start_logs_collection()
@@ -111,5 +132,24 @@ class EventingLogging(EventingBaseTest, LogRedactionBase):
                                   redactFileName=redactFileName,
                                   nonredactFileName=nonredactFileName,
                                   logFileName="ns_server.eventing.log")
+
+
+    def test_log_rotation(self):
+        self.load_sample_buckets(self.server, "travel-sample")
+        self.src_bucket_name="travel-sample"
+        body = self.create_save_function_body(self.function_name, "handler_code/logger.js")
+        body['settings']['app_log_max_size']=3768300
+        self.rest.create_function(body['appname'], body)
+        # deploy a function without any alias
+        self.deploy_function(body)
+        self.verify_doc_count_collections("dst_bucket._default._default", 31591)
+        number=self.check_number_of_files()
+        if number ==1:
+            raise Exception("Files not rotated")
+        matched, count=self.check_word_count_eventing_log(self.function_name,"docId:",31591)
+        self.skip_metabucket_check = True
+        if not matched:
+            raise Exception("Not all data logged in file")
+
 
 

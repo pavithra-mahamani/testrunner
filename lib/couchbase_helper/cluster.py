@@ -3,12 +3,12 @@ from tasks.taskmanager import TaskManager
 from tasks.task import *
 import types
 
-
 """An API for scheduling tasks that run against Couchbase Server
 
 This module is contains the top-level API's for scheduling and executing tasks. The
 API provides a way to run task do syncronously and asynchronously.
 """
+
 
 class Cluster(object):
     """An API for interacting with Couchbase clusters"""
@@ -85,8 +85,6 @@ class Cluster(object):
         self.task_manager.schedule(_task)
         return _task
 
-
-
     def async_failover(self, servers=[], failover_nodes=[], graceful=False,
                        use_hostnames=False, wait_for_pending=0):
         """Asynchronously failover a set of nodes
@@ -109,12 +107,12 @@ class Cluster(object):
         self.task_manager.schedule(_task)
         return _task
 
-    def async_create_collection(self, server, bucket_name, scope_name, collection_name, collection_params):
+    def async_create_collection(self, server, bucket_name, scope_name, collection_name, collection_params=None):
         _task = CollectionCreateTask(server, bucket_name, scope_name, collection_name, collection_params)
         self.task_manager.schedule(_task)
         return _task
 
-    def async_create_scope_collection(self, server, bucket_name, scope_name, collection_name, collection_params):
+    def async_create_scope_collection(self, server, bucket_name, scope_name, collection_name, collection_params=None):
         _task = ScopeCollectionCreateTask(server, bucket_name, scope_name, collection_name, collection_params)
         self.task_manager.schedule(_task)
         return _task
@@ -137,7 +135,7 @@ class Cluster(object):
     def async_init_node(self, server, disabled_consistent_view=None,
                         rebalanceIndexWaitingDisabled=None, rebalanceIndexPausingDisabled=None,
                         maxParallelIndexers=None, maxParallelReplicaIndexers=None, port=None,
-                        quota_percent=None, services = None, index_quota_percent = None, gsi_type='forestdb'):
+                        quota_percent=None, services=None, index_quota_percent=None, gsi_type='plasma'):
         """Asynchronously initializes a node
 
         The task scheduled will initialize a nodes username and password and will establish
@@ -159,75 +157,88 @@ class Cluster(object):
             NodeInitTask - A task future that is a handle to the scheduled task."""
 
         _task = NodeInitializeTask(server, disabled_consistent_view, rebalanceIndexWaitingDisabled,
-                          rebalanceIndexPausingDisabled, maxParallelIndexers, maxParallelReplicaIndexers,
-                          port, quota_percent, services = services, index_quota_percent = index_quota_percent,
-                          gsi_type=gsi_type)
+                                   rebalanceIndexPausingDisabled, maxParallelIndexers, maxParallelReplicaIndexers,
+                                   port, quota_percent, services=services, index_quota_percent=index_quota_percent,
+                                   gsi_type=gsi_type)
         self.task_manager.schedule(_task)
         return _task
 
-    def async_load_gen_docs(self, server, bucket, generator, kv_store=None, op_type=None, exp=0, flag=0, only_store_hash=True,
-                            batch_size=1, pause_secs=1, timeout_secs=5, proxy_client=None, compression=True, collection=None):
+    def async_load_gen_docs(self, server, bucket, generator, kv_store=None, op_type=None, exp=0, flag=0,
+                            only_store_hash=True, batch_size=1, pause_secs=1, timeout_secs=5, proxy_client=None,
+                            compression=True, scope=None, collection=None):
 
         if isinstance(generator, list):
-                _task = LoadDocumentsGeneratorsTask(server, bucket, generator, kv_store, op_type, exp, flag,
-                                                    only_store_hash, batch_size, compression=compression, collection=collection)
-        # Load using javs sdk client
+            _task = LoadDocumentsGeneratorsTask(server, bucket, generator, kv_store, op_type, exp, flag,
+                                                only_store_hash, batch_size, compression=compression,
+                                                scope=scope, collection=collection)
+        # Load using java sdk client
         elif not generator.isGenerator():
-                _task = SDKLoadDocumentsTask(server, bucket, generator, pause_secs, timeout_secs)
+            generator.doc_expiry = exp
+            _task = SDKLoadDocumentsTask(server, bucket, generator)
         else:
-                _task = LoadDocumentsGeneratorsTask(server, bucket, [generator], kv_store, op_type, exp, flag,
-                                                    only_store_hash, batch_size, compression=compression, collection=collection)
+            _task = LoadDocumentsGeneratorsTask(server, bucket, [generator], kv_store, op_type, exp, flag,
+                                                only_store_hash, batch_size, compression=compression,
+                                                scope=scope, collection=collection)
 
         self.task_manager.schedule(_task)
         return _task
 
     def async_workload(self, server, bucket, kv_store, num_ops, create, read, update,
-                       delete, exp, compression=True, collection=None):
+                       delete, exp, compression=True, scope=None, collection=None):
         _task = WorkloadTask(server, bucket, kv_store, num_ops, create, read, update,
-                             delete, exp, compression=compression, collection=collection)
+                             delete, exp, compression=compression, scope=scope, collection=collection)
         self.task_manager.schedule(_task)
         return _task
 
     def async_verify_data(self, server, bucket, kv_store, max_verify=None,
-                          only_store_hash=True, batch_size=1, replica_to_read=None, timeout_sec=5, compression=True, collection=None):
+                          only_store_hash=True, batch_size=1, replica_to_read=None, timeout_sec=60, compression=True,
+                          scope=None, collection=None):
         if batch_size > 1:
             _task = BatchedValidateDataTask(server, bucket, kv_store, max_verify, only_store_hash, batch_size,
-                                            timeout_sec, compression=compression, collection=collection)
+                                            timeout_sec, compression=compression, scope=scope, collection=collection)
         else:
             _task = ValidateDataTask(server, bucket, kv_store, max_verify, only_store_hash, replica_to_read,
-                                     compression=compression, collection=collection)
+                                     compression=compression, scope=scope, collection=collection)
         self.task_manager.schedule(_task)
         return _task
 
-    def async_verify_active_replica_data(self, server, bucket, kv_store, max_verify=None, compression=True, collection=None):
-        _task = ValidateDataWithActiveAndReplicaTask(server, bucket, kv_store, max_verify, compression=compression, collection=collection)
+    def async_verify_active_replica_data(self, server, bucket, kv_store, max_verify=None, compression=True,
+                                         scope=None, collection=None):
+        _task = ValidateDataWithActiveAndReplicaTask(server, bucket, kv_store, max_verify, compression=compression,
+                                                     scope=scope, collection=collection)
         self.task_manager.schedule(_task)
         return _task
 
-    def async_verify_meta_data(self, dest_server, bucket, kv_store, meta_data_store, collection=None):
-        _task = VerifyMetaDataTask(dest_server, bucket, kv_store, meta_data_store, collection=collection)
+    def async_verify_meta_data(self, dest_server, bucket, kv_store, meta_data_store, scope=None, collection=None):
+        _task = VerifyMetaDataTask(dest_server, bucket, kv_store, meta_data_store, scope=scope, collection=collection)
         self.task_manager.schedule(_task)
         return _task
 
-    def async_get_meta_data(self, dest_server, bucket, kv_store, compression=True, collection=None):
-        _task = GetMetaDataTask(dest_server, bucket, kv_store, compression=compression, collection=collection)
+    def async_get_meta_data(self, dest_server, bucket, kv_store, compression=True, scope=None, collection=None):
+        _task = GetMetaDataTask(dest_server, bucket, kv_store, compression=compression, scope=scope, collection=collection)
         self.task_manager.schedule(_task)
         return _task
 
     def async_verify_revid(self, src_server, dest_server, bucket, src_kv_store, dest_kv_store, max_verify=None,
-                           compression=True, collection=None):
+                           compression=True, scope=None, collection=None):
         _task = VerifyRevIdTask(src_server, dest_server, bucket, src_kv_store, dest_kv_store, max_verify=max_verify,
-                                compression=compression, collection=collection)
+                                compression=compression, scope=scope, collection=collection)
+        self.task_manager.schedule(_task)
+        return _task
+
+    def async_verify_collection_doc_count(self, src_server, dest_server, bucket, mapping):
+        _task = VerifyCollectionDocCountTask(src_server, dest_server, bucket, mapping)
         self.task_manager.schedule(_task)
         return _task
 
     def async_run_fts_query_compare(self, fts_index, es_instance, query_index,
-                                    es_index_name=None, n1ql_executor=None):
+                                    es_index_name=None, n1ql_executor=None, use_collections=False):
         _task = ESRunQueryCompare(fts_index,
                                   es_instance,
                                   query_index=query_index,
                                   es_index_name=es_index_name,
-                                  n1ql_executor=n1ql_executor)
+                                  n1ql_executor=n1ql_executor,
+                                  use_collections=use_collections)
         self.task_manager.schedule(_task)
         return _task
 
@@ -249,7 +260,7 @@ class Cluster(object):
         self.task_manager.schedule(_task)
         return _task
 
-    def async_wait_for_stats(self, servers, bucket, param, stat, comparison, value, collection=None):
+    def async_wait_for_stats(self, servers, bucket, param, stat, comparison, value, scope=None, collection=None):
         """Asynchronously wait for stats
 
         Waits for stats to match the criteria passed by the stats variable. See
@@ -268,11 +279,11 @@ class Cluster(object):
 
         Returns:
             RebalanceTask - A task future that is a handle to the scheduled task"""
-        _task = StatsWaitTask(servers, bucket, param, stat, comparison, value, collection)
+        _task = StatsWaitTask(servers, bucket, param, stat, comparison, value, scope, collection)
         self.task_manager.schedule(_task)
         return _task
 
-    def async_wait_for_xdcr_stat(self, servers, bucket, param, stat, comparison, value, collection=None):
+    def async_wait_for_xdcr_stat(self, servers, bucket, param, stat, comparison, value,scope=None, collection=None):
         """Asynchronously wait for stats
 
         Waits for stats to match the criteria passed by the stats variable. See
@@ -290,8 +301,8 @@ class Cluster(object):
             value - The value to compare to.
 
         Returns:
-            RebalanceTask - A task future that is a handle to the scheduled task"""
-        _task = XdcrStatsWaitTask(servers, bucket, param, stat, comparison, value, collection=collection)
+            XdcrStatsWaitTask - A task future that is a handle to the scheduled task"""
+        _task = XdcrStatsWaitTask(servers, bucket, param, stat, comparison, value, scope=scope, collection=collection)
         self.task_manager.schedule(_task)
         return _task
 
@@ -307,7 +318,7 @@ class Cluster(object):
         _task = self.async_create_default_bucket(bucket_params)
         return _task.result(timeout)
 
-    def create_sasl_bucket(self, name, password,bucket_params, timeout=None):
+    def create_sasl_bucket(self, name, password, bucket_params, timeout=None):
         """Synchronously creates a sasl bucket
 
         Parameters:
@@ -365,7 +376,8 @@ class Cluster(object):
         _task = self.async_delete_scope_collection(server, bucket_name, scope_name, collection_name)
         return _task
 
-    def init_node(self, server, async_init_node=True, disabled_consistent_view=None, services = None, index_quota_percent = None):
+    def init_node(self, server, async_init_node=True, disabled_consistent_view=None, services=None,
+                  index_quota_percent=None):
         """Synchronously initializes a node
 
         The task scheduled will initialize a nodes username and password and will establish
@@ -378,7 +390,8 @@ class Cluster(object):
 
         Returns:
             boolean - Whether or not the node was properly initialized."""
-        _task = self.async_init_node(server, async_init_node, disabled_consistent_view, services = services, index_quota_percent= index_quota_percent)
+        _task = self.async_init_node(server, async_init_node, disabled_consistent_view, services=services,
+                                     index_quota_percent=index_quota_percent)
         return _task.result()
 
     def rebalance(self, servers, to_add, to_remove, timeout=None,
@@ -426,10 +439,10 @@ class Cluster(object):
             total_loaded = 0
             for load in loaded:
                 total_loaded += int(load.split(':')[1].strip())
-            assert (total_loaded == items),\
+            assert (total_loaded == items), \
                 "Failed to load {} items. Loaded only {} items".format(
-                                 items,
-                                 total_loaded)
+                    items,
+                    total_loaded)
 
     def check_dataloss_for_high_ops_loader(self, server, bucket, items,
                                            batch=20000, threads=5,
@@ -550,7 +563,8 @@ class Cluster(object):
         self.task_manager.schedule(_task)
         return _task
 
-    def create_view(self, server, design_doc_name, view, bucket="default", timeout=None, with_query=True, check_replication=False):
+    def create_view(self, server, design_doc_name, view, bucket="default", timeout=None, with_query=True,
+                    check_replication=False):
         """Synchronously creates a views in a design doc
 
         Parameters:
@@ -594,7 +608,6 @@ class Cluster(object):
         _task = self.async_delete_view(server, design_doc_name, view, bucket)
         return _task.result(timeout)
 
-
     def async_query_view(self, server, design_doc_name, view_name, query,
                          expected_rows=None, bucket="default", retry_time=2):
         """Asynchronously query a views in a design doc
@@ -629,7 +642,6 @@ class Cluster(object):
             ViewQueryTask - A task future that is a handle to the scheduled task."""
         _task = self.async_query_view(server, design_doc_name, view_name, query, expected_rows, bucket, retry_time)
         return _task.result(timeout)
-
 
     def modify_fragmentation_config(self, server, config, bucket="default", timeout=None):
         """Synchronously modify fragmentation configuration spec
@@ -759,15 +771,15 @@ class Cluster(object):
         return _task
 
     def async_n1ql_query_verification(self,
-                 server, bucket,
-                 query, n1ql_helper = None,
-                 expected_result=None,
-                 is_explain_query = False,
-                 index_name = None,
-                 verify_results = True,
-                 retry_time=2,
-                 scan_consistency = None,
-                 scan_vector = None):
+                                      server, bucket,
+                                      query, n1ql_helper=None,
+                                      expected_result=None,
+                                      is_explain_query=False,
+                                      index_name=None,
+                                      verify_results=True,
+                                      retry_time=2,
+                                      scan_consistency=None,
+                                      scan_vector=None):
         """Asynchronously runs n1ql querya and verifies result if required
 
         Parameters:
@@ -784,29 +796,29 @@ class Cluster(object):
             scan_vector - scan vector used for consistency
         Returns:
             N1QLQueryTask - A task future that is a handle to the scheduled task."""
-        _task = N1QLQueryTask(n1ql_helper = n1ql_helper,
-                 server = server, bucket = bucket,
-                 query = query, expected_result=expected_result,
-                 verify_results = verify_results,
-                 is_explain_query = is_explain_query,
-                 index_name = index_name,
-                 retry_time= retry_time,
-                 scan_consistency = scan_consistency,
-                 scan_vector = scan_vector)
+        _task = N1QLQueryTask(n1ql_helper=n1ql_helper,
+                              server=server, bucket=bucket,
+                              query=query, expected_result=expected_result,
+                              verify_results=verify_results,
+                              is_explain_query=is_explain_query,
+                              index_name=index_name,
+                              retry_time=retry_time,
+                              scan_consistency=scan_consistency,
+                              scan_vector=scan_vector)
         self.task_manager.schedule(_task)
         return _task
 
     def n1ql_query_verification(self,
-                 server, bucket,
-                 query, n1ql_helper = None,
-                 expected_result=None,
-                 is_explain_query = False,
-                 index_name = None,
-                 verify_results = True,
-                 scan_consistency = None,
-                 scan_vector = None,
-                 retry_time=2,
-                 timeout = 60):
+                                server, bucket,
+                                query, n1ql_helper=None,
+                                expected_result=None,
+                                is_explain_query=False,
+                                index_name=None,
+                                verify_results=True,
+                                scan_consistency=None,
+                                scan_vector=None,
+                                retry_time=2,
+                                timeout=60):
         """Synchronously runs n1ql querya and verifies result if required
 
         Parameters:
@@ -824,24 +836,24 @@ class Cluster(object):
             timeout - timeout for task
         Returns:
             N1QLQueryTask - A task future that is a handle to the scheduled task."""
-        _task = self.async_n1ql_query_verification(n1ql_helper = n1ql_helper,
-                 server = server, bucket = bucket,
-                 query = query, expected_result=expected_result,
-                 is_explain_query = is_explain_query,
-                 index_name = index_name,
-                 verify_results = verify_results,
-                 retry_time= retry_time,
-                 scan_consistency = scan_consistency,
-                 scan_vector = scan_vector)
+        _task = self.async_n1ql_query_verification(n1ql_helper=n1ql_helper,
+                                                   server=server, bucket=bucket,
+                                                   query=query, expected_result=expected_result,
+                                                   is_explain_query=is_explain_query,
+                                                   index_name=index_name,
+                                                   verify_results=verify_results,
+                                                   retry_time=retry_time,
+                                                   scan_consistency=scan_consistency,
+                                                   scan_vector=scan_vector)
         return _task.result(timeout)
 
     def async_create_index(self,
-                 server, bucket,
-                 query, n1ql_helper = None,
-                 index_name = None,
-                 defer_build = False,
-                 retry_time=2,
-                 timeout = 240):
+                           server, bucket,
+                           query, n1ql_helper=None,
+                           index_name=None,
+                           defer_build=False,
+                           retry_time=2,
+                           timeout=240):
         """Asynchronously runs create index task
 
         Parameters:
@@ -855,21 +867,21 @@ class Cluster(object):
             timeout - timeout for index to come online
         Returns:
             CreateIndexTask - A task future that is a handle to the scheduled task."""
-        _task = CreateIndexTask(n1ql_helper = n1ql_helper,
-                 server = server, bucket = bucket,
-                 defer_build = defer_build,
-                 index_name = index_name,
-                 query = query,
-                 retry_time= retry_time,
-                 timeout = timeout)
+        _task = CreateIndexTask(n1ql_helper=n1ql_helper,
+                                server=server, bucket=bucket,
+                                defer_build=defer_build,
+                                index_name=index_name,
+                                query=query,
+                                retry_time=retry_time,
+                                timeout=timeout)
         self.task_manager.schedule(_task)
         return _task
 
     def async_monitor_index(self,
-                 server, bucket, n1ql_helper = None,
-                 index_name = None,
-                 retry_time=2,
-                 timeout = 240):
+                            server, bucket, n1ql_helper=None,
+                            index_name=None,
+                            retry_time=2,
+                            timeout=240):
         """Asynchronously runs create index task
 
         Parameters:
@@ -882,18 +894,18 @@ class Cluster(object):
             n1ql_helper - n1ql helper object
         Returns:
             MonitorIndexTask - A task future that is a handle to the scheduled task."""
-        _task = MonitorIndexTask(n1ql_helper = n1ql_helper,
-                 server = server, bucket = bucket,
-                 index_name = index_name,
-                 retry_time= retry_time,
-                 timeout = timeout)
+        _task = MonitorIndexTask(n1ql_helper=n1ql_helper,
+                                 server=server, bucket=bucket,
+                                 index_name=index_name,
+                                 retry_time=retry_time,
+                                 timeout=timeout)
         self.task_manager.schedule(_task)
         return _task
 
     def async_build_index(self,
-                 server, bucket,
-                 query, n1ql_helper = None,
-                 retry_time=2):
+                          server, bucket,
+                          query, n1ql_helper=None,
+                          retry_time=2):
         """Asynchronously runs create index task
 
         Parameters:
@@ -904,19 +916,19 @@ class Cluster(object):
             n1ql_helper - n1ql helper object
         Returns:
             BuildIndexTask - A task future that is a handle to the scheduled task."""
-        _task = BuildIndexTask(n1ql_helper = n1ql_helper,
-                 server = server, bucket = bucket,
-                 query = query,
-                 retry_time= retry_time)
+        _task = BuildIndexTask(n1ql_helper=n1ql_helper,
+                               server=server, bucket=bucket,
+                               query=query,
+                               retry_time=retry_time)
         self.task_manager.schedule(_task)
         return _task
 
     def create_index(self,
-                 server, bucket,
-                 query, n1ql_helper = None,
-                 index_name = None,
-                 defer_build = False,
-                 retry_time=2, timeout= 60):
+                     server, bucket,
+                     query, n1ql_helper=None,
+                     index_name=None,
+                     defer_build=False,
+                     retry_time=2, timeout=60):
         """Asynchronously runs drop index task
 
         Parameters:
@@ -930,19 +942,19 @@ class Cluster(object):
             timeout - timeout for the task
         Returns:
             N1QLQueryTask - A task future that is a handle to the scheduled task."""
-        _task = self.async_create_index(n1ql_helper = n1ql_helper,
-                 server = server, bucket = bucket,
-                 query = query,
-                 index_name = index_name,
-                 defer_build = defer_build,
-                 retry_time= retry_time)
+        _task = self.async_create_index(n1ql_helper=n1ql_helper,
+                                        server=server, bucket=bucket,
+                                        query=query,
+                                        index_name=index_name,
+                                        defer_build=defer_build,
+                                        retry_time=retry_time)
         return _task.result(timeout)
 
     def async_drop_index(self,
-                 server = None, bucket = "default",
-                 query = None, n1ql_helper = None,
-                 index_name = None,
-                 retry_time=2):
+                         server=None, bucket="default",
+                         query=None, n1ql_helper=None,
+                         index_name=None,
+                         retry_time=2):
         """Synchronously runs drop index task
 
         Parameters:
@@ -954,20 +966,19 @@ class Cluster(object):
             n1ql_helper - n1ql helper object
         Returns:
             DropIndexTask - A task future that is a handle to the scheduled task."""
-        _task = DropIndexTask(n1ql_helper = n1ql_helper,
-                 server = server, bucket = bucket,
-                 query = query,
-                 index_name = index_name,
-                 retry_time= retry_time)
+        _task = DropIndexTask(n1ql_helper=n1ql_helper,
+                              server=server, bucket=bucket,
+                              query=query,
+                              index_name=index_name,
+                              retry_time=retry_time)
         self.task_manager.schedule(_task)
         return _task
 
-
     def drop_index(self,
-                 server, bucket,
-                 query, n1ql_helper = None,
-                 index_name = None,
-                 retry_time=2, timeout = 60):
+                   server, bucket,
+                   query, n1ql_helper=None,
+                   index_name=None,
+                   retry_time=2, timeout=60):
         """Synchronously runs drop index task
 
         Parameters:
@@ -980,14 +991,15 @@ class Cluster(object):
             timeout - timeout for the task
         Returns:
             N1QLQueryTask - A task future that is a handle to the scheduled task."""
-        _task = self.async_drop_index(n1ql_helper = n1ql_helper,
-                 server = server, bucket = bucket,
-                 query = query,
-                 index_name = index_name,
-                 retry_time= retry_time)
+        _task = self.async_drop_index(n1ql_helper=n1ql_helper,
+                                      server=server, bucket=bucket,
+                                      query=query,
+                                      index_name=index_name,
+                                      retry_time=retry_time)
         return _task.result(timeout)
 
-    def async_view_query_verification(self, design_doc_name, view_name, query, expected_rows, num_verified_docs=20, bucket="default", query_timeout=20,
+    def async_view_query_verification(self, design_doc_name, view_name, query, expected_rows, num_verified_docs=20,
+                                      bucket="default", query_timeout=20,
                                       results=None, server=None):
         """Asynchronously query a views in a design doc and does full verification of results
 
@@ -1005,7 +1017,8 @@ class Cluster(object):
 
         Returns:
             ViewQueryVerificationTask - A task future that is a handle to the scheduled task."""
-        _task = ViewQueryVerificationTask(design_doc_name, view_name, query, expected_rows, server, num_verified_docs, bucket, query_timeout, results=results)
+        _task = ViewQueryVerificationTask(design_doc_name, view_name, query, expected_rows, server, num_verified_docs,
+                                          bucket, query_timeout, results=results)
         self.task_manager.schedule(_task)
         return _task
 
@@ -1030,9 +1043,9 @@ class Cluster(object):
         Returns:
             dict - An object with keys: passed = True or False
                                         errors = reasons why verification failed """
-        _task = self.async_view_query_verification(server, design_doc_name, view_name, query, expected_rows, num_verified_docs, bucket, query_timeout, results)
+        _task = self.async_view_query_verification(server, design_doc_name, view_name, query, expected_rows,
+                                                   num_verified_docs, bucket, query_timeout, results)
         return _task.result(timeout)
-
 
     def monitor_view_fragmentation(self, server,
                                    design_doc_name,
@@ -1078,7 +1091,6 @@ class Cluster(object):
         Returns:
             ViewCompactionTask - A task future that is a handle to the scheduled task."""
 
-
         _task = ViewCompactionTask(server, design_doc_name, bucket, with_rebalance)
         self.task_manager.schedule(_task)
         return _task
@@ -1102,7 +1114,7 @@ class Cluster(object):
         _task = self.async_compact_view(server, design_doc_name, bucket, with_rebalance)
         return _task.result(timeout)
 
-    def failover(self, servers=[], failover_nodes=[], graceful=False, use_hostnames=False,timeout=None):
+    def failover(self, servers=[], failover_nodes=[], graceful=False, use_hostnames=False, timeout=None):
         """Synchronously flushes a bucket
 
         Parameters:
@@ -1143,8 +1155,6 @@ class Cluster(object):
         _task = self.async_bucket_flush(server, bucket)
         return _task.result(timeout)
 
-
-
     def async_monitor_db_fragmentation(self, server, fragmentation, bucket, get_view_frag=False):
         """Asyncronously monitor db fragmentation
 
@@ -1176,7 +1186,7 @@ class Cluster(object):
         return _task
 
     def cbrecovery(self, src_server, dest_server, bucket_src='', bucket_dest='', username='', password='',
-                 username_dest='', password_dest='', verbose=False, wait_completed=True,timeout=None):
+                   username_dest='', password_dest='', verbose=False, wait_completed=True, timeout=None):
         """Synchronously run and monitor cbrecovery
 
         Parameters:
@@ -1194,11 +1204,11 @@ class Cluster(object):
         Returns:
             boolean - Whether or not the cbrecovery completed successfully"""
         _task = self.async_cbrecovery(src_server, dest_server, bucket_src, bucket_dest, username, password,
-                 username_dest, password_dest, verbose, wait_completed)
+                                      username_dest, password_dest, verbose, wait_completed)
         return _task.result(timeout)
 
     def async_cbrecovery(self, src_server, dest_server, bucket_src='', bucket_dest='', username='', password='',
-                 username_dest='', password_dest='', verbose=False, wait_completed=True):
+                         username_dest='', password_dest='', verbose=False, wait_completed=True):
         """Asyncronously run/monitor cbrecovery
 
         Parameters:
@@ -1216,7 +1226,7 @@ class Cluster(object):
         Returns:
             CBRecoveryTask - A task future that is a handle to the scheduled task"""
         _task = CBRecoveryTask(src_server, dest_server, bucket_src, bucket_dest, username, password,
-                 username_dest, password_dest, verbose, wait_completed)
+                               username_dest, password_dest, verbose, wait_completed)
         self.task_manager.schedule(_task)
         return _task
 
@@ -1232,7 +1242,6 @@ class Cluster(object):
         _task = CompactBucketTask(server, bucket)
         self.task_manager.schedule(_task)
         return _task
-
 
     def compact_bucket(self, server, bucket="default"):
         """Synchronously runs bucket compaction and monitors progress
@@ -1264,12 +1273,12 @@ class Cluster(object):
         Returns:
             MonitorViewCompactionTask - A task future that is a handle to the scheduled task."""
 
-
         _task = MonitorViewCompactionTask(server, design_doc_name, bucket, with_rebalance, frag_value)
         self.task_manager.schedule(_task)
         return _task
 
-    def monitor_compact_view(self, server, design_doc_name, bucket="default", timeout=None, with_rebalance=False, frag_value=0):
+    def monitor_compact_view(self, server, design_doc_name, bucket="default", timeout=None, with_rebalance=False,
+                             frag_value=0):
         """Synchronously monitor view compaction.
 
         Parameters:
@@ -1313,46 +1322,36 @@ class Cluster(object):
         status = _task.result()
         return status
 
-    def async_backup_cluster(self, cluster_host, backup_host, directory='', name='',
-                             resume=False, purge=False, no_progress_bar=False,
+    def async_backup_cluster(self, backupset, objstore_provider, resume=False, purge=False, no_progress_bar=False,
                              cli_command_location='', cb_version=None, num_shards=''):
         """
         Asynchronously starts backup cluster
 
-        :param cluster_host: host to be backed up
-        :param backup_host: host where backup happens
-        :param directory: backup directory
-        :param name: backup name
+        :param backupset: backupset containing common parameter passed into backup tests
+        :param cloud_provider: an object which implements 'Provider'
         :param resume: bool to decide if it is a resume
         :param purge: bool to decide if it is a purge
         :param no_progress_bar: bool to decide progress bar
         :param cli_command_location: command location with respect to os
         :return: task with the output or error message
         """
-        _task = EnterpriseBackupTask(cluster_host, backup_host, directory, name, resume,
-                                     purge, no_progress_bar, cli_command_location, cb_version,
-                                     num_shards)
+        _task = EnterpriseBackupTask(backupset, objstore_provider, resume, purge, no_progress_bar, cli_command_location,
+                                     cb_version, num_shards)
         self.task_manager.schedule(_task)
         return _task
 
-    def async_restore_cluster(self, restore_host, backup_host, backups=[], start=0, end=0, directory='', name='',
-                 force_updates=False, no_progress_bar=False, cli_command_location='', cb_version=None):
+    def async_restore_cluster(self, backupset, objstore_provider, no_progress_bar=False, cli_command_location='',
+                              cb_version=None):
         """
         Asynchronously start backup restore
-        :param restore_host: cluster to be restored to
-        :param backup_host: cluster where backup happens
-        :param backups: list of backups available
-        :param start: backup start index
-        :param end: backup end index
-        :param directory: backup directory
-        :param name: backup name
+        :param backupset: backupset containing common parameter passed into backup tests
+        :param cloud_provider: an object which implements 'Provider'
         :param force_updates: bool to decide if force_updates
         :param no_progress_bar: bool to decide progress bar
         :param cli_command_location: cli_command_location: command location with respect to os
         :return: task with the output or error message
         """
-        _task = EnterpriseRestoreTask(restore_host, backup_host, backups, start, end, directory, name,
-                                      force_updates, no_progress_bar, cli_command_location, cb_version)
+        _task = EnterpriseRestoreTask(backupset, objstore_provider, no_progress_bar, cli_command_location, cb_version)
         self.task_manager.schedule(_task)
         return _task
 
@@ -1376,7 +1375,7 @@ class Cluster(object):
         return _task
 
     def async_compact_cluster(self, backup_host, backup_to_compact, backups=[], directory='', name='',
-                            cli_command_location=''):
+                              cli_command_location=''):
         """
         Asynchronously start backup merge
         :param backup_host: cluster where backup happens
@@ -1388,7 +1387,7 @@ class Cluster(object):
         :return: task with the output or error message
         """
         _task = EnterpriseCompactTask(backup_host, backup_to_compact, backups, directory, name,
-                                    cli_command_location)
+                                      cli_command_location)
         self.task_manager.schedule(_task)
         return _task
 
@@ -1405,3 +1404,11 @@ class Cluster(object):
         _task = CBASQueryExecuteTask(server, cbas_endpoint, statement, mode, pretty)
         self.task_manager.schedule(_task)
         return _task
+
+    def async_log_scan(self, servers, file_prefix):
+        _tasks = []
+        for server in servers:
+            _task = LogScanTask(server, file_prefix)
+            self.task_manager.schedule(_task)
+            _tasks.append(_task)
+        return _tasks

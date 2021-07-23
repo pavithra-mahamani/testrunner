@@ -3,6 +3,7 @@
 import copy
 import json
 import random
+import time
 from threading import Thread
 
 import Geohash
@@ -10,9 +11,14 @@ from membase.helper.cluster_helper import ClusterOperationHelper
 from remote.remote_util import RemoteMachineShellConnection
 
 from TestInput import TestInputSingleton
-from .fts_base import FTSBaseTest
+from tasks.task import ESRunQueryCompare
+from tasks.taskmanager import TaskManager
+from lib.testconstants import FUZZY_FTS_SMALL_DATASET, FUZZY_FTS_LARGE_DATASET
+from .fts_base import FTSBaseTest, INDEX_DEFAULTS, QUERY, download_from_s3
 from lib.membase.api.exception import FTSException, ServerUnavailableException
 from lib.membase.api.rest_client import RestConnection
+from couchbase_helper.documentgenerator import SDKDataLoader
+import threading
 
 
 class StableTopFTS(FTSBaseTest):
@@ -30,9 +36,9 @@ class StableTopFTS(FTSBaseTest):
         except ServerUnavailableException as e:
             raise FTSException("FTS service has not started: %s" %e)
 
-    def create_simple_default_index(self):
+    def create_simple_default_index(self, data_loader_output=False):
         plan_params = self.construct_plan_params()
-        self.load_data()
+        self.load_data(generator=None, data_loader_output=data_loader_output)
         self.wait_till_items_in_bucket_equal(self._num_items//2)
         self.create_fts_indexes_all_buckets(plan_params=plan_params)
         if self._update or self._delete:
@@ -46,23 +52,33 @@ class StableTopFTS(FTSBaseTest):
         self.validate_index_count(equal_bucket_doc_count=True)
 
     def test_index_docvalues_option(self):
+        collection_index, type, index_scope, index_collections = self.define_index_parameters_collection_related()
         index = self.create_index(
             bucket=self._cb_cluster.get_bucket_by_name('default'),
-            index_name="custom_index")
+            index_name="custom_index", collection_index=collection_index, _type=type,
+            scope=index_scope, collections=index_collections)
         self.load_data()
         self.wait_for_indexing_complete()
-        if float(self.get_zap_docvalue_disksize()) != float(0):
-            self.fail("zap files size with docvalue not empty with docValues = False")
+        for node in self._cb_cluster.get_fts_nodes():
+            ds = self.get_zap_docvalue_disksize(node)
+            if ds:
+                if float(ds) != float(0):
+                    self.fail("zap files size with docvalue not empty with docValues = False")
+                else:
+                    self.log.info(" zap files size found to be : {0}".format(ds))
+        if self.container_type == "collection":
+            type = "scope1.collection1.emp"
         else:
-            self.log.info(" zap files size found to be : {0}".format(self.get_zap_docvalue_disksize()))
-
-        index.update_docvalues_email_custom_index(True)
+            type = "emp"
+        index.update_docvalues_email_custom_index(True, type)
         self.wait_for_indexing_complete()
-
-        if float(self.get_zap_docvalue_disksize()) == float(0):
-            self.fail("zap files size with docvalue found to be empty with docValues = True")
-        else:
-            self.log.info(" zap files size found to be : {0}".format(self.get_zap_docvalue_disksize()))
+        for node in self._cb_cluster.get_fts_nodes():
+            ds = self.get_zap_docvalue_disksize(node)
+            if ds:
+                if float(ds) == float(0):
+                    self.fail("zap files size with docvalue found to be empty with docValues = True")
+                else:
+                    self.log.info(" zap files size found to be : {0}".format(ds))
 
     def test_maxttl_setting(self):
         self.create_simple_default_index()
@@ -113,9 +129,12 @@ class StableTopFTS(FTSBaseTest):
         uses RQG
         """
         self.load_data()
+
+        collection_index, type, index_scope, index_collections = self.define_index_parameters_collection_related()
         index = self.create_index(
             self._cb_cluster.get_bucket_by_name('default'),
-            "default_index")
+            "default_index", collection_index=collection_index, _type=type,
+            scope=index_scope, collections=index_collections)
         self.wait_for_indexing_complete()
         if self._update or self._delete:
             self.async_perform_update_delete(self.upd_del_fields)
@@ -157,7 +176,10 @@ class StableTopFTS(FTSBaseTest):
 
     def test_match_consistency(self):
         query = {"match_all": {}}
-        self.create_simple_default_index()
+        expected_hits = int(self._input.param("expected_hits_num", self._num_items))
+        self.create_simple_default_index(data_loader_output=True)
+        if self.container_type == "collection":
+            scan_vectors_before_mutations = self._get_mutation_vectors()
         zero_results_ok = True
         for index in self._cb_cluster.get_indexes():
             hits, _, _, _ = index.execute_query(query,
@@ -169,9 +191,15 @@ class StableTopFTS(FTSBaseTest):
             self.log.info("Hits: %s" % hits)
             for i in range(list(list(self.consistency_vectors.values())[0].values())[0]):
                 self.async_perform_update_delete(self.upd_del_fields)
+            if self.container_type == "collection":
+                scan_vectors_after_mutations = self._get_mutation_vectors()
+                new_scan_vectors = scan_vectors_after_mutations - scan_vectors_before_mutations
+                self.consistency_vectors = {}
+                self.consistency_vectors[self._cb_cluster.get_indexes()[0].name] = self._convert_mutation_vector_to_scan_vector(new_scan_vectors)
+                self.log.info(self.consistency_vectors)
             hits, _, _, _ = index.execute_query(query,
                                                 zero_results_ok=zero_results_ok,
-                                                expected_hits=self._num_items,
+                                                expected_hits=expected_hits,
                                                 consistency_level=self.consistency_level,
                                                 consistency_vectors=self.consistency_vectors)
             self.log.info("Hits: %s" % hits)
@@ -224,8 +252,11 @@ class StableTopFTS(FTSBaseTest):
     def test_match_consistency_long_timeout(self):
         timeout = self._input.param("timeout", None)
         query = {"match_all": {}}
-        self.create_simple_default_index()
+        self.create_simple_default_index(data_loader_output=True)
+        if self.container_type == "collection":
+            scan_vectors_before_mutations = self._get_mutation_vectors()
         zero_results_ok = True
+        self.sleep(10)
         for index in self._cb_cluster.get_indexes():
             hits, _, _, _ = index.execute_query(query,
                                                 zero_results_ok=zero_results_ok,
@@ -234,17 +265,27 @@ class StableTopFTS(FTSBaseTest):
                                                 consistency_vectors=self.consistency_vectors)
             self.log.info("Hits: %s" % hits)
             tasks = []
+            tasks.append(Thread(target=self.async_perform_update_delete, args=(self.upd_del_fields,)))
             for i in range(list(list(self.consistency_vectors.values())[0].values())[0]):
                 tasks.append(Thread(target=self.async_perform_update_delete, args=(self.upd_del_fields,)))
             for task in tasks:
                 task.start()
             num_items = self._num_items
+            if self.container_type == "collection":
+                num_items = index.get_src_collections_doc_count()
             if timeout is None or timeout <= 60000:
                 # Here we assume that the update takes more than 60 seconds
                 # when we use timeout <= 60 sec we get timeout error
                 # with None we have 60s by default
                 num_items = 0
             try:
+                if self.container_type == "collection":
+                    self.sleep(20)
+                    scan_vectors_after_mutations = self._get_mutation_vectors()
+                    self.log.info(scan_vectors_after_mutations)
+                    new_scan_vectors = scan_vectors_after_mutations - scan_vectors_before_mutations
+                    self.consistency_vectors = {}
+                    self.consistency_vectors[self._cb_cluster.get_indexes()[0].name] = self._convert_mutation_vector_to_scan_vector(new_scan_vectors)
                 hits, _, _, _ = index.execute_query(query,
                                                     zero_results_ok=zero_results_ok,
                                                     expected_hits=num_items,
@@ -260,7 +301,9 @@ class StableTopFTS(FTSBaseTest):
         self.load_utf16_data()
         try:
             bucket = self._cb_cluster.get_bucket_by_name('default')
-            index = self.create_index(bucket, "default_index")
+            collection_index, type, index_scope, index_collections = self.define_index_parameters_collection_related()
+            index = self.create_index(bucket, "default_index", collection_index=collection_index, _type=type,
+                                      scope=index_scope, collections=index_collections)
             # an exception will most likely be thrown from waiting
             self.wait_for_indexing_complete()
             self.validate_index_count(
@@ -273,7 +316,9 @@ class StableTopFTS(FTSBaseTest):
     def create_simple_alias(self):
         self.load_data()
         bucket = self._cb_cluster.get_bucket_by_name('default')
-        index = self.create_index(bucket, "default_index")
+        collection_index, type, index_scope, index_collections = self.define_index_parameters_collection_related()
+        index = self.create_index(bucket, "default_index", collection_index=collection_index, _type=type,
+                                  scope=index_scope, collections=index_collections)
         self.wait_for_indexing_complete()
         self.validate_index_count(equal_bucket_doc_count=True)
         hits, _, _, _ = index.execute_query(self.sample_query,
@@ -324,12 +369,12 @@ class StableTopFTS(FTSBaseTest):
             self.es.create_empty_index("emp_es_index")
             self.es.create_empty_index("wiki_es_index")
             load_tasks.append(self.es.async_bulk_load_ES(index_name='emp_es_index',
-                                                        gen=emp_gen_copy,
-                                                        op_type='create'))
+                                                         gen=emp_gen_copy,
+                                                         op_type='create'))
 
             load_tasks.append(self.es.async_bulk_load_ES(index_name='wiki_es_index',
-                                                        gen=wiki_gen_copy,
-                                                        op_type='create'))
+                                                         gen=wiki_gen_copy,
+                                                         op_type='create'))
 
         for task in load_tasks:
             task.result()
@@ -338,7 +383,8 @@ class StableTopFTS(FTSBaseTest):
         emp_index = self.create_index(emp, "emp_index")
         wiki_index = self.create_index(wiki, "wiki_index")
 
-        self.wait_for_indexing_complete()
+        self.wait_for_indexing_complete(es_index="emp_es_index")
+        self.wait_for_indexing_complete(es_index="wiki_es_index")
 
         # create compound alias
         alias = self.create_alias(target_indexes=[emp_index, wiki_index],
@@ -354,7 +400,9 @@ class StableTopFTS(FTSBaseTest):
     def index_wiki(self):
         self.load_wiki(lang=self.lang)
         bucket = self._cb_cluster.get_bucket_by_name('default')
-        index = self.create_index(bucket, "wiki_index")
+        collection_index, type, index_scope, index_collections = self.define_index_parameters_collection_related()
+        index = self.create_index(bucket, "wiki_index", collection_index=collection_index, _type=type,
+                                  scope=index_scope, collections=index_collections)
         self.wait_for_indexing_complete()
         self.validate_index_count(equal_bucket_doc_count=True,
                                   zero_rows_ok=False)
@@ -362,7 +410,10 @@ class StableTopFTS(FTSBaseTest):
     def delete_index_then_query(self):
         self.load_data()
         bucket = self._cb_cluster.get_bucket_by_name('default')
-        index = self.create_index(bucket, "default_index")
+        collection_index, type, index_scope, index_collections = self.define_index_parameters_collection_related()
+        index = self.create_index(bucket, "default_index", collection_index=collection_index, _type=type,
+                                  scope=index_scope, collections=index_collections)
+        self.wait_for_indexing_complete()
         self._cb_cluster.delete_fts_index(index.name)
         try:
             hits2, _, _, _ = index.execute_query(self.sample_query)
@@ -374,8 +425,17 @@ class StableTopFTS(FTSBaseTest):
         count = 0
         self.load_data()
         bucket = self._cb_cluster.get_bucket_by_name('default')
-        index = self.create_index(bucket, "default_index")
-        self._cb_cluster.delete_bucket("default")
+        collection_index, _type, index_scope, index_collections = self.define_index_parameters_collection_related()
+        index = self.create_index(bucket, "default_index", collection_index=collection_index, _type=_type,
+                                  scope=index_scope, collections=index_collections)
+        if self.container_type == "bucket":
+            self._cb_cluster.delete_bucket("default")
+        else:
+            if type(self.collection) is list:
+                for c in self.collection:
+                    self._cb_cluster._drop_collection(bucket=bucket, scope=self.scope, collection=c, cli_client=self.cli_client)
+            else:
+                self._cb_cluster._drop_collection(bucket=bucket, scope=self.scope, collection=self.collection, cli_client=self.cli_client)
         self.sleep(20, "waiting for bucket deletion to be known by fts")
         try:
             count = index.get_indexed_doc_count()
@@ -403,7 +463,9 @@ class StableTopFTS(FTSBaseTest):
         index.delete()
         self.log.info("Recreating deleted index ...")
         bucket = self._cb_cluster.get_bucket_by_name('default')
-        self.create_index(bucket, "default_index")
+        collection_index, type, index_scope, index_collections = self.define_index_parameters_collection_related()
+        self.create_index(bucket, "default_index", collection_index=collection_index, _type=type,
+                          scope=index_scope, collections=index_collections)
         self.wait_for_indexing_complete()
         hits2, _, _, _ = alias.execute_query(self.sample_query)
         self.log.info("Hits: {0}".format(hits2))
@@ -414,7 +476,9 @@ class StableTopFTS(FTSBaseTest):
     def create_alias_on_deleted_index(self):
         self.load_employee_dataset()
         bucket = self._cb_cluster.get_bucket_by_name('default')
-        index = self.create_index(bucket, "default_index")
+        collection_index, type, index_scope, index_collections = self.define_index_parameters_collection_related()
+        index = self.create_index(bucket, "default_index", collection_index=collection_index, _type=type,
+                                  scope=index_scope, collections=index_collections)
         self.wait_for_indexing_complete()
         from .fts_base import INDEX_DEFAULTS
         alias_def = INDEX_DEFAULTS.ALIAS_DEFINITION
@@ -430,7 +494,9 @@ class StableTopFTS(FTSBaseTest):
     def edit_index_new_name(self):
         self.load_employee_dataset()
         bucket = self._cb_cluster.get_bucket_by_name('default')
-        index = self.create_index(bucket, 'sample_index')
+        collection_index, type, index_scope, index_collections = self.define_index_parameters_collection_related()
+        index = self.create_index(bucket, "sample_index", collection_index=collection_index, _type=type,
+                                  scope=index_scope, collections=index_collections)
         self.wait_for_indexing_complete()
         index.name = "new_index"
         try:
@@ -441,7 +507,9 @@ class StableTopFTS(FTSBaseTest):
     def edit_index(self):
         self.load_employee_dataset()
         bucket = self._cb_cluster.get_bucket_by_name('default')
-        index = self.create_index(bucket, 'sample_index')
+        collection_index, type, index_scope, index_collections = self.define_index_parameters_collection_related()
+        index = self.create_index(bucket, 'sample_index', collection_index=collection_index, _type=type,
+                                  scope=index_scope, collections=index_collections)
         self.wait_for_indexing_complete()
         #hits, _, _, _ = index.execute_query(self.sample_query)
         new_plan_param = {"maxPartitionsPerPIndex": 30}
@@ -453,6 +521,24 @@ class StableTopFTS(FTSBaseTest):
         _, defn = index.get_index_defn()
         self.log.info(defn['indexDef'])
 
+    def test_metrics_endpoint_availability(self):
+        # todo: use [global] section value instead of hardcode
+        fts_port = 8094
+
+        fts_node = self._cb_cluster.get_random_fts_node()
+        endpoint = self._input.param("endpoint", None)
+
+        self.load_data()
+        bucket = self._cb_cluster.get_bucket_by_name('default')
+        collection_index, tp, index_scope, index_collections = self.define_index_parameters_collection_related()
+        index = self.create_index(bucket, "default_index", collection_index=collection_index, _type=tp,
+                                  scope=index_scope, collections=index_collections)
+        self.wait_for_indexing_complete(self._num_items//2)
+
+        rest = RestConnection(self._cb_cluster.get_random_fts_node())
+        status, content = rest.get_rest_endpoint_data(endpoint, ip=fts_node.ip, port=fts_port)
+        self.assertTrue(status, f"Endpoint {endpoint} is not accessible.")
+
     def update_index_during_large_indexing(self):
         """
             MB-22410 - Updating index with a large dirty write queue
@@ -461,9 +547,11 @@ class StableTopFTS(FTSBaseTest):
         rest = RestConnection(self._cb_cluster.get_random_fts_node())
         self.load_employee_dataset()
         bucket = self._cb_cluster.get_bucket_by_name('default')
-        index = self.create_index(bucket, 'sample_index')
+        collection_index, type, index_scope, index_collections = self.define_index_parameters_collection_related()
+        index = self.create_index(bucket, 'sample_index', collection_index=collection_index, _type=type,
+                                  scope=index_scope, collections=index_collections)
         # wait till half the keys are indexed
-        self.wait_for_indexing_complete(self._num_items//2)
+        self.wait_for_indexing_complete(self._num_items//5)
         status, stat_value = rest.get_fts_stats(index_name=index.name,
                                                 bucket_name=bucket.name,
                                                 stat_name='num_recs_to_persist')
@@ -491,7 +579,9 @@ class StableTopFTS(FTSBaseTest):
         """
         self.load_employee_dataset()
         bucket = self._cb_cluster.get_bucket_by_name('default')
-        index = self.create_index(bucket, 'sample_index')
+        collection_index, type, index_scope, index_collections = self.define_index_parameters_collection_related()
+        index = self.create_index(bucket, 'sample_index', collection_index=collection_index, _type=type,
+                                  scope=index_scope, collections=index_collections)
         # wait till half the keys are indexed
         self.wait_for_indexing_complete(self._num_items//2)
         index.delete()
@@ -507,7 +597,9 @@ class StableTopFTS(FTSBaseTest):
     def edit_index_negative(self):
         self.load_employee_dataset()
         bucket = self._cb_cluster.get_bucket_by_name('default')
-        index = self.create_index(bucket, 'sample_index')
+        collection_index, type, index_scope, index_collections = self.define_index_parameters_collection_related()
+        index = self.create_index(bucket, 'sample_index', collection_index=collection_index, _type=type,
+                                  scope=index_scope, collections=index_collections)
         self.wait_for_indexing_complete()
         hits, _, _, _ = index.execute_query(self.sample_query)
         new_plan_param = {"maxPartitionsPerPIndex": 30}
@@ -543,9 +635,11 @@ class StableTopFTS(FTSBaseTest):
          uses RQG for custom mapping
         """
         # create a custom map, disable default map
+        collection_index, type, index_scope, index_collections = self.define_index_parameters_collection_related()
         index = self.create_index(
             bucket=self._cb_cluster.get_bucket_by_name('default'),
-            index_name="custom_index")
+            index_name="custom_index", collection_index=collection_index, _type=type,
+            scope=index_scope, collections=index_collections)
         if self.es:
             self.create_es_index_mapping(index.es_custom_map,
                                          index.index_definition)
@@ -557,12 +651,148 @@ class StableTopFTS(FTSBaseTest):
                 self.sleep(60, "Waiting for updates to get indexed...")
             self.wait_for_indexing_complete()
         self.generate_random_queries(index, self.num_queries, self.query_types)
+        self.sleep(30, "additional wait time to be sure, fts index is ready")
+
         if self.run_via_n1ql:
             n1ql_executor = self._cb_cluster
         else:
             n1ql_executor = None
+        self.run_query_and_compare(index, n1ql_executor=n1ql_executor, use_collections=collection_index)
 
-        self.run_query_and_compare(index, n1ql_executor=n1ql_executor)
+    def test_collection_index_data_mutations(self):
+        collection_index, type, index_scope, index_collections = self.define_index_parameters_collection_related()
+        index = self.create_index(bucket=self._cb_cluster.get_bucket_by_name('default'),
+                                  index_name="custom_index", collection_index=collection_index, _type=type,
+                                  scope=index_scope, collections=index_collections)
+        num_collections = TestInputSingleton.input.param("num_collections", 1)
+
+        self.load_data()
+        self.wait_for_indexing_complete()
+        query = {"query": "mutated:0"}
+        hits,_,_,_ = index.execute_query(query)
+        self.assertEquals(hits, 1000*num_collections, f"Expected hits does not match after insert. Expected - {1000*num_collections}, found {hits}")
+
+        self._update = True
+        self.async_perform_update_delete(self.upd_del_fields)
+        self.wait_for_indexing_complete()
+        self.sleep(30, "sleep additional time.")
+        query = {"query": "mutated:0"}
+        hits,_,_,_ = index.execute_query(query)
+        self.assertEquals(hits, 700*num_collections, f"Expected hits does not match after update. Expected - {700*num_collections}, found {hits}")
+
+        self._update = False
+        self._delete = True
+        self.async_perform_update_delete(self.upd_del_fields)
+        self.wait_for_indexing_complete()
+        query = {"query": "type:emp"}
+        hits,_,_,_ = index.execute_query(query)
+        self.assertEquals(hits, 700*num_collections, f"Expected hits does not match after delete. Expected - {700*num_collections}, found {hits}")
+
+        self._expires = 10
+        self._update = True
+        self._delete = False
+        self.async_perform_update_delete()
+        self.wait_for_indexing_complete()
+        self.sleep(30, "Wait for docs expiration")
+        query = {"query": "type:emp"}
+        hits,_,_,_ = index.execute_query(query)
+        self.assertEquals(hits, 400*num_collections, f"Expected hits does not match after expiration. Expected - {400*num_collections}, found {hits}")
+
+    def test_collection_mutations_isolation(self):
+        #delete unnecessary bucket
+        self._cb_cluster.delete_bucket("default")
+        #create bucket
+        bucket_size = 200
+        bucket_priority = None
+        bucket_type = TestInputSingleton.input.param("bucket_type", "membase")
+        maxttl = TestInputSingleton.input.param("maxttl", None)
+        self._cb_cluster.create_default_bucket(
+            bucket_size,
+            self._num_replicas,
+            eviction_policy='valueOnly',
+            bucket_priority=bucket_priority,
+            bucket_type=bucket_type,
+            maxttl=maxttl,
+            bucket_storage='couchstore',
+            bucket_name='bucket1')
+        #create 2 scopes
+        self.cli_client.create_scope(bucket='bucket1', scope='scope1')
+        self.cli_client.create_scope(bucket='bucket1', scope='scope2')
+        #create collections with same name
+        self.cli_client.create_collection(bucket='bucket1', scope='scope1', collection='collection1')
+        self.cli_client.create_collection(bucket='bucket1', scope='scope2', collection='collection1')
+        # create 2 indexes
+        index1 = self.create_index(self._cb_cluster.get_bucket_by_name('bucket1'),
+                                   "index_scope1", collection_index=True, _type="scope1.collection1",
+                                   scope="scope1", collections=["collection1"])
+        index2 = self.create_index(self._cb_cluster.get_bucket_by_name('bucket1'),
+                                   "index_scope2", collection_index=True, _type="scope2.collection1",
+                                   scope="scope2", collections=["collection1"])
+
+        #load data into collections
+        bucket = self._cb_cluster.get_bucket_by_name('bucket1')
+        gen_create = SDKDataLoader(num_ops=1000, percent_create=100, percent_update=0, percent_delete=0,
+                 load_pattern="uniform", start_seq_num=1, key_prefix="doc_", key_suffix="_",
+                 scope="scope1", collection="collection1", json_template="emp", doc_expiry=0,
+                 doc_size=500, get_sdk_logs=False, username="Administrator", password="password", timeout=1000,
+                 start=0, end=0, op_type="create", all_collections=False, es_compare=False, es_host=None, es_port=None,
+                 es_login=None, es_password=None)
+
+        load_tasks = self._cb_cluster.async_load_bucket_from_generator(bucket, gen_create)
+        for task in load_tasks:
+            task.result()
+
+        gen_create1 = SDKDataLoader(num_ops=1000, percent_create=100, percent_update=0, percent_delete=0,
+                 load_pattern="uniform", start_seq_num=1, key_prefix="doc_", key_suffix="_",
+                 scope="scope2", collection="collection1", json_template="emp", doc_expiry=0,
+                 doc_size=500, get_sdk_logs=False, username="Administrator", password="password", timeout=1000,
+                 start=0, end=0, op_type="create", all_collections=False, es_compare=False, es_host=None, es_port=None,
+                 es_login=None, es_password=None)
+        load_tasks = self._cb_cluster.async_load_bucket_from_generator(bucket, gen_create1)
+        for task in load_tasks:
+            task.result()
+
+        # run all types of mutations on scope1, check that scope2 results remain the same
+        query = {"query": "dept:Marketing"}
+        untouched_hits,_,_,_ = index1.execute_query(query)
+        gen_update2 = SDKDataLoader(num_ops=100, percent_create=0, percent_update=100, percent_delete=0,
+                 load_pattern="uniform", start_seq_num=1, key_prefix="doc_", key_suffix="_",
+                 scope="scope2", collection="collection1", json_template="emp", doc_expiry=0,
+                 doc_size=500, get_sdk_logs=False, username="Administrator", password="password", timeout=1000,
+                 start=0, end=100, op_type="update", all_collections=False, es_compare=False, es_host=None, es_port=None,
+                 es_login=None, es_password=None)
+        load_tasks = self._cb_cluster.async_load_bucket_from_generator(bucket, gen_update2)
+        for task in load_tasks:
+            task.result()
+        query = {"query": "dept:Marketing"}
+        hits,_,_,_ = index1.execute_query(query)
+        self.assertEqual(hits, untouched_hits, "Update isolation test is failed")
+
+        gen_delete2 = SDKDataLoader(num_ops=100, percent_create=0, percent_update=0, percent_delete=100,
+                 load_pattern="uniform", start_seq_num=1, key_prefix="doc_", key_suffix="_",
+                 scope="scope2", collection="collection1", json_template="emp", doc_expiry=0,
+                 doc_size=500, get_sdk_logs=False, username="Administrator", password="password", timeout=1000,
+                 start=0, end=100, op_type="delete", all_collections=False, es_compare=False, es_host=None, es_port=None,
+                 es_login=None, es_password=None)
+        load_tasks = self._cb_cluster.async_load_bucket_from_generator(bucket, gen_delete2)
+        for task in load_tasks:
+            task.result()
+        query = {"query": "dept:Marketing"}
+        hits,_,_,_ = index1.execute_query(query)
+        self.assertEqual(hits, untouched_hits, "Delete isolation test is failed")
+
+        gen_exp2 = SDKDataLoader(num_ops=100, percent_create=0, percent_update=100, percent_delete=0,
+                 load_pattern="uniform", start_seq_num=500, key_prefix="doc_", key_suffix="_",
+                 scope="scope2", collection="collection1", json_template="emp", doc_expiry=10,
+                 doc_size=500, get_sdk_logs=False, username="Administrator", password="password", timeout=1000,
+                 start=500, end=600, op_type="update", all_collections=False, es_compare=False, es_host=None, es_port=None,
+                 es_login=None, es_password=None)
+        load_tasks = self._cb_cluster.async_load_bucket_from_generator(bucket, kv_gen=gen_exp2, exp=10)
+        for task in load_tasks:
+            task.result()
+        query = {"query": "dept:Marketing"}
+        hits,_,_,_ = index1.execute_query(query)
+        self.assertEqual(hits, untouched_hits, "Expiration isolation test is failed")
 
     def test_query_string_combinations(self):
         """
@@ -640,11 +870,12 @@ class StableTopFTS(FTSBaseTest):
         """
         Index and query index, update map, query again, uses RQG
         """
-        err = None
         fail = False
+        collection_index, type, index_scope, index_collections = self.define_index_parameters_collection_related()
         index = self.create_index(
             bucket=self._cb_cluster.get_bucket_by_name('default'),
-            index_name="custom_index")
+            index_name="custom_index", collection_index=collection_index, _type=type,
+            scope=index_scope, collections=index_collections)
         self.create_es_index_mapping(index.es_custom_map, index.index_definition)
         self.load_data()
         self.wait_for_indexing_complete()
@@ -652,10 +883,11 @@ class StableTopFTS(FTSBaseTest):
         try:
             self.run_query_and_compare(index)
         except AssertionError as err:
+            error_msg = str(err)
             self.log.error(err)
             fail = True
         self.log.info("Editing custom index with new map...")
-        index.generate_new_custom_map(seed=index.cm_id+10)
+        index.generate_new_custom_map(seed=index.cm_id+10, collection_index=collection_index, type_mapping=type)
         index.index_definition['uuid'] = index.get_uuid()
         index.update()
         # updating mapping on ES is not easy, often leading to merge issues
@@ -670,7 +902,7 @@ class StableTopFTS(FTSBaseTest):
 
         self.run_query_and_compare(index, n1ql_executor=n1ql_executor)
         if fail:
-            raise err
+            raise error_msg
 
     def index_query_in_parallel(self):
         """
@@ -678,9 +910,11 @@ class StableTopFTS(FTSBaseTest):
         turn off es validation
         goal is to make sure there are no fdb or cbft crashes
         """
+        collection_index, type, index_scope, index_collections = self.define_index_parameters_collection_related()
         index = self.create_index(
             bucket=self._cb_cluster.get_bucket_by_name('default'),
-            index_name="default_index")
+            index_name="default_index", collection_index=collection_index, _type=type,
+            scope=index_scope, collections=index_collections)
         self.load_data()
         self.generate_random_queries(index, self.num_queries, self.query_types)
         self.run_query_and_compare(index)
@@ -691,9 +925,11 @@ class StableTopFTS(FTSBaseTest):
         turn off es validation
         goal is to make sure there are no fdb or cbft crashes
         """
+        collection_index, type, index_scope, index_collections = self.define_index_parameters_collection_related()
         index = self.create_index(
             bucket=self._cb_cluster.get_bucket_by_name('default'),
-            index_name="default_index")
+            index_name="default_index", collection_index=collection_index, _type=type,
+            scope=index_scope, collections=index_collections)
         self.sleep(20)
         self.generate_random_queries(index, self.num_queries, self.query_types)
         from threading import Thread
@@ -732,7 +968,13 @@ class StableTopFTS(FTSBaseTest):
         index.update()
         # updating mapping on ES is not easy, often leading to merge issues
         # drop and recreate the index, load again
+
         self.create_es_index_mapping(index.es_custom_map, index.index_definition)
+        gen = copy.deepcopy(self.create_gen)
+        task = self.es.async_bulk_load_ES(index_name='es_index',
+                                   gen=gen,
+                                   op_type='create')
+        task.result()
         self.wait_for_indexing_complete()
         try:
             if self.run_via_n1ql:
@@ -868,25 +1110,44 @@ class StableTopFTS(FTSBaseTest):
     def test_facets(self):
         field_indexed = self._input.param("field_indexed", True)
         self.load_data()
+        collection_index, type, index_scope, index_collections = self.define_index_parameters_collection_related()
         index = self.create_index(
             self._cb_cluster.get_bucket_by_name('default'),
-            "default_index")
+            "default_index", collection_index=collection_index, _type=type,
+            scope=index_scope, collections=index_collections)
         self.wait_for_indexing_complete()
-        index.add_child_field_to_default_mapping(field_name="type",
-                                                 field_type="text",
-                                                 field_alias="type",
-                                                 analyzer="keyword")
-        if field_indexed:
-            index.add_child_field_to_default_mapping(field_name="dept",
-                                                 field_type="text",
-                                                 field_alias="dept",
-                                                 analyzer="keyword")
-            index.add_child_field_to_default_mapping(field_name="salary",
-                                                 field_type="number",
-                                                 field_alias="salary")
-            index.add_child_field_to_default_mapping(field_name="join_date",
-                                                 field_type="datetime",
-                                                 field_alias="join_date")
+        if self.container_type == 'bucket':
+            index.add_child_field_to_default_mapping(field_name="type",
+                                                     field_type="text",
+                                                     field_alias="type",
+                                                     analyzer="keyword")
+            if field_indexed:
+                index.add_child_field_to_default_mapping(field_name="dept",
+                                                     field_type="text",
+                                                     field_alias="dept",
+                                                     analyzer="keyword")
+                index.add_child_field_to_default_mapping(field_name="salary",
+                                                     field_type="number",
+                                                     field_alias="salary")
+                index.add_child_field_to_default_mapping(field_name="join_date",
+                                                     field_type="datetime",
+                                                     field_alias="join_date")
+        else:
+            index.add_child_field_to_default_collection_mapping(field_name="type",
+                                                     field_type="text",
+                                                     field_alias="type",
+                                                     analyzer="keyword", scope=self.scope, collection=self.collection)
+            if field_indexed:
+                index.add_child_field_to_default_collection_mapping(field_name="dept",
+                                                     field_type="text",
+                                                     field_alias="dept",
+                                                     analyzer="keyword", scope=self.scope, collection=self.collection)
+                index.add_child_field_to_default_collection_mapping(field_name="salary",
+                                                     field_type="number",
+                                                     field_alias="salary", scope=self.scope, collection=self.collection)
+                index.add_child_field_to_default_collection_mapping(field_name="join_date",
+                                                     field_type="datetime",
+                                                     field_alias="join_date", scope=self.scope, collection=self.collection)
         index.index_definition['uuid'] = index.get_uuid()
         index.update()
         self.sleep(5)
@@ -915,25 +1176,44 @@ class StableTopFTS(FTSBaseTest):
     def test_facets_during_index(self):
         field_indexed = self._input.param("field_indexed", True)
         self.load_data()
+        collection_index, type, index_scope, index_collections = self.define_index_parameters_collection_related()
         index = self.create_index(
             self._cb_cluster.get_bucket_by_name('default'),
-            "default_index")
+            "default_index", collection_index=collection_index, _type=type,
+            scope=index_scope, collections=index_collections)
         self.sleep(5)
-        index.add_child_field_to_default_mapping(field_name="type",
-                                                 field_type="text",
-                                                 field_alias="type",
-                                                 analyzer="keyword")
-        if field_indexed:
-            index.add_child_field_to_default_mapping(field_name="dept",
+        if self.container_type == 'bucket':
+            index.add_child_field_to_default_mapping(field_name="type",
                                                      field_type="text",
-                                                     field_alias="dept",
+                                                     field_alias="type",
                                                      analyzer="keyword")
-            index.add_child_field_to_default_mapping(field_name="salary",
-                                                     field_type="number",
-                                                     field_alias="salary")
-            index.add_child_field_to_default_mapping(field_name="join_date",
-                                                     field_type="datetime",
-                                                     field_alias="join_date")
+            if field_indexed:
+                index.add_child_field_to_default_mapping(field_name="dept",
+                                                         field_type="text",
+                                                         field_alias="dept",
+                                                         analyzer="keyword")
+                index.add_child_field_to_default_mapping(field_name="salary",
+                                                         field_type="number",
+                                                         field_alias="salary")
+                index.add_child_field_to_default_mapping(field_name="join_date",
+                                                         field_type="datetime",
+                                                         field_alias="join_date")
+        else:
+            index.add_child_field_to_default_collection_mapping(field_name="type",
+                                                     field_type="text",
+                                                     field_alias="type",
+                                                     analyzer="keyword", scope=self.scope, collection=self.collection)
+            if field_indexed:
+                index.add_child_field_to_default_collection_mapping(field_name="dept",
+                                                         field_type="text",
+                                                         field_alias="dept",
+                                                         analyzer="keyword", scope=self.scope, collection=self.collection)
+                index.add_child_field_to_default_collection_mapping(field_name="salary",
+                                                         field_type="number",
+                                                         field_alias="salary", scope=self.scope, collection=self.collection)
+                index.add_child_field_to_default_collection_mapping(field_name="join_date",
+                                                         field_type="datetime",
+                                                         field_alias="join_date", scope=self.scope, collection=self.collection)
         index.index_definition['uuid'] = index.get_uuid()
         index.update()
 
@@ -961,7 +1241,7 @@ class StableTopFTS(FTSBaseTest):
         # Load Travel Sample bucket and create an index
         self.load_sample_buckets(server=master, bucketName="travel-sample")
         bucket = self._cb_cluster.get_bucket_by_name("travel-sample")
-        index = self.create_index(bucket, "travel-index")
+        index = self.create_index(bucket, "travel-index", scope="_default", collections=["_default"])
         self.sleep(10)
         self.wait_for_indexing_complete()
 
@@ -1030,21 +1310,21 @@ class StableTopFTS(FTSBaseTest):
                 self.log.info("Hits: %s" % hits)
                 self.log.info("Contents: %s" % contents)
                 score_before_boosting_doc1 = index.get_score_from_query_result_content(
-                    contents=contents, doc_id='emp10000021')
+                    contents=contents, doc_id='emp10000045')
                 score_before_boosting_doc2 = index.get_score_from_query_result_content(
-                    contents=contents, doc_id='emp10000086')
+                    contents=contents, doc_id='emp10000053')
 
                 self.log.info("Scores before boosting:")
                 self.log.info("")
-                self.log.info("emp10000021: %s", score_before_boosting_doc1)
-                self.log.info("emp10000086: %s", score_before_boosting_doc2)
+                self.log.info("emp10000045: %s", score_before_boosting_doc1)
+                self.log.info("emp10000053: %s", score_before_boosting_doc2)
 
         except Exception as err:
             self.log.error(err)
             self.fail("Testcase failed: " + str(err))
 
         if not score_before_boosting_doc1 == score_before_boosting_doc2:
-            self.fail("Testcase failed: Scores for emp10000021 & emp10000086 "
+            self.fail("Testcase failed: Scores for emp10000045 & emp10000053 "
                       "are not equal before boosting")
 
         # Run Query w/o Boosting and compare the scores for Docs emp10000021 &
@@ -1061,14 +1341,14 @@ class StableTopFTS(FTSBaseTest):
             self.log.info("Hits: %s" % hits)
             self.log.info("Contents: %s" % contents)
             score_after_boosting_doc1 = index.get_score_from_query_result_content(
-                contents=contents, doc_id='emp10000021')
+                contents=contents, doc_id='emp10000045')
             score_after_boosting_doc2 = index.get_score_from_query_result_content(
-                contents=contents, doc_id='emp10000086')
+                contents=contents, doc_id='emp10000053')
 
             self.log.info("Scores after boosting:")
             self.log.info("")
-            self.log.info("emp10000021: %s", score_after_boosting_doc1)
-            self.log.info("emp10000086: %s", score_after_boosting_doc2)
+            self.log.info("emp10000045: %s", score_after_boosting_doc1)
+            self.log.info("emp10000053: %s", score_after_boosting_doc2)
             assert score_after_boosting_doc1 == score_after_boosting_doc2
             assert score_before_boosting_doc1 < score_after_boosting_doc1
             assert score_before_boosting_doc2 < score_after_boosting_doc2
@@ -1082,7 +1362,7 @@ class StableTopFTS(FTSBaseTest):
             "default_index")
         self.wait_for_indexing_complete()
         index.add_type_mapping_to_index_definition(type="emp",
-                                                   analyzer="keyword")
+                                                   analyzer="standard")
 
         index.index_definition['uuid'] = index.get_uuid()
         index.update()
@@ -1156,9 +1436,11 @@ class StableTopFTS(FTSBaseTest):
     def test_sorting_of_results(self):
         self.load_data()
         self.wait_till_items_in_bucket_equal(self._num_items//2)
+        collection_index, type, index_scope, index_collections = self.define_index_parameters_collection_related()
         index = self.create_index(
             self._cb_cluster.get_bucket_by_name('default'),
-            "default_index")
+            "default_index", collection_index=collection_index, _type=type,
+            scope=index_scope, collections=index_collections)
         self.wait_for_indexing_complete()
 
         zero_results_ok = True
@@ -1195,9 +1477,11 @@ class StableTopFTS(FTSBaseTest):
     def test_sorting_of_results_during_indexing(self):
         self.load_data()
         self.wait_till_items_in_bucket_equal(self._num_items//2)
+        collection_index, type, index_scope, index_collections = self.define_index_parameters_collection_related()
         index = self.create_index(
             self._cb_cluster.get_bucket_by_name('default'),
-            "default_index")
+            "default_index", collection_index=collection_index, _type=type,
+            scope=index_scope, collections=index_collections)
         #self.wait_for_indexing_complete()
 
         self.sleep(5)
@@ -1228,14 +1512,23 @@ class StableTopFTS(FTSBaseTest):
 
     def test_sorting_of_results_on_non_indexed_fields(self):
         self.load_data()
+        collection_index, type, index_scope, index_collections = self.define_index_parameters_collection_related()
         index = self.create_index(
             self._cb_cluster.get_bucket_by_name('default'),
-            "default_index")
+            "default_index", collection_index=collection_index, _type=type,
+            scope=index_scope, collections=index_collections)
         self.wait_for_indexing_complete()
-        index.add_child_field_to_default_mapping(field_name="name",
-                                                 field_type="text",
-                                                 field_alias="name",
-                                                 analyzer="en")
+        if self.container_type == 'bucket':
+            index.add_child_field_to_default_mapping(field_name="name",
+                                                     field_type="text",
+                                                     field_alias="name",
+                                                     analyzer="en")
+        else:
+            index.add_child_field_to_default_collection_mapping(field_name="name",
+                                                                field_type="text",
+                                                                field_alias="name",
+                                                                analyzer="en", scope=self.scope,
+                                                                collection=self.collection)
         index.index_definition['uuid'] = index.get_uuid()
         index.update()
         self.sleep(5)
@@ -1276,9 +1569,9 @@ class StableTopFTS(FTSBaseTest):
         """
         Test if the TF score in the Scoring functionality works fine
         """
-        test_data = ["{\\\"text\\\":\\\"cat - a lazy cat and a brown cat\\\"}",
-                     "{\\\"text\\\":\\\"a lazy cat and a brown cat\\\"}",
-                     "{\\\"text\\\":\\\"a lazy cat\\\"}"]
+        test_data = [{"text":"cat - a lazy cat and a brown cat"},
+                     {"text":"a lazy cat and a brown cat"},
+                     {"text":"a lazy cat"}]
 
         self.create_test_dataset(self._master, test_data)
         self.wait_till_items_in_bucket_equal(items=len(test_data))
@@ -1344,13 +1637,13 @@ class StableTopFTS(FTSBaseTest):
         """
         Test if the IDF score in the Scoring functionality works fine
         """
-        test_data = ["{\\\"text\\\":\\\"a brown cat\\\"}",
-                     "{\\\"text\\\":\\\"a lazy cat\\\"}",
-                     "{\\\"text\\\":\\\"a lazy cat and a brown cat\\\"}",
-                     "{\\\"text\\\":\\\"a brown dog\\\"}",
-                     "{\\\"text\\\":\\\"a lazy dog\\\"}",
-                     "{\\\"text\\\":\\\"a lazy dog and a brown dog\\\"}",
-                     "{\\\"text\\\":\\\"a lazy fox and a brown fox\\\"}"]
+        test_data = [{"text":"a brown cat"},
+                     {"text":"a lazy cat"},
+                     {"text":"a lazy cat and a brown cat"},
+                     {"text":"a brown dog"},
+                     {"text":"a lazy dog"},
+                     {"text":"a lazy dog and a brown dog"},
+                     {"text":"a lazy fox and a brown fox"}]
 
         self.create_test_dataset(self._master, test_data)
         self.wait_till_items_in_bucket_equal(items=len(test_data))
@@ -1398,9 +1691,9 @@ class StableTopFTS(FTSBaseTest):
         """
         Test if the Field Normalization score in the Scoring functionality works fine
         """
-        test_data = ["{\\\"text\\\":\\\"a cat\\\"}",
-                     "{\\\"text\\\":\\\"a lazy cat\\\"}",
-                     "{\\\"text\\\":\\\"a lazy cat and a brown cat\\\"}"]
+        test_data = [{"text":"a cat"},
+                     {"text":"a lazy cat"},
+                     {"text":"a lazy cat and a brown cat"}]
 
         self.create_test_dataset(self._master, test_data)
         self.wait_till_items_in_bucket_equal(items=len(test_data))
@@ -1459,9 +1752,9 @@ class StableTopFTS(FTSBaseTest):
         """
         Test if the Query Normalization score in the Scoring functionality works fine
         """
-        test_data = ["{\\\"text\\\":\\\"a cat\\\"}",
-                     "{\\\"text\\\":\\\"a lazy cat\\\"}",
-                     "{\\\"text\\\":\\\"a lazy cat and a brown cat\\\"}"]
+        test_data = [{"text":"a cat"},
+                     {"text":"a lazy cat"},
+                     {"text":"a lazy cat and a brown cat"}]
 
         self.create_test_dataset(self._master, test_data)
         self.wait_till_items_in_bucket_equal(items=len(test_data))
@@ -1520,8 +1813,8 @@ class StableTopFTS(FTSBaseTest):
         """
         Test if the Coord score in the Scoring functionality works fine
         """
-        test_data = ["{\\\"text\\\":\\\"a cat\\\"}",
-                     "{\\\"text\\\":\\\"a lazy cat\\\"}"]
+        test_data = [{"text":"a cat"},
+                     {"text":"a lazy cat"}]
 
         self.create_test_dataset(self._master, test_data)
         self.wait_till_items_in_bucket_equal(items=len(test_data))
@@ -1625,7 +1918,7 @@ class StableTopFTS(FTSBaseTest):
 
         zero_results_ok = True
         expected_hits = int(self._input.param("expected_hits", 0))
-        default_query = {"match_all": "true", "field":"name"}
+        default_query = {"match_all": "true", "field": "name"}
         query = eval(self._input.param("query", str(default_query)))
         if expected_hits:
             zero_results_ok = False
@@ -1636,9 +1929,9 @@ class StableTopFTS(FTSBaseTest):
             sort_params = self.build_sort_params()
             for index in self._cb_cluster.get_indexes():
                 hits, doc_ids, _, _ = index.execute_query(query=query,
-                                                           zero_results_ok=zero_results_ok,
-                                                           expected_hits=expected_hits,
-                                                           sort_fields=sort_params,
+                                                          zero_results_ok=zero_results_ok,
+                                                          expected_hits=expected_hits,
+                                                          sort_fields=sort_params,
                                                           show_results_from_item=show_results_from_item)
 
                 self.log.info("Hits: %s" % hits)
@@ -1837,8 +2130,8 @@ class StableTopFTS(FTSBaseTest):
         for i in range(self.num_queries):
             self.log.info("Running Query no --> " + str(i))
             fts_query, es_query = FTSESQueryGenerator.construct_geo_location_query()
-            print(fts_query)
-            print(("fts_query location ---> " + str(fts_query["location"])))
+            self.log.info(fts_query)
+            self.log.info("fts_query location ---> " + str(fts_query["location"]))
             # If query has geo co-ordinates in form of an object
             if "lon" in fts_query["location"]:
                 lon = fts_query["location"]["lon"]
@@ -1877,7 +2170,7 @@ class StableTopFTS(FTSBaseTest):
             if case == 3:
                 geohash = Geohash.encode(lat, lon, precision=random.randint(3, 8))
                 location = geohash
-            print(("sort_fields_location ----> " + str(location)))
+                self.log.info("sort_fields_location ----> " + str(location))
             sort_fields = [
                 {
                     "by": "geo_distance",
@@ -1930,10 +2223,15 @@ class StableTopFTS(FTSBaseTest):
         :return: Nothing
         """
         self.load_data()
+        collection_index, type, index_scope, index_collections = self.define_index_parameters_collection_related()
         index = self._cb_cluster.create_fts_index(
             name='default_index',
             source_name='default',
-            source_params={"includeXAttrs": True})
+            collection_index=collection_index,
+            _type=type,
+            source_params={"includeXAttrs": True},
+            scope=index_scope,
+            collections=index_collections)
         self.is_index_partitioned_balanced(index)
         self.wait_for_indexing_complete()
         if self._update or self._delete:
@@ -1951,9 +2249,17 @@ class StableTopFTS(FTSBaseTest):
         """
         fts_ssl_port=18094
         import json, subprocess
-        idx = {"sourceName": "default",
-               "sourceType": "couchbase",
-               "type": "fulltext-index"}
+        if self.container_type == 'bucket':
+            idx = {"sourceName": "default",
+                   "sourceType": "couchbase",
+                   "type": "fulltext-index"}
+        else:
+            idx = {'type': 'fulltext-index',
+                   'params': {'mapping': {'default_mapping': {'properties': {}, 'dynamic': False, 'enabled': False},
+                                          'types': {self.scope+'.'+self.collection: {'default_analyzer': 'standard', 'dynamic': True, 'enabled': True}}
+                                          },
+                   'doc_config': {'mode': 'scope.collection.type_field', 'type_field': 'type'}},
+                   'sourceType': 'couchbase', 'sourceName': 'default'}
 
         qry = {"indexName": "default_index_1",
                  "query": {"field": "type", "match": "emp"},
@@ -2011,8 +2317,22 @@ class StableTopFTS(FTSBaseTest):
             authenticator = PasswordAuthenticator('Administrator', 'password')
             cluster.authenticate(authenticator)
             cb = cluster.open_bucket('default')
-            for key, value in list(dic.items()):
-                cb.upsert(key, value)
+            if self.container_type == 'bucket':
+                for key, value in list(dic.items()):
+                    cb.upsert(key, value)
+            else:
+                count = 1
+                for key, value in list(dic.items()):
+                    if not value:
+                        query = "insert into default:default." + self.scope + "." + self.collection + " (key,value) values ('key_" + str(
+                            count) + "', {'" + str(key) + "' : '" + str(value) + "'})"
+                    else:
+                        if isinstance(value, str):
+                            query = "insert into default:default."+self.scope+"."+self.collection+" (key,value) values ('key_"+str(count)+"', {'"+str(key)+"' : '"+str(value)+"'})"
+                        else:
+                            query = "insert into default:default."+self.scope+"."+self.collection+" (key,value) values ('key_"+str(count)+"', {'"+str(key)+"' : "+str(value)+"})"
+                    count += 1
+                    cb.n1ql_query(query).execute()
         except Exception as e:
             self.fail(e)
         self.wait_for_indexing_complete()
@@ -2408,3 +2728,1365 @@ class StableTopFTS(FTSBaseTest):
         except Exception as err:
             self.log.error(err)
             self.fail("Testcase failed: " + str(err))
+
+    def test_drop_index_container(self):
+        rest = RestConnection(self._cb_cluster.get_random_fts_node())
+
+        drop_container = self._input.param("drop_container")
+        drop_name = self._input.param("drop_name")
+        plan_params = self.construct_plan_params()
+
+        self.load_data(generator=None)
+        self.wait_till_items_in_bucket_equal(self._num_items//2)
+        self.create_fts_indexes_all_buckets(plan_params=plan_params)
+        self.wait_for_indexing_complete()
+        self.validate_index_count(equal_bucket_doc_count=True)
+
+        if drop_container == 'collection':
+            self.cli_client.delete_collection(scope=self.scope, collection=drop_name)
+        elif drop_container == 'scope':
+            self.cli_client.delete_scope(scope=drop_name)
+        else:
+            self._cb_cluster.delete_bucket("default")
+        self.sleep(20)
+
+        for idx in self._cb_cluster.get_indexes():
+            status,dfn = rest.get_fts_index_definition(idx.name)
+            self.assertEqual(status, False, "FTS index was not dropped after kv container drop.")
+            self._cb_cluster.get_indexes().remove(idx)
+
+    def test_drop_busy_index_container_building(self):
+        rest = RestConnection(self._cb_cluster.get_random_fts_node())
+
+        drop_container = self._input.param("drop_container")
+        drop_name = self._input.param("drop_name")
+        plan_params = self.construct_plan_params()
+
+        self.load_data(generator=None)
+        self.create_fts_indexes_all_buckets(plan_params=plan_params)
+
+        if drop_container == 'collection':
+            self.cli_client.delete_collection(scope=self.scope, collection=drop_name)
+        elif drop_container == 'scope':
+            self.cli_client.delete_scope(scope=drop_name)
+        else:
+            self._cb_cluster.delete_bucket("default")
+        self.sleep(20)
+
+        for idx in self._cb_cluster.get_indexes():
+            status,dfn = rest.get_fts_index_definition(idx.name)
+            self.assertEqual(status, False, "FTS index was not dropped during index build.")
+            self._cb_cluster.get_indexes().remove(idx)
+
+    def test_drop_busy_index_container_scan(self):
+        rest = RestConnection(self._cb_cluster.get_random_fts_node())
+
+        drop_container = self._input.param("drop_container")
+        drop_name = self._input.param("drop_name")
+        plan_params = self.construct_plan_params()
+
+        self.load_data(generator=None)
+        self.create_fts_indexes_all_buckets(plan_params=plan_params)
+        self.wait_for_indexing_complete()
+        index = self._cb_cluster.get_indexes()[0]
+        query = self._input.param("query")
+        import threading
+        query_thread = threading.Thread(target=self._index_query_wrapper, args=(index, query))
+        drop_thread = threading.Thread(target=self._drop_container_wrapper, args=(drop_container, drop_name))
+        query_thread.daemon = True
+        drop_thread.daemon = True
+        query_thread.start()
+        drop_thread.start()
+
+        query_thread.join()
+        drop_thread.join()
+        self.sleep(30, "wait for index drop")
+
+        for idx in self._cb_cluster.get_indexes():
+            status,dfn = rest.get_fts_index_definition(idx.name)
+            self.assertEqual(status, False, "FTS index was not dropped during index scan.")
+            self._cb_cluster.get_indexes().remove(idx)
+
+    def test_drop_busy_index_container_mutations(self):
+        rest = RestConnection(self._cb_cluster.get_random_fts_node())
+
+        drop_container = self._input.param("drop_container")
+        drop_name = self._input.param("drop_name")
+        plan_params = self.construct_plan_params()
+
+        self.load_data(generator=None)
+        self.create_fts_indexes_all_buckets(plan_params=plan_params)
+        self.wait_for_indexing_complete()
+        self._cb_cluster.run_n1ql_query(query=f"create primary index on default:default.{self.scope}.{self.collection}")
+        index = self._cb_cluster.get_indexes()[0]
+        query = f"update default:default.{self.scope}.{self.collection} set email='mutated@gmail.com'"
+        import threading
+        query_thread = threading.Thread(target=self._n1ql_query_wrapper, args=[query])
+        drop_thread = threading.Thread(target=self._drop_container_wrapper, args=(drop_container, drop_name))
+        query_thread.daemon = True
+        drop_thread.daemon = True
+        query_thread.start()
+        drop_thread.start()
+
+        query_thread.join()
+        drop_thread.join()
+        self.sleep(30, "wait for index drop")
+
+        for idx in self._cb_cluster.get_indexes():
+            status,dfn = rest.get_fts_index_definition(idx.name)
+            self.assertEqual(status, False, "FTS index was not dropped during index scan.")
+            self._cb_cluster.get_indexes().remove(idx)
+
+    def test_concurrent_drop_index_and_container(self):
+        rest = RestConnection(self._cb_cluster.get_random_fts_node())
+
+        drop_container = self._input.param("drop_container")
+        drop_name = self._input.param("drop_name")
+        plan_params = self.construct_plan_params()
+
+        self.load_data(generator=None)
+        self.create_fts_indexes_all_buckets(plan_params=plan_params)
+        self.wait_for_indexing_complete()
+        index = self._cb_cluster.get_indexes()[0]
+
+        import threading
+        query_thread = threading.Thread(target=self._drop_index_wrapper, args=[index])
+        drop_thread = threading.Thread(target=self._drop_container_wrapper, args=(drop_container, drop_name))
+        query_thread.daemon = True
+        drop_thread.daemon = True
+        query_thread.start()
+        drop_thread.start()
+
+        query_thread.join()
+        drop_thread.join()
+
+        for idx in self._cb_cluster.get_indexes():
+            status,dfn = rest.get_fts_index_definition(idx.name)
+            self.assertEqual(status, False, "FTS index was not dropped during index scan.")
+            self._cb_cluster.get_indexes().remove(idx)
+
+    def _drop_index_wrapper(self, index):
+        index.delete()
+
+    def _index_query_wrapper(self, index, query):
+        index.execute_query(query)
+
+    def _drop_container_wrapper(self, drop_container, drop_name):
+        if drop_container == 'collection':
+            self.cli_client.delete_collection(scope=self.scope, collection=drop_name)
+        elif drop_container == 'scope':
+            self.cli_client.delete_scope(scope=drop_name)
+        else:
+            self._cb_cluster.delete_bucket("default")
+
+    def _n1ql_query_wrapper(self, n1ql_query):
+        self._cb_cluster.run_n1ql_query(query=n1ql_query)
+
+    def test_create_drop_index(self):
+        self.load_data(generator=None)
+        self.wait_till_items_in_bucket_equal(self._num_items//2)
+        plan_params = self.construct_plan_params()
+        self.create_fts_indexes_all_buckets(plan_params=plan_params)
+        self.wait_for_indexing_complete()
+        self.validate_index_count(equal_bucket_doc_count=True)
+
+        for idx in self._cb_cluster.get_indexes():
+            idx.delete()
+
+        self.assertEqual(len(self._cb_cluster.get_indexes()), 0, "FTS index cannot be deleted.")
+
+    def test_create_index_multiple_scopes_negative(self):
+        collection_index, type, index_scope, index_collections = self.define_index_parameters_collection_related()
+
+        for bucket in self._cb_cluster.get_buckets():
+            try:
+                self.create_index(bucket, "fts_idx", index_params=None,
+                                  plan_params=None, collection_index=collection_index, _type=type, analyzer="standard",
+                                  scope=index_scope, collections=index_collections)
+                self.assertTrue(False, "Successfully created FTS index for collections from different buckets!")
+            except Exception as ex:
+                self.assertTrue(str(ex).find("Error creating index")>=0 and
+                                str(ex).find("multiple scopes found")>=0 and
+                                str(ex).find("index can only span collections on a single scope")>=0,
+                                "Non-expected error message is found while trying to create FTS index for more than one scope.")
+                pass
+
+    def test_create_index_missed_container_negative(self):
+        missed_collection = 'missed_collection'
+        missed_scope = 'missed_scope'
+
+        _types = [f"{self.scope}.{missed_collection}",
+                  f"_default.{missed_collection}",
+                  f"{missed_scope}._default",
+                  f"{missed_scope}.{self.collection}",
+                  f"{missed_scope}.{missed_collection}"]
+
+        self.load_data()
+        collection_index = True
+        for _type in _types:
+            try:
+                index = self._cb_cluster.create_fts_index(
+                    name='default_index',
+                    source_name='default',
+                    collection_index=collection_index,
+                    _type=_type,
+                    source_params={"includeXAttrs": True})
+                self.fail(f"FTS index is successfully created basing on non-existent kv container: {_type}")
+            except Exception as e:
+                self.log.info("Expected exception happened during fts index creation on missed kv container.")
+
+    def prepare_for_score_none_fuzzy(self):
+        fuzzy_dataset_size = self._input.param("fuzzy_dataset_size", "small")
+        index_params = {}
+        data_json = ""
+        dataset = ""
+        if "small" in fuzzy_dataset_size:
+            data_json = "fuzzy_small_dataset.json"
+            dataset = FUZZY_FTS_SMALL_DATASET
+            index_params = INDEX_DEFAULTS.FUZZY_SMALL_INDEX_MAPPING
+            self.query = QUERY.FUZZY_SMALL_INDEX_QUERY
+        if "large" in fuzzy_dataset_size:
+            data_json = "fuzzy_large_dataset.json"
+            dataset = FUZZY_FTS_LARGE_DATASET
+            index_params = INDEX_DEFAULTS.FUZZY_LARGE_INDEX_MAPPING
+            self.query = QUERY.FUZZY_LARGE_INDEX_QUERY
+
+        download_from_s3(dataset, "/tmp/" + data_json)
+
+        self.cbimport_data(data_json_path="/tmp/" + data_json, server=self._cb_cluster.get_master_node())
+        self.sleep(10)
+
+        self.fts_index = self._cb_cluster.create_fts_index(name="fuzzy_index",
+                                          source_name="default",
+                                          index_params=index_params)
+        self.wait_for_indexing_complete()
+
+    def test_score_none_fuzzy(self):
+
+        self.prepare_for_score_none_fuzzy()
+        expected_hits = 0
+        try:
+            for index in self._cb_cluster.get_indexes():
+                expected_hits, contents, _, _ = index.execute_query(query=self.query,
+                                                                    zero_results_ok=False,
+                                                                    return_raw_hits=True)
+                self.log.info("Hits: %s" % expected_hits)
+        except Exception as err:
+            self.log.error(err)
+            self.fail("Testcase failed: " + str(err))
+
+        try:
+            for index in self._cb_cluster.get_indexes():
+                hits, contents, _, _ = index.execute_query(query=self.query,
+                                                           zero_results_ok=False,
+                                                           expected_hits=expected_hits,
+                                                           return_raw_hits=True,
+                                                           score="none")
+
+                self.log.info("Hits: %s" % hits)
+                result = True
+                if hits == expected_hits:
+                    for doc in contents:
+                        # Check if the score of the doc is 0.
+                        if "score" in doc:
+                            self.assertEqual(doc["score"], 0, "Score is not 0 for doc {0}".format(doc["id"]))
+                        else:
+                            self.fail("Score key not present in search results for doc {0}".format(doc["id"]))
+                    if not result:
+                        self.fail(
+                            "Testcase failed. Actual results do not match expected.")
+                else:
+                    self.fail("No. of hits not matching expected hits. Hits = {0}, Expected Hits = {1}".format(hits,
+                                                                                                               expected_hits))
+        except Exception as err:
+            self.log.error(err)
+            self.fail("Testcase failed: " + str(err))
+
+    def test_mem_utilization_score_none_fuzzy(self):
+        self.prepare_for_score_none_fuzzy()
+
+        self.sleep(60, "Waiting for 1 min before before collecting mem_usage")
+
+        fts_nodes_mem_usage = self.get_fts_ram_used()
+        self.log.info("fts_nodes_mem_usage: {0}".format(fts_nodes_mem_usage))
+
+        self.fts_index.fts_queries.append(self.query)
+        self.start_task_managers(10)
+        for count in range(2000):
+            for task_manager in self.task_managers:
+                task_manager.schedule(ESRunQueryCompare(self.fts_index,
+                                                        self.es,
+                                                        query_index=0))
+        self.sleep(600)
+
+        self.shutdown_task_managers()
+
+        self.sleep(60, "Waiting for 1 min before checking cpu utilization/mem_high again")
+
+        mem_high = False
+        for node in fts_nodes_mem_usage:
+            mem_high = mem_high or self.check_if_fts_ram_usage_high(node["nodeip"], 2.0*float(node["mem_usage"]))
+
+        if mem_high:
+            self.fail("CPU utilization or memory usage found to be high")
+
+    def test_create_index_same_name_same_scope_negative(self):
+        scope_name = self._input.param("scope", "_default")
+        #delete unnecessary bucket
+        self._cb_cluster.delete_bucket("default")
+        #create bucket
+        bucket_size = 200
+        bucket_priority = None
+        bucket_type = TestInputSingleton.input.param("bucket_type", "membase")
+        maxttl = TestInputSingleton.input.param("maxttl", None)
+        self._cb_cluster.create_default_bucket(
+            bucket_size,
+            self._num_replicas,
+            eviction_policy='valueOnly',
+            bucket_priority=bucket_priority,
+            bucket_type=bucket_type,
+            maxttl=maxttl,
+            bucket_storage='couchstore',
+            bucket_name='bucket1')
+        #create scope
+        self.cli_client.create_scope(bucket='bucket1', scope=scope_name)
+        #create collections with same name
+        self.cli_client.create_collection(bucket='bucket1', scope=scope_name, collection='collection1')
+        self.cli_client.create_collection(bucket='bucket1', scope=scope_name, collection='collection2')
+        # create 2 indexes
+        index1 = self.create_index(self._cb_cluster.get_bucket_by_name('bucket1'),
+                                   "index1", collection_index=True, _type=f"{scope_name}.collection1",
+                                   scope=scope_name, collections=["collection1"])
+        try:
+            index2 = self.create_index(self._cb_cluster.get_bucket_by_name('bucket1'),
+                                       "index1", collection_index=True, _type=f"{scope_name}.collection2",
+                                       scope=scope_name, collections=["collection2"], no_check=True)
+        except Exception as e:
+            self.log.info("Exceptin caught ::"+str(e)+"::")
+            return
+        self.fail(f"Successfully created 2 indexes with same name in scope {scope_name}")
+
+    def test_create_index_same_name_diff_scope_negative(self):
+        #delete unnecessary bucket
+        self._cb_cluster.delete_bucket("default")
+        #create bucket
+        bucket_size = 200
+        bucket_priority = None
+        bucket_type = TestInputSingleton.input.param("bucket_type", "membase")
+        maxttl = TestInputSingleton.input.param("maxttl", None)
+        self._cb_cluster.create_default_bucket(
+            bucket_size,
+            self._num_replicas,
+            eviction_policy='valueOnly',
+            bucket_priority=bucket_priority,
+            bucket_type=bucket_type,
+            maxttl=maxttl,
+            bucket_storage='couchstore',
+            bucket_name='bucket1')
+        #create scopes
+        self.cli_client.create_scope(bucket='bucket1', scope="scope1")
+        self.cli_client.create_scope(bucket='bucket1', scope="scope2")
+        #create collections with same name
+        self.cli_client.create_collection(bucket='bucket1', scope="scope1", collection='collection1')
+        self.cli_client.create_collection(bucket='bucket1', scope="scope2", collection='collection1')
+        # create 2 indexes
+        index1 = self.create_index(self._cb_cluster.get_bucket_by_name('bucket1'),
+                                   "index1", collection_index=True, _type="scope1.collection1",
+                                   scope="scope1", collections=["collection1"])
+        try:
+            index2 = self.create_index(self._cb_cluster.get_bucket_by_name('bucket1'),
+                                       "index1", collection_index=True, _type="scope2.collection1",
+                                       scope="scope2", collections=["collection1"], no_check=True)
+        except Exception as e:
+            self.log.info("Exception caught ::" + str(e) + "::")
+            return
+        self.fail("Failed creating 2 indexes with same name in different scopes ")
+
+    test_data = {
+        "doc_1": {
+            "num": 1,
+            "str": "str_1",
+            "bool": True,
+            "array": ["array1_1", "array1_2"],
+            "obj": {"key": "key1", "val": "val1"},
+            "filler": "filler"
+        },
+        "doc_2": {
+            "num": 2,
+            "str": "str_2",
+            "bool": False,
+            "array": ["array2_1", "array2_2"],
+            "obj": {"key": "key2", "val": "val2"},
+            "filler": "filler"
+        },
+        "doc_3": {
+            "num": 3,
+            "str": "str_3",
+            "bool": True,
+            "array": ["array3_1", "array3_2"],
+            "obj": {"key": "key3", "val": "val3"},
+            "filler": "filler"
+        },
+        "doc_4": {
+            "num": 4,
+            "str": "str_4",
+            "bool": False,
+            "array": ["array4_1", "array4_2"],
+            "obj": {"key": "key4", "val": "val4"},
+            "filler": "filler"
+        },
+        "doc_5": {
+            "num": 5,
+            "str": "str_5",
+            "bool": True,
+            "array": ["array5_1", "array5_2"],
+            "obj": {"key": "key5", "val": "val5"},
+            "filler": "filler"
+        },
+        "doc_10": {
+            "num": 10,
+            "str": "str_10",
+            "bool": False,
+            "array": ["array10_1", "array10_2"],
+            "obj": {"key": "key10", "val": "val10"},
+            "filler": "filler"
+        },
+    }
+
+    def test_search_before(self):
+        bucket = self._cb_cluster.get_bucket_by_name('default')
+        self._load_search_before_search_after_test_data(bucket.name, self.test_data)
+        index = self.create_index(bucket, "idx1")
+        self.wait_for_indexing_complete(len(self.test_data))
+        full_size = len(self.test_data)
+        partial_size = TestInputSingleton.input.param("partial_size", 1)
+        partial_start_index = TestInputSingleton.input.param("partial_start_index", 3)
+        sort_mode = eval(TestInputSingleton.input.param("sort_mode", '[_id]'))
+
+        cluster = index.get_cluster()
+
+        all_fts_query = {"explain": False, "fields": ["*"], "highlight": {}, "query": {"match": "filler", "field": "filler"},"size": full_size, "sort": sort_mode}
+        all_hits, all_matches, _, _ = cluster.run_fts_query(index.name, all_fts_query)
+        search_before_param = all_matches[partial_start_index]['sort']
+
+        for i in range(0, len(search_before_param)):
+            if search_before_param[i] == "_score":
+                search_before_param[i] = str(all_matches[partial_start_index]['score'])
+
+        search_before_fts_query = {"explain": False, "fields": ["*"], "highlight": {}, "query": {"match": "filler", "field": "filler"},"size": partial_size, "sort": sort_mode, "search_before": search_before_param}
+        _, search_before_matches, _, _ = cluster.run_fts_query(index.name, search_before_fts_query)
+
+        all_results_ids = []
+        search_before_results_ids = []
+
+        for match in all_matches:
+            all_results_ids.append(match['id'])
+
+        for match in search_before_matches:
+            search_before_results_ids.append(match['id'])
+
+        for i in range(0, partial_size-1):
+            if i in range(0, len(search_before_results_ids) - 1):
+                if search_before_results_ids[i] != all_results_ids[partial_start_index-partial_size+i]:
+                    self.fail("test is failed")
+
+    def test_search_after(self):
+        bucket = self._cb_cluster.get_bucket_by_name('default')
+        self._load_search_before_search_after_test_data(bucket.name, self.test_data)
+        index = self.create_index(bucket, "idx1")
+        self.wait_for_indexing_complete(len(self.test_data))
+        full_size = len(self.test_data)
+        partial_size = TestInputSingleton.input.param("partial_size", 1)
+        partial_start_index = TestInputSingleton.input.param("partial_start_index", 3)
+        sort_mode = eval(TestInputSingleton.input.param("sort_mode", '[_id]'))
+
+        cluster = index.get_cluster()
+
+        all_fts_query = {"explain": False, "fields": ["*"], "highlight": {}, "query": {"match": "filler", "field": "filler"},"size": full_size, "sort": sort_mode}
+        all_hits, all_matches, _, _ = cluster.run_fts_query(index.name, all_fts_query)
+
+        search_before_param = all_matches[partial_start_index]['sort']
+
+        for i in range(0, len(search_before_param)):
+            if search_before_param[i] == "_score":
+                search_before_param[i] = str(all_matches[partial_start_index]['score'])
+
+        search_before_fts_query = {"explain": False, "fields": ["*"], "highlight": {}, "query": {"match": "filler", "field": "filler"},"size": partial_size, "sort": sort_mode, "search_after": search_before_param}
+        _, search_before_matches, _, _ = cluster.run_fts_query(index.name, search_before_fts_query)
+        all_results_ids = []
+        search_before_results_ids = []
+
+        for match in all_matches:
+            all_results_ids.append(match['id'])
+
+        for match in search_before_matches:
+            search_before_results_ids.append(match['id'])
+
+        for i in range(0, partial_size-1):
+            if i in range(0, len(search_before_results_ids)-1):
+                if search_before_results_ids[i] != all_results_ids[partial_start_index+1+i]:
+                    self.fail("test is failed")
+
+    def test_search_before_multi_fields(self):
+        bucket = self._cb_cluster.get_bucket_by_name('default')
+        self._load_search_before_search_after_test_data(bucket.name, self.test_data)
+        index = self.create_index(bucket, "idx1")
+        self.wait_for_indexing_complete(len(self.test_data))
+
+        full_size = len(self.test_data)
+        partial_size = TestInputSingleton.input.param("partial_size", 1)
+        partial_start_index = TestInputSingleton.input.param("partial_start_index", 3)
+        sort_modes = ['str', 'num', 'bool', 'array', '_id', '_score']
+        sort_mode = []
+        fails = []
+
+        cluster = index.get_cluster()
+        for i in range(0, len(sort_modes)):
+            for j in range(0, len(sort_modes)):
+                sort_mode.clear()
+                if sort_modes[i] == sort_modes[j]:
+                    pass
+                sort_mode.append(sort_modes[i])
+                sort_mode.append(sort_modes[j])
+                all_fts_query = {"explain": False, "fields": ["*"], "highlight": {}, "query": {"match": "filler", "field": "filler"},"size": full_size, "sort": sort_mode}
+                all_hits, all_matches, _, _ = cluster.run_fts_query(index.name, all_fts_query)
+                search_before_param = all_matches[partial_start_index]['sort']
+
+                for i in range(0, len(search_before_param)):
+                    if search_before_param[i] == "_score":
+                        search_before_param[i] = str(all_matches[partial_start_index]['score'])
+
+                search_before_fts_query = {"explain": False, "fields": ["*"], "highlight": {}, "query": {"match": "filler", "field": "filler"},"size": partial_size, "sort": sort_mode, "search_before": search_before_param}
+                _, search_before_matches, _, _ = cluster.run_fts_query(index.name, search_before_fts_query)
+
+                all_results_ids = []
+                search_before_results_ids = []
+
+                for match in all_matches:
+                    all_results_ids.append(match['id'])
+
+                for match in search_before_matches:
+                    search_before_results_ids.append(match['id'])
+
+                for i in range(0, partial_size-1):
+                    if search_before_results_ids[i] != all_results_ids[full_size-partial_start_index-partial_size+i]:
+                        fails.append(str(sort_mode))
+        self.assertEqual(len(fails), 0, "Tests for the following sort modes are failed: "+str(fails))
+
+    def test_search_after_multi_fields(self):
+        bucket = self._cb_cluster.get_bucket_by_name('default')
+        self._load_search_before_search_after_test_data(bucket.name, self.test_data)
+        index = self.create_index(bucket, "idx1")
+        self.wait_for_indexing_complete(len(self.test_data))
+
+        full_size = len(self.test_data)
+        partial_size = TestInputSingleton.input.param("partial_size", 1)
+        partial_start_index = TestInputSingleton.input.param("partial_start_index", 3)
+        sort_modes = ['str', 'num', 'bool', 'array', '_id', '_score']
+        sort_mode = []
+        fails = []
+
+        cluster = index.get_cluster()
+        for i in range(0, len(sort_modes)):
+            for j in range(0, len(sort_modes)):
+                sort_mode.clear()
+                if sort_modes[i] == sort_modes[j]:
+                    pass
+                sort_mode.append(sort_modes[i])
+                sort_mode.append(sort_modes[j])
+                all_fts_query = {"explain": False, "fields": ["*"], "highlight": {}, "query": {"match": "filler", "field": "filler"},"size": full_size, "sort": sort_mode}
+                all_hits, all_matches, _, _ = cluster.run_fts_query(index.name, all_fts_query)
+                search_before_param = all_matches[partial_start_index]['sort']
+
+                for i in range(0, len(search_before_param)):
+                    if search_before_param[i] == "_score":
+                        search_before_param[i] = str(all_matches[partial_start_index]['score'])
+
+                search_before_fts_query = {"explain": False, "fields": ["*"], "highlight": {}, "query": {"match": "filler", "field": "filler"},"size": partial_size, "sort": sort_mode, "search_after": search_before_param}
+                _, search_before_matches, _, _ = cluster.run_fts_query(index.name, search_before_fts_query)
+
+                all_results_ids = []
+                search_before_results_ids = []
+
+                for match in all_matches:
+                    all_results_ids.append(match['id'])
+
+                for match in search_before_matches:
+                    search_before_results_ids.append(match['id'])
+
+                for i in range(0, partial_size-1):
+                    if search_before_results_ids[i] != all_results_ids[partial_start_index+1+i]:
+                        fails.append(str(sort_mode))
+        self.assertEqual(len(fails), 0, "Tests for the following sort modes are failed: "+str(fails))
+
+    def test_search_before_search_after_negative(self):
+        expected_error = "cannot use search after and search before together"
+        bucket = self._cb_cluster.get_bucket_by_name('default')
+        self._load_search_before_search_after_test_data(bucket.name, self.test_data)
+        index = self.create_index(bucket, "idx1")
+        self.wait_for_indexing_complete(len(self.test_data))
+
+        cluster = index.get_cluster()
+        search_before_fts_query = {"explain": False, "fields": ["*"], "highlight": {}, "query": {"query": "filler:filler"},"size": 2, "search_before": ["doc_2"], "search_after": ["doc_4"], "sort": ["_id"]}
+
+        response = cluster.run_fts_query_generalized(index.name, search_before_fts_query)
+        if 'error' in response.keys():
+            self.assertTrue(str(response['error']).index(expected_error) > 0, "Cannot find expected error message.")
+        else:
+            self.fail("Incorrect query was executed successfully.")
+
+    query_result = None
+
+    def run_fts_query_wrapper(self, index, fts_query):
+        cluster = index.get_cluster()
+        _, self.query_result,_,_ = cluster.run_fts_query(index.name, fts_query)
+
+
+    def test_concurrent_search_before_query_index_build(self):
+        bucket = self._cb_cluster.get_bucket_by_name('default')
+        self._load_search_before_search_after_test_data(bucket.name, self.test_data)
+        index = self.create_index(bucket, "idx1")
+        self.wait_for_indexing_complete(len(self.test_data))
+
+        cluster = index.get_cluster()
+
+        search_before_fts_query = {"explain": False, "fields": ["*"], "highlight": {}, "query": {"match": "filler", "field": "filler"},"size": 2, "sort": ["str"], "search_before": ["str_4"]}
+        _, search_before_matches, _, _ = cluster.run_fts_query(index.name, search_before_fts_query)
+
+        data_filler_thread = threading.Thread(target=self._load_search_before_search_after_additional_data, args=(bucket.name, 1000 , 20))
+        query_executor_thread = threading.Thread(target=self.run_fts_query_wrapper, args=(index, search_before_fts_query))
+        data_filler_thread.daemon = True
+        data_filler_thread.start()
+        self.sleep(10)
+        query_executor_thread.daemon = True
+        query_executor_thread.start()
+
+        data_filler_thread.join()
+        query_executor_thread.join()
+        self.log.info("idle results ::"+str(search_before_matches)+"::")
+        self.log.info("busy results ::"+str(self.query_result)+"::")
+        idle_ids = []
+        busy_ids = []
+        for match in search_before_matches:
+            idle_ids.append(match['id'])
+        for match in self.query_result:
+            busy_ids.append(match['id'])
+        self.assertEqual(idle_ids, busy_ids, "Results for idle and busy index states are different.")
+
+    def test_concurrent_search_after_query_index_build(self):
+        bucket = self._cb_cluster.get_bucket_by_name('default')
+        self._load_search_before_search_after_test_data(bucket.name, self.test_data)
+        index = self.create_index(bucket, "idx1")
+        self.wait_for_indexing_complete(len(self.test_data))
+
+        cluster = index.get_cluster()
+
+        search_after_fts_query = {"explain": False, "fields": ["*"], "highlight": {}, "query": {"match": "filler", "field": "filler"},"size": 2, "sort": ["str"], "search_after": ["str_2"]}
+        _, search_after_matches, _, _ = cluster.run_fts_query(index.name, search_after_fts_query)
+
+        data_filler_thread = threading.Thread(target=self._load_search_before_search_after_additional_data, args=(bucket.name, 1000 , 20))
+        query_executor_thread = threading.Thread(target=self.run_fts_query_wrapper, args=(index, search_after_fts_query))
+        data_filler_thread.daemon = True
+        data_filler_thread.start()
+        self.sleep(10)
+        query_executor_thread.daemon = True
+        query_executor_thread.start()
+
+        data_filler_thread.join()
+        query_executor_thread.join()
+        idle_ids = []
+        busy_ids = []
+        for match in search_after_matches:
+            idle_ids.append(match['id'])
+        for match in self.query_result:
+            busy_ids.append(match['id'])
+        self.assertEqual(idle_ids, busy_ids, "Results for idle and busy index states are different.")
+
+    def test_search_before_after_n1ql_function(self):
+        bucket = self._cb_cluster.get_bucket_by_name('default')
+        self._load_search_before_search_after_test_data(bucket.name, self.test_data)
+        index = self.create_index(bucket, "idx1")
+        direction = TestInputSingleton.input.param("direction", "search_before")
+        self.wait_for_indexing_complete(len(self.test_data))
+
+        cluster = index.get_cluster()
+
+        search_before_after_fts_query = {"explain": False, "fields": ["*"], "highlight": {}, "query": {"match": "filler", "field": "filler"},"size": 2, "sort": ["_id"], direction: ["doc_2"]}
+        _, fts_matches, _, _ = cluster.run_fts_query(index.name, search_before_after_fts_query)
+        n1ql_query = 'select meta().id from '+bucket.name+' where search('+bucket.name+', {"explain": false, "fields": ["*"], "highlight": {}, "query": {"match": "filler", "field": "filler"}, "size": 2, "sort": ["_id"], "'+direction+'": ["doc_2"]})'
+        n1ql_results = self._cb_cluster.run_n1ql_query(query=n1ql_query)['results']
+        fts_ids = []
+        n1ql_ids = []
+        for match in fts_matches:
+            fts_ids.append(match['id'])
+        for match in n1ql_results:
+            n1ql_ids.append(match['id'])
+        self.assertEqual(fts_ids, n1ql_ids, "Results for fts and n1ql queries are different.")
+
+
+
+    def test_search_before_not_indexed_field(self):
+        bucket = self._cb_cluster.get_bucket_by_name('default')
+        self._load_search_before_search_after_test_data(bucket.name, self.test_data)
+        index = self.create_index(bucket, "idx1")
+        self.wait_for_indexing_complete(len(self.test_data))
+        full_size = len(self.test_data)
+        partial_size = 2
+        partial_start_index = 3
+
+        index.index_definition['params']['doc_config'] = {}
+        doc_config = {}
+        doc_config['mode'] = 'type_field'
+        doc_config['type_field'] = 'filler'
+        index.index_definition['params']['doc_config'] = doc_config
+
+        index.add_type_mapping_to_index_definition(type="filler",
+                                                   analyzer="standard")
+        index.index_definition['params']['mapping'] = {
+                    "default_analyzer": "standard",
+                    "default_datetime_parser": "dateTimeOptional",
+                    "default_field": "_all",
+                    "default_mapping": {
+                        "dynamic": False,
+                        "enabled": False
+                    },
+                    "default_type": "_default",
+                    "docvalues_dynamic": True,
+                    "index_dynamic": True,
+                    "store_dynamic": False,
+                    "type_field": "_type",
+                    "types": {
+                        "filler": {
+                            "default_analyzer": "standard",
+                            "dynamic": False,
+                            "enabled": True,
+                            "properties": {
+                                "num": {
+                                    "enabled": True,
+                                    "dynamic": False,
+                                    "fields": [
+                                        {
+                                            "docvalues": True,
+                                            "include_term_vectors": True,
+                                            "index": True,
+                                            "name": "num",
+                                            "type": "number"
+                                        }
+                                    ]
+                                }
+                            }
+                        }
+                    }
+                }
+        index.index_definition['uuid'] = index.get_uuid()
+        index.update()
+
+        self.wait_for_indexing_complete(len(self.test_data))
+        self.sleep(5)
+
+        cluster = index.get_cluster()
+
+
+        all_fts_query = {"explain": False, "fields": ["*"], "highlight": {}, "query": {"query": "num: >0"},"size": full_size, "sort": ["str"]}
+        all_hits, all_matches, _, _ = cluster.run_fts_query(index.name, all_fts_query)
+        search_before_param = all_matches[partial_start_index]['sort']
+
+        for i in range(0, len(search_before_param)):
+            if search_before_param[i] == "_score":
+                search_before_param[i] = str(all_matches[partial_start_index]['score'])
+
+        search_before_fts_query = {"explain": False, "fields": ["*"], "highlight": {}, "query": {"query": "num: >0"},"size": partial_size, "sort": ["str"], "search_before": search_before_param}
+        total_hits, hit_list, time_taken, status = cluster.run_fts_query(index.name, search_before_fts_query)
+        self.assertEqual(total_hits, full_size, "search_before query for non-indexed field is failed.")
+
+
+    def test_search_after_not_indexed_field(self):
+
+        bucket = self._cb_cluster.get_bucket_by_name('default')
+        self._load_search_before_search_after_test_data(bucket.name, self.test_data)
+        index = self.create_index(bucket, "idx1")
+        self.wait_for_indexing_complete(len(self.test_data))
+        full_size = len(self.test_data)
+        partial_size = 2
+        partial_start_index = 3
+
+        index.index_definition['params']['doc_config'] = {}
+        doc_config = {}
+        doc_config['mode'] = 'type_field'
+        doc_config['type_field'] = 'filler'
+        index.index_definition['params']['doc_config'] = doc_config
+
+        index.add_type_mapping_to_index_definition(type="filler",
+                                                   analyzer="standard")
+        index.index_definition['params']['mapping'] = {
+                    "default_analyzer": "standard",
+                    "default_datetime_parser": "dateTimeOptional",
+                    "default_field": "_all",
+                    "default_mapping": {
+                        "dynamic": False,
+                        "enabled": False
+                    },
+                    "default_type": "_default",
+                    "docvalues_dynamic": True,
+                    "index_dynamic": True,
+                    "store_dynamic": False,
+                    "type_field": "_type",
+                    "types": {
+                        "filler": {
+                            "default_analyzer": "standard",
+                            "dynamic": False,
+                            "enabled": True,
+                            "properties": {
+                                "num": {
+                                    "enabled": True,
+                                    "dynamic": False,
+                                    "fields": [
+                                        {
+                                            "docvalues": True,
+                                            "include_term_vectors": True,
+                                            "index": True,
+                                            "name": "num",
+                                            "type": "number"
+                                        }
+                                    ]
+                                }
+                            }
+                        }
+                    }
+                }
+        index.index_definition['uuid'] = index.get_uuid()
+        index.update()
+
+        self.wait_for_indexing_complete(len(self.test_data))
+        self.sleep(5)
+
+        cluster = index.get_cluster()
+
+        all_fts_query = {"explain": False, "fields": ["*"], "highlight": {}, "query": {"query": "num: >0"},"size": full_size, "sort": ["str"]}
+        all_hits, all_matches, _, _ = cluster.run_fts_query(index.name, all_fts_query)
+
+        search_after_param = all_matches[partial_start_index]['sort']
+
+        for i in range(0, len(search_after_param)):
+            if search_after_param[i] == "_score":
+                search_after_param[i] = str(all_matches[partial_start_index]['score'])
+
+        search_after_fts_query = {"explain": False, "fields": ["*"], "highlight": {}, "query": {"query": "num: >0"},"size": partial_size, "sort": ["str"], "search_after": search_after_param}
+        total_hits, hit_list, time_taken, status = cluster.run_fts_query(index.name, search_after_fts_query)
+        self.assertEqual(total_hits, full_size, "search_after query for non-indexed field is failed.")
+
+    def _load_search_before_search_after_test_data(self, bucket, test_data):
+        for key in test_data:
+            query = "insert into "+bucket+" (KEY, VALUE) VALUES " \
+                                          "('"+str(key)+"', " \
+                                          ""+str(test_data[key])+")"
+            self._cb_cluster.run_n1ql_query(query=query)
+
+    def _load_search_before_search_after_additional_data(self, bucket, num_records=5000, start_index=20):
+        for i in range(start_index, num_records):
+            query = 'insert into '+bucket+' (KEY, VALUE) VALUES ' \
+                                          '("doc_'+str(i)+'", ' \
+                    '{' \
+                        '"num": '+str(i)+',' \
+                        '"str": "ystr_'+str(i)+'",' \
+                        '"bool": False,' \
+                        '"array": ["array'+str(i)+'_1", "array'+str(i)+'_2"],' \
+                        '"obj": {"key": "key'+str(i)+'", "val": "val'+str(i)+'"},' \
+                        '"filler": "filler"' \
+                    '})'
+            self._cb_cluster.run_n1ql_query(query=query)
+
+    def _create_oso_containers(self, bucket=None, num_scopes=1, collections_per_scope=1, docs_per_collection=10000):
+        load_tasks = []
+        for i in range(1, num_scopes+1):
+            scope_name = "scope_"+str(i)
+            self.cli_client.create_scope(bucket="default", scope=scope_name);
+            self.sleep(10)
+            for j in range(1, collections_per_scope+1):
+                collection_name = "collection_"+str(j)
+                self._cb_cluster._create_collection(bucket="default", scope=scope_name, collection=collection_name, cli_client=self.cli_client)
+
+                #load data into collections
+                gen_create = SDKDataLoader(num_ops=docs_per_collection, percent_create=100, percent_update=0, percent_delete=0,
+                             load_pattern="uniform", start_seq_num=1, key_prefix="doc_", key_suffix="_",
+                             scope=scope_name, collection=collection_name, json_template="emp", doc_expiry=0,
+                             doc_size=500, get_sdk_logs=False, username="Administrator", password="password", timeout=1000,
+                             start=0, end=0, op_type="create", all_collections=False, es_compare=False, es_host=None, es_port=None,
+                             es_login=None, es_password=None)
+
+                load_tasks = self._cb_cluster.async_load_bucket_from_generator(bucket, gen_create)
+                for task in load_tasks:
+                    task.result()
+
+    def _fill_collection(self, bucket=None, scope=None, collection=None, num_docs=1000, start_seq_num=1):
+        gen_create = SDKDataLoader(num_ops=num_docs, percent_create=100, percent_update=0, percent_delete=0,
+                     load_pattern="uniform", start_seq_num=start_seq_num, key_prefix="doc_", key_suffix="_",
+                     scope=scope, collection=collection, json_template="emp", doc_expiry=0,
+                     doc_size=500, get_sdk_logs=False, username="Administrator", password="password", timeout=1000,
+                     start=0, end=0, op_type="create", all_collections=False, es_compare=False, es_host=None, es_port=None,
+                     es_login=None, es_password=None)#
+
+        load_tasks = self._cb_cluster.async_load_bucket_from_generator(bucket, gen_create)
+        for task in load_tasks:
+            task.result()
+
+    def _update_collection(self, bucket=None, scope=None, collection=None, num_docs=1000, start=1):
+        gen_create = SDKDataLoader(num_ops=num_docs, percent_create=0, percent_update=100, percent_delete=0,
+                     load_pattern="uniform", start_seq_num=start, key_prefix="doc_", key_suffix="_",
+                     scope=scope, collection=collection, json_template="emp", doc_expiry=0,
+                     doc_size=500, get_sdk_logs=False, username="Administrator", password="password", timeout=1000,
+                     start=start, end=start+num_docs, op_type="create", all_collections=False, es_compare=False, es_host=None, es_port=None,
+                     es_login=None, es_password=None)
+
+        load_tasks = self._cb_cluster.async_load_bucket_from_generator(bucket, gen_create)
+        for task in load_tasks:
+            task.result()
+
+    def _delete_from_collection(self, bucket=None, scope=None, collection=None, num_docs=1000, start=1):
+        gen_create = SDKDataLoader(num_ops=num_docs, percent_create=0, percent_update=0, percent_delete=100,
+                     load_pattern="uniform", start_seq_num=start, key_prefix="doc_", key_suffix="_",
+                     scope=scope, collection=collection, json_template="emp", doc_expiry=0,
+                     doc_size=500, get_sdk_logs=False, username="Administrator", password="password", timeout=1000,
+                     start=start, end=start+num_docs, op_type="create", all_collections=False, es_compare=False, es_host=None, es_port=None,
+                     es_login=None, es_password=None)
+
+        load_tasks = self._cb_cluster.async_load_bucket_from_generator(bucket, gen_create)
+        for task in load_tasks:
+            task.result()
+
+    def test_index_creation_oso(self):
+        rest = RestConnection(self._cb_cluster.get_random_fts_node())
+        rest.set_node_setting("useOSOBackfill", True)
+        bucket = self._cb_cluster.get_bucket_by_name('default')
+        num_scopes = TestInputSingleton.input.param("num_scopes", 5)
+        collections_per_scope = TestInputSingleton.input.param("collections_per_scope", 20)
+        docs_per_collection = TestInputSingleton.input.param("docs_per_collection", 10000)
+        self._create_oso_containers(bucket=bucket, num_scopes=num_scopes, collections_per_scope=collections_per_scope, docs_per_collection=docs_per_collection)
+
+        test_scope = "scope_"+str(num_scopes)
+        test_collection = "test_collection"
+        self._cb_cluster._create_collection(bucket="default", scope=test_scope, collection=test_collection, cli_client=self.cli_client)
+        self._fill_collection(bucket=bucket, scope=test_scope, collection=test_collection, num_docs=1000)
+        test_index = self.create_index(self._cb_cluster.get_bucket_by_name('default'),
+                                       "test_index", collection_index=True, _type=f"{test_scope}.{test_collection}",
+                                       scope=test_scope, collections=[test_collection])
+        self.wait_for_indexing_complete_simple(item_count=1000, index=test_index)
+
+        multi_collections = []
+        for i in range(1, 4):
+            coll_name = test_collection + "_" + str(i)
+            self._cb_cluster._create_collection(bucket="default", scope=test_scope, collection=coll_name, cli_client=self.cli_client)
+            self._fill_collection(bucket=bucket, scope=test_scope, collection=coll_name, num_docs=1000, start_seq_num=1000*i+1)
+            multi_collections.append(coll_name)
+        _type_multi = []
+        index_collections = []
+        for c in multi_collections:
+            _type_multi.append(f"{test_scope}.{c}")
+            index_collections.append(c)
+        test_index_multi = self.create_index(self._cb_cluster.get_bucket_by_name('default'),
+                                       "test_index_multi", collection_index=True, _type=_type_multi,
+                                        scope=test_scope, collections=index_collections)
+        self.wait_for_indexing_complete_simple(item_count=3000, index=test_index_multi)
+
+        test_query = {"match": "emp", "field": "type"}
+        hits_before, _, _, _ = test_index.execute_query(test_query)
+        hits_before_multi, _, _, _ = test_index_multi.execute_query(test_query)
+
+        additional_collections_per_scope = TestInputSingleton.input.param("additional_collections_per_scope", 2)
+
+        for i in range(1, num_scopes+1):
+            scope_name = "scope_" + str(i)
+            for j in (collections_per_scope+2, additional_collections_per_scope+1):
+                collection_name = "collection_" + str(j)
+                self._cb_cluster._create_collection(bucket="default", scope=scope_name, collection=collection_name, cli_client=self.cli_client)
+                self._fill_collection(bucket=bucket, scope=scope_name, collection=collection_name)
+
+        hits_after, _, _, _ = test_index.execute_query(test_query)
+        hits_after_multi, _, _, _ = test_index_multi.execute_query(test_query)
+        errors = []
+        try:
+            self.assertEqual(hits_before, hits_after)
+        except AssertionError as e:
+            errors.append("Hits before and after additional data load do not match for single collection index.")
+        try:
+            self.assertEqual(hits_before_multi, hits_after_multi)
+        except AssertionError as e:
+            errors.append("Hits before and after additional data load do not match for multi collection index.")
+
+        try:
+            self.assertEqual(len(errors), 0)
+        except AssertionError as ex:
+            for err in errors:
+                self.log.error(err)
+            self.fail()
+
+    def test_data_mutations_oso(self):
+        rest = RestConnection(self._cb_cluster.get_random_fts_node())
+        rest.set_node_setting("useOSOBackfill", True)
+
+        bucket = self._cb_cluster.get_bucket_by_name('default')
+        num_scopes = TestInputSingleton.input.param("num_scopes", 5)
+        collections_per_scope = TestInputSingleton.input.param("collections_per_scope", 20)
+        docs_per_collection = TestInputSingleton.input.param("docs_per_collection", 10000)
+        self._create_oso_containers(bucket=bucket, num_scopes=num_scopes, collections_per_scope=collections_per_scope, docs_per_collection=docs_per_collection)
+
+        test_scope = "scope_"+str(num_scopes)
+        test_collection = "test_collection"
+        self._cb_cluster._create_collection(bucket="default", scope=test_scope, collection=test_collection, cli_client=self.cli_client)
+        self._fill_collection(bucket=bucket, scope=test_scope, collection=test_collection, num_docs=1000)
+
+        test_index = self.create_index(self._cb_cluster.get_bucket_by_name('default'),
+                                       "test_index", collection_index=True, _type=f"{test_scope}.{test_collection}",
+                                       scope=test_scope, collections=[test_collection])
+        self.wait_for_indexing_complete_simple(item_count=1000, index=test_index)
+
+        multi_collections = []
+        for i in range(1, 4):
+            coll_name = test_collection + "_" + str(i)
+            self._cb_cluster._create_collection(bucket="default", scope=test_scope, collection=coll_name, cli_client=self.cli_client)
+            self._fill_collection(bucket=bucket, scope=test_scope, collection=coll_name, num_docs=1000, start_seq_num=1000*i+1)
+            multi_collections.append(coll_name)
+        _type_multi = []
+        index_collections = []
+        for c in multi_collections:
+            _type_multi.append(f"{test_scope}.{c}")
+            index_collections.append(c)
+        test_index_multi = self.create_index(self._cb_cluster.get_bucket_by_name('default'),
+                                       "test_index_multi", collection_index=True, _type=_type_multi,
+                                             scope=test_scope, collections=index_collections)
+        self.wait_for_indexing_complete_simple(item_count=3000, index=test_index_multi)
+
+        additional_collections_per_scope = TestInputSingleton.input.param("additional_collections_per_scope", 2)
+
+        for i in range(1, num_scopes+1):
+            scope_name = "scope_" + str(i)
+            for j in (collections_per_scope+2, additional_collections_per_scope+1):
+                collection_name = "collection_" + str(j)
+                self._cb_cluster._create_collection(bucket="default", scope=scope_name, collection=collection_name, cli_client=self.cli_client)
+                self._fill_collection(bucket=bucket, scope=scope_name, collection=collection_name)
+
+        for i in range(1, num_scopes+1):
+            scope_name = "scope_" + str(i)
+            for j in (1, additional_collections_per_scope+1):
+                collection_name = "collection_" + str(j)
+                self._update_collection(bucket=bucket, scope=scope_name, collection=collection_name)
+
+        self._update_collection(bucket=bucket, scope=test_scope, collection=test_collection, num_docs=1000)
+        for i in range(1, 4):
+            self._update_collection(bucket=bucket, scope=test_scope, collection=test_collection+"_"+str(i), num_docs=1000, start=1000*i+1)
+
+        self.wait_for_indexing_complete_simple(item_count=1000, index=test_index)
+        self.wait_for_indexing_complete_simple(item_count=3000, index=test_index_multi)
+
+        test_query = {"query": "mutated:1"}
+        hits, _, _, _ = test_index.execute_query(test_query)
+        hits_multi, _, _, _ = test_index_multi.execute_query(test_query)
+
+        errors = []
+        try:
+            self.assertEqual(hits, 1000)
+        except AssertionError as e:
+            errors.append("Full update of test collection is failed, or fts index produces wrong results for test query.")
+        try:
+            self.assertEqual(hits_multi, 3000)
+        except AssertionError as e:
+            errors.append("Full update of test collections for multi collection index is failed, or multi collections fts index produces wrong results for test query.")
+
+        try:
+            self.assertEqual(len(errors), 0)
+        except AssertionError as ex:
+            for err in errors:
+                self.log.error(err)
+            self.fail()
+
+    def test_doc_id_oso(self):
+        rest = RestConnection(self._cb_cluster.get_random_fts_node())
+        rest.set_node_setting("useOSOBackfill", True)
+
+        bucket = self._cb_cluster.get_bucket_by_name('default')
+        num_scopes = TestInputSingleton.input.param("num_scopes", 5)
+        collections_per_scope = TestInputSingleton.input.param("collections_per_scope", 20)
+        docs_per_collection = TestInputSingleton.input.param("docs_per_collection", 10000)
+        self._create_oso_containers(bucket=bucket, num_scopes=num_scopes, collections_per_scope=collections_per_scope, docs_per_collection=docs_per_collection)
+
+        test_scope = "scope_"+str(num_scopes)
+        test_collection = "test_collection"
+        self._cb_cluster._create_collection(bucket="default", scope=test_scope, collection=test_collection, cli_client=self.cli_client)
+        self._fill_collection(bucket=bucket, scope=test_scope, collection=test_collection, num_docs=1000, start_seq_num=1001)
+
+        test_index = self.create_index(self._cb_cluster.get_bucket_by_name('default'),
+                                       "test_index", collection_index=True, _type=f"{test_scope}.{test_collection}",
+                                       scope=test_scope, collections=[test_collection])
+
+        additional_collections_per_scope = TestInputSingleton.input.param("additional_collections_per_scope", 2)
+
+        for i in range(1, num_scopes+1):
+            scope_name = "scope_" + str(i)
+            for j in (collections_per_scope+2, additional_collections_per_scope+1):
+                collection_name = "collection_" + str(j)
+                self._cb_cluster._create_collection(bucket="default", scope=scope_name, collection=collection_name, cli_client=self.cli_client)
+                self._fill_collection(bucket=bucket, scope=scope_name, collection=collection_name)
+
+        self._fill_collection(bucket=bucket, scope=test_scope, collection=test_collection, num_docs=1000, start_seq_num=1)
+
+        test_query = {"match": "emp", "field": "type"}
+        hits, _, _, _ = test_index.execute_query(test_query)
+        self.assertEqual(hits, 2000, "Test for doc_id special load order is failed.")
+
+    def test_partial_rollback_oso(self):
+        from lib.memcached.helper.data_helper import MemcachedClientHelper
+        #items = 50000, update = True, upd = 30, upd_del_fields = ['dept']
+        rest = RestConnection(self._cb_cluster.get_random_fts_node())
+        rest.set_node_setting("useOSOBackfill", True)
+
+        bucket = self._cb_cluster.get_bucket_by_name("default")
+        self._cb_cluster.flush_buckets([bucket])
+
+        num_scopes = TestInputSingleton.input.param("num_scopes", 5)
+        collections_per_scope = TestInputSingleton.input.param("collections_per_scope", 20)
+        docs_per_collection = TestInputSingleton.input.param("docs_per_collection", 10000)
+        self._create_oso_containers(bucket=bucket, num_scopes=num_scopes, collections_per_scope=collections_per_scope, docs_per_collection=docs_per_collection)
+
+        test_scope = "scope_"+str(num_scopes)
+        test_collection = "test_collection"
+        self._cb_cluster._create_collection(bucket="default", scope=test_scope, collection=test_collection, cli_client=self.cli_client)
+        self._fill_collection(bucket=bucket, scope=test_scope, collection=test_collection, num_docs=15000)
+
+        test_index = self.create_index(self._cb_cluster.get_bucket_by_name('default'),
+                                       "test_index", collection_index=True, _type=f"{test_scope}.{test_collection}",
+                                       scope=test_scope, collections=[test_collection])
+        self.wait_for_indexing_complete_simple(item_count=15000, index=test_index)
+
+        multi_collections = []
+        for i in range(1, 4):
+            coll_name = test_collection + "_" + str(i)
+            self._cb_cluster._create_collection(bucket="default", scope=test_scope, collection=coll_name, cli_client=self.cli_client)
+            self._fill_collection(bucket=bucket, scope=test_scope, collection=coll_name, num_docs=15000)
+            multi_collections.append(coll_name)
+        _type_multi = []
+        index_collections = []
+        for c in multi_collections:
+            _type_multi.append(f"{test_scope}.{c}")
+            index_collections.append(c)
+        test_index_multi = self.create_index(self._cb_cluster.get_bucket_by_name('default'),
+                                             "test_index_multi", collection_index=True, _type=_type_multi,
+                                             scope=test_scope, collections=index_collections)
+        self.wait_for_indexing_complete_simple(item_count=45000, index=test_index_multi)
+
+        additional_collections_per_scope = TestInputSingleton.input.param("additional_collections_per_scope", 2)
+
+        for i in range(1, num_scopes+1):
+            scope_name = "scope_" + str(i)
+            for j in (collections_per_scope+2, additional_collections_per_scope+1):
+                collection_name = "collection_" + str(j)
+                self._cb_cluster._create_collection(bucket="default", scope=scope_name, collection=collection_name, cli_client=self.cli_client)
+                self._fill_collection(bucket=bucket, scope=scope_name, collection=collection_name)
+
+        for i in range(1, num_scopes+1):
+            scope_name = "scope_" + str(i)
+            for j in (1, additional_collections_per_scope+1):
+                collection_name = "collection_" + str(j)
+                self._update_collection(bucket=bucket, scope=scope_name, collection=collection_name)
+
+        # Stop Persistence on Node A & Node B
+        self.log.info("Stopping persistence on {0}".
+                      format(self._input.servers[:2]))
+        mem_client = MemcachedClientHelper.direct_client(self._input.servers[0],
+                                                         bucket)
+        mem_client.stop_persistence()
+        mem_client = MemcachedClientHelper.direct_client(self._input.servers[1],
+                                                         bucket)
+        mem_client.stop_persistence()
+
+        # Perform mutations on the bucket
+        if self._input.param("update", False):
+            self._update_collection(bucket=bucket, scope=test_scope, collection=test_collection, num_docs=300)
+            for i in range(1, 4):
+                self._update_collection(bucket=bucket, scope=test_scope, collection=test_collection + "_" + str(i),
+                                        num_docs=300, start=1000 * i + 1)
+
+        if self._input.param("delete", False):
+            self._delete_from_collection(bucket=bucket, scope=test_scope, collection=test_collection, num_docs=5000)
+            for i in range(1, 4):
+                self._delete_from_collection(bucket=bucket, scope=test_scope, collection="test_collection_"+str(i), num_docs=5000)
+        self.wait_for_indexing_complete_simple(item_count=900, index=test_index)
+
+        self.wait_for_indexing_complete_simple(item_count=2700, index=test_index_multi)
+
+        # Run FTS Query to fetch the initial count of mutated items
+        query = {"query": "mutated:>0"}
+
+        hits1_simple_index, _, _, _ = test_index.execute_query(query)
+        self.log.info("Hits for simple index before rollback: %s" % hits1_simple_index)
+        hits1_multi_index, _, _, _ = test_index_multi.execute_query(query)
+        self.log.info("Hits for multi index before rollback: %s" % hits1_multi_index)
+        # Fetch count of docs in index and bucket
+        before_simple_index_doc_count = test_index.get_indexed_doc_count()
+        before_multi_index_doc_count = test_index_multi.get_indexed_doc_count()
+        before_bucket_doc_count = test_index.get_src_bucket_doc_count()
+
+        self.log.info("Docs in Bucket : %s, Docs in simple Index : %s, Docs in multi Index: %s" % (
+            before_bucket_doc_count, before_simple_index_doc_count, before_multi_index_doc_count))
+
+        # Kill memcached on Node A
+        self.log.info("Killing memcached on {0}".format(self._master.ip))
+        shell = RemoteMachineShellConnection(self._master)
+        shell.kill_memcached()
+
+        # Start persistence on Node B
+        self.log.info("Starting persistence on {0}".
+                      format(self._input.servers[1].ip))
+        mem_client = MemcachedClientHelper.direct_client(self._input.servers[1],
+                                                         bucket)
+        mem_client.start_persistence()
+
+        # Failover Node B
+        failover_task = self._cb_cluster.async_failover(
+            node=self._input.servers[1])
+        failover_task.result()
+
+        # Wait for Failover & FTS index rollback to complete
+        self.wait_for_indexing_complete_simple(item_count=900, index=test_index)
+        self.wait_for_indexing_complete_simple(item_count=2700, index=test_index_multi)
+
+        # Run FTS query to fetch count of mutated items post rollback.
+        hits2_simple_index, _, _, _ = test_index.execute_query(query)
+        self.log.info("Hits for simple index after rollback: %s" % hits2_simple_index)
+        hits2_multi_index, _, _, _ = test_index_multi.execute_query(query)
+        self.log.info("Hits for multi index after rollback: %s" % hits2_multi_index)
+        # Fetch count of docs in index and bucket
+        after_simple_index_doc_count = test_index.get_indexed_doc_count()
+        after_multi_index_doc_count = test_index_multi.get_indexed_doc_count()
+        after_bucket_doc_count = test_index.get_src_bucket_doc_count()
+
+        self.log.info("Docs in Bucket : %s, Docs in simple Index : %s, Docs in multi Index: %s" % (
+            after_bucket_doc_count, after_simple_index_doc_count, after_multi_index_doc_count))
+
+        # Validation : If there are deletes, validate the #docs in index goes
+        #  up post rollback
+        if self._input.param("delete", False):
+            self.assertGreater(after_simple_index_doc_count, before_simple_index_doc_count,
+                               "Deletes : Simple index count after rollback not "
+                               "greater than before rollback")
+            self.assertGreater(after_multi_index_doc_count, before_multi_index_doc_count,
+                               "Deletes : Multi index count after rollback not "
+                               "greater than before rollback")
+        else:
+            # For Updates, validate that #hits goes down in the query output
+            # post rollback
+            self.assertGreater(hits1_simple_index, hits2_simple_index,
+                               "Mutated items before rollback are not more "
+                               "than after rollback for simple index")
+            self.assertGreater(hits1_multi_index, hits2_multi_index,
+                               "Mutated items before rollback are not more "
+                               "than after rollback for multi index")
+
+        # Failover FTS node
+        failover_fts_node = self._input.param("failover_fts_node", False)
+
+        if failover_fts_node:
+            failover_task = self._cb_cluster.async_failover(
+                num_nodes=1)
+            failover_task.result()
+            self.sleep(10)
+
+            # Run FTS query to fetch count of mutated items post FTS node failover.
+            hits3_simple_index, _, _, _ = test_index.execute_query(query)
+            hits3_multi_index, _, _, _ = test_index_multi.execute_query(query)
+
+            self.log.info(
+                "Hits after rollback and failover of primary FTS node for simple index: %s" % hits3_simple_index)
+            self.log.info(
+                "Hits after rollback and failover of primary FTS node for multi index: %s" % hits3_multi_index)
+            self.assertEqual(hits2_simple_index, hits3_simple_index,
+                                "Mutated items after FTS node failover are not equal to that after rollback for simple index")
+            self.assertEqual(hits2_multi_index, hits3_multi_index,
+                                "Mutated items after FTS node failover are not equal to that after rollback for multi index")
+
+    def test_flush_bucket_oso(self):
+        rest = RestConnection(self._cb_cluster.get_random_fts_node())
+        rest.set_node_setting("useOSOBackfill", True)
+
+        bucket = self._cb_cluster.get_bucket_by_name('default')
+        num_scopes = TestInputSingleton.input.param("num_scopes", 5)
+        collections_per_scope = TestInputSingleton.input.param("collections_per_scope", 20)
+        docs_per_collection = TestInputSingleton.input.param("docs_per_collection", 10000)
+        self._create_oso_containers(bucket=bucket, num_scopes=num_scopes, collections_per_scope=collections_per_scope, docs_per_collection=docs_per_collection)
+
+        test_scope = "scope_"+str(num_scopes)
+        test_collection = "test_collection"
+        self._cb_cluster._create_collection(bucket="default", scope=test_scope, collection=test_collection, cli_client=self.cli_client)
+        self._fill_collection(bucket=bucket, scope=test_scope, collection=test_collection, num_docs=1000)
+
+        test_index = self.create_index(self._cb_cluster.get_bucket_by_name('default'),
+                                       "test_index", collection_index=True, _type=f"{test_scope}.{test_collection}",
+                                       scope=test_scope, collections=[test_collection])
+        self.wait_for_indexing_complete_simple(item_count=1000, index=test_index)
+
+        multi_collections = []
+        for i in range(1, 4):
+            coll_name = test_collection + "_" + str(i)
+            self._cb_cluster._create_collection(bucket="default", scope=test_scope, collection=coll_name, cli_client=self.cli_client)
+            self._fill_collection(bucket=bucket, scope=test_scope, collection=coll_name, num_docs=1000, start_seq_num=1000*i+1)
+            multi_collections.append(coll_name)
+        _type_multi = []
+        index_collections = []
+        for c in multi_collections:
+            _type_multi.append(f"{test_scope}.{c}")
+            index_collections.append(c)
+        test_index_multi = self.create_index(self._cb_cluster.get_bucket_by_name('default'),
+                                       "test_index_multi", collection_index=True, _type=_type_multi,
+                                        scope=test_scope, collections=index_collections)
+        self.wait_for_indexing_complete_simple(item_count=3000, index=test_index_multi)
+
+        additional_collections_per_scope = TestInputSingleton.input.param("additional_collections_per_scope", 2)
+
+        for i in range(1, num_scopes+1):
+            scope_name = "scope_" + str(i)
+            for j in (collections_per_scope+2, additional_collections_per_scope+1):
+                collection_name = "collection_" + str(j)
+                self._cb_cluster._create_collection(bucket="default", scope=scope_name, collection=collection_name, cli_client=self.cli_client)
+                self._fill_collection(bucket=bucket, scope=scope_name, collection=collection_name)
+
+        for i in range(1, num_scopes+1):
+            scope_name = "scope_" + str(i)
+            for j in (1, additional_collections_per_scope+1):
+                collection_name = "collection_" + str(j)
+                self._update_collection(bucket=bucket, scope=scope_name, collection=collection_name)
+
+        self._update_collection(bucket=bucket, scope=test_scope, collection=test_collection, num_docs=1000)
+        for i in range(1, 4):
+            self._update_collection(bucket=bucket, scope=test_scope, collection=test_collection+"_"+str(i), num_docs=1000, start=1000*i+1)
+
+        self.wait_for_indexing_complete_simple(item_count=1000, index=test_index)
+        self.wait_for_indexing_complete_simple(item_count=3000, index=test_index_multi)
+
+        self._cb_cluster.flush_buckets([bucket])
+        self.sleep(60, "Waiting for flush to be happened.")
+
+
+        simple_index_doc_count = test_index.get_indexed_doc_count()
+        multi_index_doc_count = test_index_multi.get_indexed_doc_count()
+        bucket_doc_count = test_index.get_src_bucket_doc_count()
+
+        errors = []
+        try:
+            self.assertEquals(simple_index_doc_count, 0)
+        except AssertionError as e:
+            errors.append("Simple index contains documents after source bucket flush")
+        try:
+            self.assertEquals(multi_index_doc_count, 0)
+        except AssertionError as e:
+            errors.append("Multi index contains documents after source bucket flush")
+        try:
+            self.assertEquals(bucket_doc_count, 0)
+        except AssertionError as e:
+            errors.append("Source bucket contains documents after source bucket flush")
+
+        try:
+            self.assertEqual(len(errors), 0)
+        except AssertionError as ex:
+            for err in errors:
+                self.log.error(err)
+            self.fail()
+

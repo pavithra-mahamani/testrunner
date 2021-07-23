@@ -9,9 +9,10 @@ from testconstants import STANDARD_BUCKET_PORT
 from testconstants import LINUX_COUCHBASE_BIN_PATH
 from testconstants import LINUX_COUCHBASE_SAMPLE_PATH
 from testconstants import WIN_COUCHBASE_BIN_PATH
-from testconstants import WIN_COUCHBASE_SAMPLE_PATH
+from testconstants import WIN_COUCHBASE_SAMPLE_PATH_C
 from testconstants import COUCHBASE_FROM_WATSON, COUCHBASE_FROM_4DOT6,\
-                          COUCHBASE_FROM_SPOCK, COUCHBASE_FROM_VULCAN
+                          COUCHBASE_FROM_SPOCK, COUCHBASE_FROM_VULCAN,\
+                          COUCHBASE_FROM_CHESHIRE_CAT
 from scripts.install import InstallerJob
 
 class CreateBucketTests(BaseTestCase):
@@ -29,7 +30,10 @@ class CreateBucketTests(BaseTestCase):
         self.node_version = self.rest.get_nodes_version()
         self.total_items_travel_sample = 31569
         if self.node_version[:5] in COUCHBASE_FROM_WATSON:
-            self.total_items_travel_sample = 31591
+            if self.node_version[:5] in COUCHBASE_FROM_CHESHIRE_CAT:
+                self.total_items_travel_sample = 63288
+            else:
+                self.total_items_travel_sample = 63182
         shell = RemoteMachineShellConnection(self.master)
         type = shell.extract_remote_info().distribution_type
         shell.disconnect()
@@ -41,7 +45,7 @@ class CreateBucketTests(BaseTestCase):
             self.bin_path = "/home/%s%s" % (self.master.ssh_username,
                                             LINUX_COUCHBASE_BIN_PATH)
         if type.lower() == 'windows':
-            self.sample_path = WIN_COUCHBASE_SAMPLE_PATH
+            self.sample_path = WIN_COUCHBASE_SAMPLE_PATH_C
             self.bin_path = WIN_COUCHBASE_BIN_PATH
         elif type.lower() == "mac":
             self.sample_path = MAC_COUCHBASE_SAMPLE_PATH
@@ -54,7 +58,7 @@ class CreateBucketTests(BaseTestCase):
     def test_banned_bucket_name(self, password='password'):
         try:
             if self.bucket_type == 'sasl':
-                self.rest.create_bucket(self.bucket_name, authType='sasl', saslPassword=password, ramQuotaMB=200)
+                self.rest.create_bucket(self.bucket_name, ramQuotaMB=200)
             elif self.bucket_type == 'standard':
                 self.rest.create_bucket(self.bucket_name, ramQuotaMB=200, proxyPort=STANDARD_BUCKET_PORT + 1)
             elif self.bucket_type == 'memcached':
@@ -90,19 +94,19 @@ class CreateBucketTests(BaseTestCase):
                                                               replicas=self.num_replicas)
             if self.bucket_type == 'sasl':
                 self.cluster.create_sasl_bucket(name=self.bucket_name, password=password, bucket_params=shared_params)
-                self.buckets.append(Bucket(name=self.bucket_name, authType="sasl", saslPassword=password, num_replicas=self.num_replicas,
+                self.buckets.append(Bucket(name=self.bucket_name, num_replicas=self.num_replicas,
                                            bucket_size=self.bucket_size, master_id=self.server))
             elif self.bucket_type == 'standard':
                 self.cluster.create_standard_bucket(name=self.bucket_name, port=STANDARD_BUCKET_PORT+1,
                                                     bucket_params=shared_params)
-                self.buckets.append(Bucket(name=self.bucket_name, authType=None, saslPassword=None, num_replicas=self.num_replicas,
+                self.buckets.append(Bucket(name=self.bucket_name, num_replicas=self.num_replicas,
                                            bucket_size=self.bucket_size, port=STANDARD_BUCKET_PORT + 1, master_id=self.server))
             elif self.bucket_type == "memcached":
                 tasks.append(self.cluster.async_create_memcached_bucket(name=self.bucket_name,
                                                                         port=STANDARD_BUCKET_PORT+1,
                                                                         bucket_params=shared_params))
 
-                self.buckets.append(Bucket(name=self.bucket_name, authType=None, saslPassword=None,
+                self.buckets.append(Bucket(name=self.bucket_name,
                                            num_replicas=self.num_replicas, bucket_size=self.bucket_size,
                                            port=STANDARD_BUCKET_PORT + 1, master_id=self.server, type='memcached'))
                 for task in tasks:
@@ -144,9 +148,9 @@ class CreateBucketTests(BaseTestCase):
 
         try:
             status = self.rest.init_node_services(hostname=self.master.ip,
-                                        services= ["index,kv,n1ql"])
+                                        services= ["index,kv,n1ql,fts"])
             init_node = self.cluster.async_init_node(self.master,
-                                            services = ["index,kv,n1ql"])
+                                            services = ["index,kv,n1ql,fts"])
         except Exception as e:
             if e:
                 print(e)
@@ -183,7 +187,7 @@ class CreateBucketTests(BaseTestCase):
         index_count = 8
         if self.cb_version[:5] in COUCHBASE_FROM_4DOT6:
             index_count = 10
-        result = self.rest.index_tool_stats()
+        result = self.rest.index_tool_stats(False)
 
         self.log.info("check if all %s indexes built." % index_count)
         end_time_i = time.time() + 60
@@ -195,12 +199,12 @@ class CreateBucketTests(BaseTestCase):
                             if x["progress"] < 100:
                                 self.sleep(7, "waiting for indexing {0} complete"
                                            .format(x["index"]))
-                                result = self.rest.index_tool_stats()
+                                result = self.rest.index_tool_stats(False)
                             elif x["progress"] == 100:
                                 if x["index"] not in index_name:
                                     index_name.append(x["index"])
                                     self.sleep(7, "waiting for other indexing complete")
-                                    result = self.rest.index_tool_stats()
+                                    result = self.rest.index_tool_stats(False)
                 else:
                     self.sleep(7, "waiting for indexing start")
                     result = self.rest.index_tool_stats()
@@ -225,14 +229,17 @@ class CreateBucketTests(BaseTestCase):
         if self.node_version[:5] in COUCHBASE_FROM_WATSON:
             set_index_storage_type = " --index-storage-setting=memopt "
         options = ' --cluster-port=8091 \
-                    --cluster-ramsize=300 \
+                    --cluster-ramsize=1000 \
                     --cluster-index-ramsize=300 \
-                    --services=data,index,query %s ' % set_index_storage_type
+                    --services=data,index,query,fts %s ' % set_index_storage_type
         o, e = shell.execute_couchbase_cli(cli_command="cluster-init", options=options)
         if self.node_version[:5] in COUCHBASE_FROM_SPOCK:
-            self.assertEqual(o[0], 'SUCCESS: Cluster initialized')
+            self.assertTrue(self._check_output("SUCCESS: Cluster initialized", o),
+                                               "Failed to initialize cluster")
         else:
-            self.assertEqual(o[0], "SUCCESS: init/edit localhost")
+            self.assertTrue(self._check_output("SUCCESS: init/edit localhost", o),
+                                               "Failed to init/edit localhost")
+        self.sleep(7, "wait for services up completely")
 
         self.log.info("Add new user after reset node! ")
         self.add_built_in_server_user(node=self.master)
@@ -245,7 +252,7 @@ class CreateBucketTests(BaseTestCase):
             bucket_quota_flag = "-m"
             data_set_location_flag = "-d"
         shell.execute_command("{0}cbdocloader -u Administrator -p password \
-                      {3} {1}:{6} -b travel-sample {4} 100 {5} {2}travel-sample.zip" \
+                      {3} {1}:{6} -b travel-sample {4} 200 {5} {2}travel-sample.zip" \
                                                       .format(self.bin_path,
                                                        self.master.ip,
                                                        self.sample_path,
@@ -277,11 +284,11 @@ class CreateBucketTests(BaseTestCase):
         index_count = 8
         if self.cb_version[:5] in COUCHBASE_FROM_4DOT6:
             index_count = 10
-        result = self.rest.index_tool_stats()
+        result = self.rest.index_tool_stats(False)
         """ check all indexes are completed """
 
         self.log.info("check if all %s indexes built." % index_count)
-        end_time_i = time.time() + 60
+        end_time_i = time.time() + 180
         while time.time() < end_time_i and len(index_name) < index_count:
             if result["indexes"]:
                 for x in result["indexes"]:
@@ -290,10 +297,10 @@ class CreateBucketTests(BaseTestCase):
                            x["index"] not in index_name:
                                 index_name.append(x["index"])
                 self.sleep(7, "waiting for indexing complete")
-                result = self.rest.index_tool_stats()
+                result = self.rest.index_tool_stats(False)
             else:
                 self.sleep(2, "waiting for indexing start")
-                result = self.rest.index_tool_stats()
+                result = self.rest.index_tool_stats(False)
         if time.time() >= end_time_i and len(index_name) < index_count:
             self.log.info("index list {0}".format(index_name))
             self.fail("some indexing may not complete")
@@ -310,13 +317,14 @@ class CreateBucketTests(BaseTestCase):
         if self.node_version[:5] in COUCHBASE_FROM_VULCAN:
             self.rest.force_eject_node()
             shell = RemoteMachineShellConnection(self.master)
-            set_index_storage_type = ""
             set_index_storage_type = " --index-storage-setting=memopt "
             options = ' --cluster-port=8091 \
                         --cluster-ramsize=300 \
                         --cluster-index-ramsize=300 \
-                        --services=data,index,query %s ' % set_index_storage_type
-            o, e = shell.execute_couchbase_cli(cli_command="cluster-init", options=options)
+                        --services=data,index,query %s ' \
+                      % set_index_storage_type
+            o, e = shell.execute_couchbase_cli(cli_command="cluster-init",
+                                               options=options)
             self.assertEqual(o[0], 'SUCCESS: Cluster initialized')
 
             self.log.info("Add new user after reset node! ")
@@ -324,24 +332,25 @@ class CreateBucketTests(BaseTestCase):
             shell = RemoteMachineShellConnection(self.master)
             bucket_type = self.input.param("bucket_type", "couchbase")
             options = ' --bucket=default \
-                            --bucket-type={0} \
-                            --bucket-ramsize=200 \
-                            --max-ttl=400 \
-                            --wait '.format(bucket_type)
-            o, e = shell.execute_couchbase_cli(cli_command="bucket-create", options=options)
+                        --bucket-type={0} \
+                        --bucket-ramsize=200 \
+                        --max-ttl=400 \
+                        --wait '.format(bucket_type)
+            o, e = shell.execute_couchbase_cli(cli_command="bucket-create",
+                                               options=options)
             self.assertEqual(o[0], 'SUCCESS: Bucket created')
+
+            self.sleep(30, "Sleep before loading doc using cbdocloader")
 
             cluster_flag = "-c"
             bucket_quota_flag = "-m"
             data_set_location_flag = "-d"
-            shell.execute_command("{0}cbdocloader -u Administrator -p password \
-                          {3} {1} -b default {4} 100 {5} {2}travel-sample.zip" \
-                                                          .format(self.bin_path,
-                                                           self.master.ip,
-                                                           self.sample_path,
-                                                           cluster_flag,
-                                                           bucket_quota_flag,
-                                                           data_set_location_flag))
+            shell.execute_command(
+                "{0}cbdocloader -u Administrator -p password "
+                "{3} {1} -b default {4} 100 {5} {2}travel-sample.zip"
+                .format(self.bin_path, self.master.ip, self.sample_path,
+                        cluster_flag, bucket_quota_flag,
+                        data_set_location_flag))
             shell.disconnect()
 
             buckets = RestConnection(self.master).get_buckets()
@@ -351,19 +360,21 @@ class CreateBucketTests(BaseTestCase):
 
             """ check for load data into travel-sample bucket """
             end_time = time.time() + 120
+            num_actual = 0
             while time.time() < end_time:
                 self.sleep(10)
                 num_actual = self.get_item_count(self.master, "default")
                 if int(num_actual) == self.total_items_travel_sample:
                     break
-                self.assertTrue(int(num_actual) == self.total_items_travel_sample,
-                                "Items number expected %s, actual %s" % (
-                                        self.total_items_travel_sample, num_actual))
+            self.assertTrue(int(num_actual) == self.total_items_travel_sample,
+                            "Items number expected %s, actual %s"
+                            % (self.total_items_travel_sample, num_actual))
             self.log.info("Total items %s " % num_actual)
-            self.sleep(400, "waiting for docs to expire per maxttl rule")
+            self.sleep(400, "Waiting for docs to expire as per maxttl")
             self.expire_pager([self.master])
+            self.sleep(20, "Wait for expiry_purger to run")
             num_actual = self.get_item_count(self.master, "default")
-            if int(num_actual) == 0:
+            if int(num_actual) != 0:
                 self.fail("Item count is not 0 after maxttl has elapsed")
             else:
                 self.log.info("SUCCESS: Item count is 0 after maxttl has elapsed")
@@ -379,7 +390,7 @@ class CreateBucketTests(BaseTestCase):
                                                    eviction_policy=eviction_policy)
         # just do sasl for now, pending decision on support of non-sasl buckets in 5.0
         self.cluster.create_sasl_bucket(name=self.bucket_name, password=self.sasl_password, bucket_params=shared_params)
-        self.buckets.append(Bucket(name=self.bucket_name, authType="sasl", saslPassword=self.sasl_password,
+        self.buckets.append(Bucket(name=self.bucket_name,
                                            num_replicas=self.num_replicas,
                                            bucket_size=self.bucket_size, master_id=self.server))
 
@@ -417,3 +428,23 @@ class CreateBucketTests(BaseTestCase):
                     self.input.test_params["stop-on-failure"] = True
                     self.log.error("Couchbase wasn't recovered. All downstream tests will be skipped")
                     self.fail("some nodes were not install successfully!")
+
+    def _check_output(self, word_check, output):
+        found = False
+        if len(output) >= 1:
+            if isinstance(word_check, list):
+                for ele in word_check:
+                    for x in output:
+                        if ele.lower() in str(x.lower()):
+                            self.log.info("Found '{0} in CLI output".format(ele))
+                            found = True
+                            break
+            elif isinstance(word_check, str):
+                for x in output:
+                    if word_check.lower() in str(x.lower()):
+                        self.log.info("Found '{0}' in CLI output".format(word_check))
+                        found = True
+                        break
+            else:
+                self.log.error("invalid {0}".format(word_check))
+        return found

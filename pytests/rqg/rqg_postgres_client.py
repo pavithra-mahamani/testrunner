@@ -124,7 +124,7 @@ class RQGPostgresClient(PostgresClient):
 
         return columns, rows
 
-    def _gen_json_from_results(self, columns, rows):
+    def _gen_json_from_results(self, columns, rows, round_level=0):
         data = []
         # Convert to JSON and capture in a dictionary
         for row in rows:
@@ -133,27 +133,38 @@ class RQGPostgresClient(PostgresClient):
             for column in columns:
                 value = row[index]
                 if isinstance(column, dict):
-                    map[column["column_name"]] = self._convert_to_mysql_json_compatible_val(value, column["type"])
+                    map[column["column_name"]] = self._convert_to_mysql_json_compatible_val(value, column["type"], round_level=round_level)
                 else:
                     map[column] = value
                 index += 1
             data.append(map)
         return data
 
-    def _convert_to_mysql_json_compatible_val(self, value, type):
+    def _convert_to_mysql_json_compatible_val(self, value, type, round_level=0):
         if "16" == str(type): # boolean
             return value
-        if "1700" == str(type): # numeric
+        if str(type) in ["1700", "701", "23", "20"]: # numeric
             if value is None:
                 return None
             else:
                 if "." in str(value):
-                    return float(str(value))
+                    right_part = str(value).split(".")[1]
+                    while len(right_part) > 1:
+                        if right_part[len(right_part)-1:] == "0":
+                            right_part = right_part[:len(right_part)-1]
+                        else:
+                            break
+                    if right_part == "0":
+                        return int(str(str(value).split(".")[0]))
+                    if round_level > 0:
+                        return round(float(str(str(value).split(".")[0]+"."+right_part)), round_level)
+                    else:
+                        return float(str(str(value).split(".")[0] + "." + right_part))
                 else:
                     try:
                         return int(str(value))
                     except ValueError as e:
-                        print(("####### INVALID NUMBER ::"+str(value)+":: "))
+                        print(("####### INVALID NUMBER ::" + str(value) + ":: "))
         if "1114" == str(type): # datetime
             return str(value)
 

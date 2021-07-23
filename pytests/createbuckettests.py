@@ -24,6 +24,7 @@ class CreateMembaseBucketsTests(unittest.TestCase):
         self.servers = self.input.servers
         BucketOperationHelper.delete_all_buckets_or_assert(servers=self.servers, test_case=self)
         self.master = self.servers[0]
+        self.bucket_storage = self.input.param("bucket_storage", 'couchstore')
         self._log_start()
 
     def tearDown(self):
@@ -63,8 +64,6 @@ class CreateMembaseBucketsTests(unittest.TestCase):
             proxyPort = rest.get_nodes_self().moxi
             rest.create_bucket(bucket=name,
                                ramQuotaMB=200,
-                               authType='sasl',
-                               saslPassword='test_non_default',
                                proxyPort=proxyPort)
             msg = 'create_bucket succeeded but bucket {0} does not exist'.format(name)
             self.assertTrue(BucketOperationHelper.wait_for_bucket_creation(name, rest), msg=msg)
@@ -74,9 +73,7 @@ class CreateMembaseBucketsTests(unittest.TestCase):
             try:
                 rest.create_bucket(bucket=name,
                                    ramQuotaMB=200,
-                                   proxyPort=11221,
-                                   authType='sasl',
-                                   saslPassword='test_non_default')
+                                   proxyPort=11221)
                 msg = "create_bucket created two buckets in different case : {0},{1}".format('default', 'Default')
                 self.fail(msg)
             except BucketCreationException as ex:
@@ -91,9 +88,7 @@ class CreateMembaseBucketsTests(unittest.TestCase):
             proxyPort = rest.get_nodes_self().moxi + 1000
             rest.create_bucket(bucket=name,
                                ramQuotaMB=200,
-                               proxyPort=proxyPort,
-                               authType='sasl',
-                               saslPassword='test_non_default')
+                               proxyPort=proxyPort)
             msg = 'create_bucket succeeded but bucket {0} does not exist'.format(name)
             self.assertTrue(BucketOperationHelper.wait_for_bucket_creation(name, rest), msg=msg)
 
@@ -164,7 +159,7 @@ class CreateMembaseBucketsTests(unittest.TestCase):
         proxyPort = rest.get_nodes_self().moxi + 100
         shell = RemoteMachineShellConnection(master)
         url = "http://%s:8091/pools/default/buckets" % master.ip
-        params = "name=%s&ramQuotaMB=200&authType=none&replicaNumber=1&proxyPort=%s" \
+        params = "name=%s&ramQuotaMB=200&replicaNumber=1&proxyPort=%s" \
                                                                    % (name, proxyPort)
         cmd = "curl -X POST -u Administrator:password  -d '%s' %s" % (params, url)
         output, error = shell.execute_command(cmd)
@@ -175,7 +170,7 @@ class CreateMembaseBucketsTests(unittest.TestCase):
         self.assertTrue(BucketOperationHelper.wait_for_bucket_creation(name, rest), msg=msg)
 
         name = 'UPPERCASE{0}'.format(postfix)
-        params = "name=%s&ramQuotaMB=200&authType=none&replicaNumber=1&proxyPort=%s" \
+        params = "name=%s&ramQuotaMB=200&replicaNumber=1&proxyPort=%s" \
                                                                    % (name, proxyPort)
         cmd = "curl -X POST -u Administrator:password  -d '%s' %s" % (params, url)
         output, error = shell.execute_command(cmd)
@@ -190,7 +185,7 @@ class CreateMembaseBucketsTests(unittest.TestCase):
             rest = RestConnection(serverInfo)
             proxyPort = rest.get_nodes_self().moxi
             try:
-                rest.create_bucket(bucket=name, ramQuotaMB=99, authType='sasl', proxyPort=proxyPort)
+                rest.create_bucket(bucket=name, ramQuotaMB=99, proxyPort=proxyPort)
                 self.fail('create-bucket did not throw exception while creating a new bucket with 99 MB quota')
             #make sure it raises bucketcreateexception
             except BucketCreationException as ex:
@@ -198,7 +193,7 @@ class CreateMembaseBucketsTests(unittest.TestCase):
 
             try:
                 rest.create_bucket(bucket=name, ramQuotaMB=0,
-                                   authType='sasl', proxyPort=proxyPort)
+                                   proxyPort=proxyPort)
 
                 self.fail('create-bucket did not throw exception while creating a new bucket with 0 MB quota')
             #make sure it raises bucketcreateexception
@@ -216,7 +211,6 @@ class CreateMembaseBucketsTests(unittest.TestCase):
             try:
                 rest.create_bucket(bucket=name,
                                    ramQuotaMB=bucket_ram,
-                                   authType='sasl',
                                    proxyPort=proxyPort)
             except BucketCreationException as ex:
                 self.log.error(ex)
@@ -235,7 +229,6 @@ class CreateMembaseBucketsTests(unittest.TestCase):
                 rest.create_bucket(bucket=name,
                                    ramQuotaMB=200,
                                    replicaNumber=-1,
-                                   authType='sasl',
                                    proxyPort=proxyPort)
                 self.fail('bucket create succeded even with a negative replica count')
             except BucketCreationException as ex:
@@ -251,7 +244,7 @@ class CreateMembaseBucketsTests(unittest.TestCase):
                 rest.create_bucket(bucket=name,
                                    ramQuotaMB=200,
                                    replicaNumber=0,
-                                   authType='sasl', proxyPort=proxyPort)
+                                   proxyPort=proxyPort)
             except BucketCreationException as ex:
                 self.log.error(ex)
                 self.fail('failed to create bucket with 0 replicas')
@@ -266,7 +259,7 @@ class CreateMembaseBucketsTests(unittest.TestCase):
             rest = RestConnection(serverInfo)
             proxyPort = rest.get_nodes_self().moxi
             try:
-                rest.create_bucket(bucket=name, ramQuotaMB=200, authType='sasl', proxyPort=proxyPort)
+                rest.create_bucket(bucket=name, ramQuotaMB=200, proxyPort=proxyPort)
             except BucketCreationException as ex:
                 self.log.error(ex)
                 self.fail('failed to create bucket with 1 replicas')
@@ -282,7 +275,8 @@ class CreateMembaseBucketsTests(unittest.TestCase):
             proxyPort = rest.get_nodes_self().moxi
             try:
                 rest.create_bucket(bucket=name, ramQuotaMB=200, replicaNumber=2,
-                                   authType='sasl', proxyPort=proxyPort)
+                                   proxyPort=proxyPort,
+                                   storageBackend=self.bucket_storage)
             except BucketCreationException as ex:
                 self.log.error(ex)
                 self.fail('failed to create bucket with 2 replicas')
@@ -298,7 +292,8 @@ class CreateMembaseBucketsTests(unittest.TestCase):
             proxyPort = rest.get_nodes_self().moxi
             try:
                 rest.create_bucket(bucket=name, ramQuotaMB=200, replicaNumber=3,
-                                   authType='sasl', proxyPort=proxyPort)
+                                   proxyPort=proxyPort,
+                                   storageBackend=self.bucket_storage)
             except BucketCreationException as ex:
                 self.log.error(ex)
                 self.fail('failed to create bucket with 3 replicas')
@@ -314,7 +309,7 @@ class CreateMembaseBucketsTests(unittest.TestCase):
             proxyPort = rest.get_nodes_self().moxi
             try:
                 rest.create_bucket(bucket=name, ramQuotaMB=200, replicaNumber=4,
-                                   authType='sasl', proxyPort=proxyPort)
+                                   proxyPort=proxyPort)
                 self.fail('created bucket with 4 replicas')
             except BucketCreationException as ex:
                 self.log.info(ex)
@@ -327,7 +322,7 @@ class CreateMembaseBucketsTests(unittest.TestCase):
             proxyPort = rest.get_nodes_self().moxi
             try:
                 rest.create_bucket(bucket=name, ramQuotaMB=200,
-                                   authType='sasl', proxyPort=proxyPort)
+                                   proxyPort=proxyPort)
             except BucketCreationException as ex:
                 self.log.error(ex)
                 self.fail('could not create bucket with all valid characters')
@@ -346,7 +341,7 @@ class CreateMembaseBucketsTests(unittest.TestCase):
                 proxyPort = rest.get_nodes_self().moxi
                 try:
                     rest.create_bucket(bucket=name, ramQuotaMB=200, replicaNumber=2,
-                                       authType='sasl', proxyPort=proxyPort)
+                                       proxyPort=proxyPort)
                     self.fail('created a bucket with invalid characters')
                 except BucketCreationException as ex:
                     self.log.info(ex)
@@ -381,7 +376,7 @@ class CreateMembaseBucketsTests(unittest.TestCase):
             bucket_name = 'max_buckets-{0}'.format(uuid.uuid4())
             rest.create_bucket(bucket=bucket_name,
                                ramQuotaMB=bucket_ram,
-                               authType='sasl', proxyPort=proxyPort)
+                               proxyPort=proxyPort)
             ready = BucketOperationHelper.wait_for_memcached(serverInfo, bucket_name)
             log.info("kv RAM left in cluster: {0}".format(cluster_ram - 100))
             cluster_ram -= bucket_ram
@@ -395,7 +390,7 @@ class CreateMembaseBucketsTests(unittest.TestCase):
         try:
             rest.create_bucket(bucket=bucket_name,
                                ramQuotaMB=bucket_ram,
-                               authType='sasl', proxyPort=proxyPort)
+                               proxyPort=proxyPort)
             msg = 'bucket creation did not fail even though system was overcommited'
             self.fail(msg)
         except BucketCreationException as ex:
@@ -417,7 +412,8 @@ class CreateMembaseBucketsTests(unittest.TestCase):
         proxyPort = rest.get_nodes_self().moxi
         try:
             rest.create_bucket(bucket=name, ramQuotaMB=200,
-                                authType='sasl', proxyPort=proxyPort)
+                               proxyPort=proxyPort,
+                               storageBackend=self.bucket_storage)
             if name_len <= max_len:
                 msg = 'failed to start up bucket with valid length'
                 self.assertTrue(BucketOperationHelper.wait_for_bucket_creation(name, rest), msg=msg)

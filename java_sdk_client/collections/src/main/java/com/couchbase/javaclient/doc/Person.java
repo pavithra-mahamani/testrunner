@@ -1,61 +1,35 @@
 package com.couchbase.javaclient.doc;
 
-import com.github.javafaker.Faker;
+import java.util.List;
+import java.util.Random;
+
 import com.couchbase.client.java.json.JsonObject;
+import com.github.javafaker.Faker;
 
-public class Person {
-	String firstName;
-	String lastName;
-	String streetAddress;
-	JsonObject jsonObject;
+public class Person implements DocTemplate{
+	JsonObject jsonObject = JsonObject.create();
+	Random random = new Random();
 
-	public Person() {
-		Faker faker = new Faker();
-		setFirstName(faker.name().firstName());
-		setLastName(faker.name().lastName());
-		setStreetAddress(faker.address().streetAddress());
-		setJsonObject(JsonObject.create());
-	}
-
-	public String getFirstName() {
-		return firstName;
-	}
-
-	public void setFirstName(String firstName) {
-		this.firstName = firstName;
-	}
-
-	public String getLastName() {
-		return lastName;
-	}
-
-	public void setLastName(String lastName) {
-		this.lastName = lastName;
-	}
-
-	public String getStreetAddress() {
-		return streetAddress;
-	}
-
-	public void setStreetAddress(String streetAddress) {
-		this.streetAddress = streetAddress;
-
-	}
-
-	@Override
-	public String toString() {
-		return "{" + "\"firstName\":" + firstName + "," + "\"lastName\":" + lastName + "," + "\"streetAddress\":"
-				+ streetAddress + "}";
-	}
-
-	public JsonObject getJsonObject() {
+	public JsonObject createJsonObject(Faker faker, int docsize, int id) {
+		jsonObject.put("firstName", faker.name().firstName());
+		jsonObject.put("lastName", faker.name().lastName());
+		jsonObject.put("title", faker.name().title());
+		jsonObject.put("suffix", faker.name().suffix());
+		jsonObject.put("streetAddress", faker.address().streetAddress());
+		jsonObject.put("city", faker.address().city());
+		jsonObject.put("country", faker.address().country());
+		jsonObject.put("age", random.nextInt(70));
+		int count = 0;
+		do {
+			count = count + 1;
+			jsonObject.put("filler" + count, faker.lorem().words(docsize / 10));
+		} while (jsonObject.toString().length() < docsize);
 		return jsonObject;
 	}
 
-	public void setJsonObject(JsonObject jsonObject) {
-		this.jsonObject = jsonObject;
-		this.jsonObject.put("firstName", firstName);
-		this.jsonObject.put("lastName", lastName);
-		this.jsonObject.put("streetAddress", streetAddress);
+	@Override
+	public JsonObject updateJsonObject(Faker faker, JsonObject obj, List<String> fieldsToUpdate) {
+		return obj;
 	}
+
 }

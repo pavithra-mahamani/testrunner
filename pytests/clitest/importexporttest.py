@@ -3,7 +3,7 @@ import json, filecmp, itertools
 import os, shutil, ast
 from threading import Thread
 
-from membase.api.rest_client import RestConnection
+from membase.api.rest_client import RestConnection, RestHelper
 from memcached.helper.data_helper import MemcachedClientHelper
 from TestInput import TestInputSingleton
 from clitest.cli_base import CliBaseTest
@@ -780,6 +780,133 @@ class ImportExportTests(CliBaseTest):
         options = {"load_doc": False, "docs": "1000"}
         return self._common_imex_test("import", options)
 
+    def test_export_with_collection(self):
+        """
+        1. Creates specified bucket on the cluster and loads it with given number of items
+        2. Export data and validates it
+        """
+        if self.custom_scopes:
+            self.create_scope()
+        if self.custom_collections:
+            self.create_collection(self.col_per_scope)
+        scopes = self.get_bucket_scope()
+        scopes_id = {}
+        for scope in scopes:
+            if scope == "_default" and self.custom_scopes:
+                scopes.remove(scope)
+                continue
+            scopes_id[scope] = (self.get_scopes_id(scope))
+        """ get collection stats """
+        collections, error = self.get_collection_names()
+        url_format = ""
+        secure_port = ""
+        secure_conn = ""
+        if self.secure_conn:
+            # bin_path, cert_path, user, password, server_cert
+            cacert = self.shell.get_cluster_certificate_info(self.cli_command_path,
+                                                             self.tmp_path_raw,
+                                                             "Administrator",
+                                                             "password",
+                                                             self.master)
+            secure_port = "1"
+            url_format = "s"
+            if not self.no_cacert:
+                secure_conn = "--cacert %s" % cacert
+            if self.no_ssl_verify:
+                secure_conn = "--no-ssl-verify"
+        col_cmd = " -j "
+        self.load_scope_name = None
+        if scopes[0][:4] == "\x1b[6n":
+            scopes[0] = scopes[0][4:]
+        if self.load_to_collection:
+            self.load_scope_name = scopes[0]
+            for collection in collections:
+                if self.load_scope_name in collection:
+                    self.load_collection_name = collection
+                    self.collection_id = self.get_collections_id(self.load_scope_name, collection)
+            col_cmd += " -c {0}".format(self.collection_id)
+        self.sleep(10)
+        self.load_all_buckets(self.master, ratio=0.1,
+                                             command_options=col_cmd)
+        shell = RemoteMachineShellConnection(self.master)
+        if self.relative_path:
+            tilde = "~/"
+            if self.os == "windows":
+                tilde = ""
+            export_file = "{0}export{1}/".format(tilde, self.master.ip) + "default"
+            shell.execute_command("rm -rf {0}export{1}".format(tilde, self.master.ip))
+            shell.execute_command("mkdir {0}export{1}".format(tilde, self.master.ip))
+        else:
+            shell.execute_command("rm -rf {0}export{1}".format(self.tmp_path, self.master.ip))
+            shell.execute_command("mkdir {0}export{1}".format(self.tmp_path, self.master.ip))
+            if self.os == "windows":
+                export_file = "c:/tmp/export{0}/".format(self.master.ip) + "default"
+            else:
+                export_file = self.tmp_path + "export{0}/".format(self.master.ip) + "default"
+
+        master_ip = self.master.ip
+        if self.enable_ipv6:
+            raw_master_ip = shell.get_ip_address()
+            nodes = RestConnection(self.master).node_statuses()
+            for node in nodes:
+                if node.ip in raw_master_ip:
+                    master_ip = node.ip
+                    break
+        ex_cmd_str = "%scbexport%s %s -c http%s://%s:%s8091 -u Administrator -p password " \
+                                  " -b %s -f %s %s -o %s -t 4"\
+                                  % (self.cli_command_path, self.cmd_ext,
+                                     self.imex_type, url_format, master_ip, secure_port,
+                                     "default", self.format_type, secure_conn, export_file)
+        export_file = self.tmp_path + "export{0}/".format(self.master.ip) + "default"
+        if self.custom_scopes:
+            ex_cmd_str += " --scope-field {0}".format(scopes[0])
+        if self.custom_collections:
+            ex_cmd_str += " --collection-field {0}".format(collections[0])
+        output, error = shell.execute_command(ex_cmd_str)
+        if not self._check_output("successfully", output):
+            if self.should_fail:
+                self.log.info("Test failed as expected")
+                return
+            elif self.no_cacert:
+                self.log.info("Test failed as expected")
+                return
+            else:
+                self.fail("Failed to export data.")
+
+        if self.custom_scopes:
+            scope_o, _ = shell.execute_command("cat {0} | grep {1}".format(export_file, "scope"))
+            if self.custom_collections and not self._check_output("scope", scope_o):
+                raise Exception("Failed to export scope")
+            else:
+                self.log.info("Found scope in export file")
+        if self.custom_collections:
+            if self.load_to_collection:
+                output, error = shell.execute_command("cat {0} | grep {1}".format(export_file,
+                                                                          self.load_scope_name))
+                if not self._check_output(self.load_scope_name, output):
+                    self.fail("Failed to export collection data")
+            else:
+                col_o, _ = shell.execute_command("cat {0} | grep {1}".format(export_file, "mycollection"))
+                if not self._check_output("collection", col_o):
+                    raise Exception("Failed to export collection")
+                else:
+                    self.log.info("Found collection in export file")
+
+    def test_import_with_collection(self):
+        """
+        1. Creates specified bucket on the cluster
+        2. Import data and validates it
+        """
+        if self.custom_scopes:
+            self.create_scope()
+        if self.custom_collections:
+            self.create_collection(self.col_per_scope)
+        self.import_file = self.input.param("import_file", None)
+        options = {"load_doc": False, "docs": "1000"}
+        self._common_imex_test("import", options)
+        scopes = self.get_bucket_scope()
+
+
     def _common_imex_test(self, cmd, options):
         username = self.input.param("username", None)
         password = self.input.param("password", None)
@@ -849,12 +976,13 @@ class ImportExportTests(CliBaseTest):
                                           % self.active_resident_threshold)
                             self.shell.execute_command("{0}{1}{2} bucket-edit -c {3}:8091 "\
                                                        " -u Administrator -p password "\
-                                                       "--bucket {4} --bucket-ramsize 100"\
+                                                       "--bucket {4} --bucket-ramsize 180"\
                                                        .format(self.cli_command_path,
                                                         "couchbase-cli", self.cmd_ext,
                                                         server.ip, bucket.name))
-                            self._load_all_buckets(self.master, kv_gen, "create", 0)
+                            self._load_all_buckets(self.master, kv_gen, "create", 0, batch_size=110)
                         self.log.info("load sample data to bucket")
+                        self.sleep(15)
                         self.shell.execute_command(load_cmd)
             """ remove previous export directory at tmp dir and re-create it
                 in linux:   /tmp/export
@@ -896,13 +1024,10 @@ class ImportExportTests(CliBaseTest):
                             res_status = stats_all_buckets[bucket.name].get_stats([self.master],
                                          bucket, '',
                                          'vb_active_perc_mem_resident')[self.master]
-                        if int(res_status) <= self.active_resident_threshold:
-                            self.log.info("Clear terminal")
-                            self.shell.execute_command('printf "\033c"')
                     output = ""
                     try:
                         output, error = self.shell.execute_command_raw(exe_cmd_str,
-                                                                        timeout=60)
+                                                                        timeout=90)
                     except Exception as e:
                         if not output:
                             self.fail("MB-31432 is fixed.  This must be other issue {0}"
@@ -932,7 +1057,13 @@ class ImportExportTests(CliBaseTest):
                 imp_rest = RestConnection(import_servers[2])
                 import_shell = RemoteMachineShellConnection(import_servers[2])
                 imp_rest.force_eject_node()
-                self.sleep(2)
+                ready = RestHelper(RestConnection(import_servers[2])).is_ns_server_running()
+                if ready:
+                    shell = RemoteMachineShellConnection(import_servers[2])
+                    shell.enable_diag_eval_on_non_local_hosts()
+                    shell.disconnect()
+                else:
+                    self.fail("NS server is not ready after reset node")
 
                 imp_rest = RestConnection(import_servers[2])
                 status = False
@@ -1058,6 +1189,8 @@ class ImportExportTests(CliBaseTest):
                                           limit_lines, skip_lines,
                                           omit_empty, infer_types,
                                           secure_conn, json_invalid_errors_file)
+                    if self.custom_scopes and self.custom_collections:
+                        imp_cmd_str += " --scope-collection-exp scope1.mycollection_scope1_0 "
                     print(("\ncommand format: ", imp_cmd_str))
                     if self.dgm_run and self.active_resident_threshold:
                         """ disable auto compaction so that bucket could
@@ -1068,11 +1201,11 @@ class ImportExportTests(CliBaseTest):
                                           % self.active_resident_threshold)
                         self.shell.execute_command("{0}{1}{2} bucket-edit -c {3}:8091 "\
                                                        " -u Administrator -p password "\
-                                                       "--bucket {4} --bucket-ramsize 100"\
+                                                       "--bucket {4} --bucket-ramsize 180"\
                                                        .format(self.cli_command_path,
                                                         "couchbase-cli", self.cmd_ext,
                                                         server.ip, bucket.name))
-                        self._load_all_buckets(self.master, kv_gen, "create", 0)
+                        self._load_all_buckets(self.master, kv_gen, "create", 0, batch_size=110)
                     self.cluster_helper.wait_for_stats([self.master], bucket.name, "",
                                                              "ep_queue_size", "==", 0)
                     if self.check_preload_keys:
@@ -1126,8 +1259,6 @@ class ImportExportTests(CliBaseTest):
 
     def _verify_import_data(self, options):
         self.buckets = RestConnection(self.master).get_buckets()
-        for bucket in self.buckets:
-            keys = RestConnection(self.master).get_active_key_count(bucket.name)
         skip_lines = 0
         if self.import_file and self.import_file.startswith("csv"):
             skip_lines = 1
@@ -1147,12 +1278,19 @@ class ImportExportTests(CliBaseTest):
         if self.limit_rows:
             data_import = int(self.limit_rows)
             limit_lines = int(self.limit_rows)
+        for bucket in self.buckets:
+            if int(self.active_resident_threshold) < 60:
+                self.sleep(15, "wait for all keys loaded to bucket")
+            keys = RestConnection(self.master).get_active_key_count(bucket.name)
+            if int(keys) < data_import:
+                self.sleep(10)
+                keys = RestConnection(self.master).get_active_key_count(bucket.name)
         if self.dgm_run:
             keys = int(keys) - int(self.pre_imex_ops_keys)
 
         if not self.json_invalid_errors:
-            print(("Total docs in bucket: ", keys))
-            print(("Docs need to import: ", data_import))
+            print("Total docs in bucket: ", keys)
+            print("Docs need to import: ", data_import)
 
         if data_import != int(keys):
             if self.skip_docs:
@@ -1163,7 +1301,7 @@ class ImportExportTests(CliBaseTest):
                 self.fail("Import failed to limit %s rows" % self.limit_rows)
             if self.skip_rows:
                 self.fail("Import failed to skip %s rows" % self.limit_rows)
-            else:
+            elif int(self.active_resident_threshold) == 100:
                 self.fail("Import data does not match with bucket data")
 
         if self.verify_data:
@@ -1251,12 +1389,15 @@ class ImportExportTests(CliBaseTest):
                     bucket_data[len(bucket_data) - 1] = \
                     bucket_data[len(bucket_data) - 1].replace("]", "")
                 if self.debug_logs:
-                    print(("\nsource data  \n", src_data))
-                    print(("\nbucket data  \n", bucket_data))
+                    print("\nsource data  \n", src_data)
+                    print("\nbucket data  \n", bucket_data)
                 self.log.info("Compare source data and bucket data")
                 for x in range(0, len(bucket_data)):
                     k = json.loads(bucket_data[x])
-                    bucket_data[x] = '{"name":"' + k["name"]+ '","age":' + str(k["age"]) + ',"index":"' + k["index"]+ '","body":"' + k["body"]+ '"}'
+                    if  '"index":"' in src_data[0]:
+                        bucket_data[x] = '{"name":"' + k["name"]+ '","age":' + str(k["age"]) + ',"index":"' + str(k["index"]) + '","body":"' + k["body"]+ '"}'
+                    else:
+                        bucket_data[x] = '{"name":"' + k["name"]+ '","age":' + str(k["age"]) + ',"index":' + str(k["index"]) + ',"body":"' + k["body"]+ '"}'
                 if sorted(src_data) == sorted(bucket_data):
                     self.log.info("Import data match bucket data")
                     if os.path.exists("/tmp/%s" % self.master.ip):
@@ -1405,12 +1546,22 @@ class ImportExportTests(CliBaseTest):
 
     def _check_output(self, word_check, output):
         found = False
-        if len(output) >=1 :
-            for x in output:
-                if word_check.lower() in x.lower():
-                    self.log.info("Found \"%s\" in CLI output" % word_check)
-                    found = True
-                    break
+        if len(output) >= 1:
+            if isinstance(word_check, list):
+                for ele in word_check:
+                    for x in output:
+                        if ele.lower() in x.lower():
+                            self.log.info("Found '{0} in CLI output".format(ele))
+                            found = True
+                            break
+            elif isinstance(word_check, str):
+                for x in output:
+                    if word_check.lower() in x.lower():
+                        self.log.info("Found '{0}' in CLI output".format(word_check))
+                        found = True
+                        break
+            else:
+                self.log.error("invalid {0}".format(word_check))
         return found
 
     def _remote_copy_import_file(self, import_file):

@@ -6,7 +6,7 @@ from string import ascii_uppercase
 from string import ascii_lowercase
 from string import digits
 import gzip
-from testconstants import DEWIKI, ENWIKI, ESWIKI, FRWIKI
+from testconstants import DEWIKI, ENWIKI, ESWIKI, FRWIKI, NAPADATASET
 from .data import FIRST_NAMES, LAST_NAMES, DEPT, LANGUAGES
 
 class KVGenerator(object):
@@ -223,6 +223,10 @@ class BatchedDocumentGenerator(object):
             key_val[key] = val
             count += 1
         return key_val
+
+    # is a python generator function
+    def isGenerator(self):
+        return True
 
 class JSONNonDocGenerator(KVGenerator):
     """
@@ -646,16 +650,23 @@ class GeoSpatialDataLoader(KVGenerator):
         return self.name+str(self.itr),\
                json.dumps(doc, indent=3).encode(self.encoding, "ignore")
 
+
 class SDKDataLoader(object):
     # type: (int, int, int, int, str, int, str, str, list, list, str, bool)
-    def __init__(self, num_ops, percent_create, percent_update, percent_delete, load_pattern="uniform",
-                  start_seq_num=1, key_prefix="doc_", key_suffix="_",
-                 scope="_default", collection="default", json_template="Person", print_sdk_logs="info"):
-        #TODO : doc_size, batch_size, pause_secs, timeout, expiry
+    def __init__(self, num_ops=0, percent_create=0, percent_update=0, percent_delete=0,
+                 load_pattern="uniform", start_seq_num=1, key_prefix="doc_", key_suffix="_",
+                 scope="_default", collection="_default", json_template="Person", doc_expiry=0, fields_to_update=None,
+                 doc_size=500, get_sdk_logs=False, username="Administrator", password="password", timeout=1000,
+                 start=0, end=0, op_type="create", all_collections=False, es_compare=False, es_host=None, es_port=None,
+                 es_login=None, es_password=None, output=False, upd_del_shift=0 , shuffle_docs=False):
         self.num_ops = num_ops
         self.percent_create = percent_create
         self.percent_update = percent_update
         self.percent_delete = percent_delete
+        self.json_template = json_template
+        self.key_prefix = key_prefix
+        self.start = start
+        self.end = end if end > start else num_ops - 1
         self.load_pattern = load_pattern
         self.start_seq_num = start_seq_num
         self.key_prefix = key_prefix
@@ -663,10 +674,209 @@ class SDKDataLoader(object):
         self.scope = scope
         self.collection = collection
         self.json_template = json_template
-        self.print_sdk_logs = print_sdk_logs
+        self.doc_expiry = doc_expiry
+        self.doc_size = doc_size
+        self.get_sdk_logs = get_sdk_logs
+        self.username = username
+        self.password = password
+        self.timeout = timeout
+        self.fields_to_update = fields_to_update
+        self.op_type = op_type
+        self.all_collections = all_collections
+        self.results = None
+        self.es_compare = es_compare
+        self.es_host = es_host
+        self.es_port = es_port
+        self.es_login = es_login
+        self.es_password = es_password
+        self.output = output
+        self.upd_del_shift = upd_del_shift
+        self.shuffle_docs = shuffle_docs
+
+    def update(self, fields_to_update=None):
+        self.start_seq_num = self.start + 1
+        self.num_ops = self.end - self.start
+        self.percent_create = 0
+        self.percent_update = 100
+        self.percent_delete = 0
+        self.fields_to_update = fields_to_update
+        self.op_type = "update"
+
+    def delete(self):
+        self.start_seq_num = self.start + 1
+        self.num_ops = self.end - self.start
+        self.percent_create = 0
+        self.percent_update = 0
+        self.percent_delete = 100
+        self.op_type = "delete"
 
     def isGenerator(self):
         return False
 
+    def get_num_ops(self):
+        return self.num_ops
+
+    def get_start_seq_num(self):
+        return self.start_seq_num
+
+    def set_num_ops(self, num_ops):
+        self.num_ops = num_ops
+
+    def set_start_seq_num(self, start_seq_num):
+        self.start_seq_num = start_seq_num
+
+    def get_sdk_results(self):
+        return self.results
+
+    def set_sdk_results(self, results):
+        self.results = results
+
+class NapaDataLoader(KVGenerator):
+
+    def __init__(self, name, encoding="utf-8", op_type="create",
+                 *args, **kwargs):
+
+        """Napa doc loader
+
+        gen = NapaDataLoader(prefix,"encoding="utf-8",
+                                start=0,end=1000)
+        Args:
+            prefix: prefix for key
+            encoding: utf-8/ascii/utf-16 encoding of JSON doc
+            *args: A list for each argument in the template
+            *kwargs: Special constrains for the document generator
 
 
+        Sample napa doc:
+
+        {
+          "_id": "1019_ycsb",
+          "doc_id": 1019,
+          "gid": "f9d57c4b-b6f6-5ef6-9c77-e4e2a1e3e823",
+          "index": 1,
+          "routing_number": 15073,
+          "company_name": "Wisozk, Casper and Moore",
+          "company_code": "HOF44",
+          "first_name": "Kaden",
+          "middle_name": "Terry",
+          "last_name": "Monahan",
+          "age": 41,
+          "ballance_current": "$8166.76",
+          "ballance_average": "$2294.65",
+          "picture": "https://www.gravatar.com/avatar/cc8a0fed5b51679b0f96044c6b41d0bd",
+          "phone": "(748) 317-8602",
+          "dob": "2020-02-15",
+          "email": "Larue_Labadie@hotmail.com",
+          "isActive": false,
+          "address": {
+            "street": "7826 Schinner Forges Port",
+            "city": "West Merlinstad",
+            "zip": "04380",
+            "country": "Germany",
+            "applicationId": 12,
+            "deviceTypeId": 9,
+            "deviceStatus": 0,
+            "ecpdId": "3",
+            "activationDate": "2020-04-18T18:36:40.752Z"
+          },
+          "devices": [
+            "504062-023",
+            "504798-457",
+            "521716-476",
+            "861229-804"
+          ],
+          "children": [
+            {
+              "first_name": "Titus",
+              "gender": null,
+              "age": 9
+            },
+            {
+              "first_name": "Meta",
+              "gender": "M",
+              "age": 10
+            },
+            {
+              "first_name": "Emmanuelle",
+              "gender": "F",
+              "age": 11
+            },
+            {
+              "first_name": "Hope",
+              "gender": "M",
+              "age": 13
+            },
+            {
+              "first_name": "Monserrat",
+              "gender": "M",
+              "age": 7
+            }
+          ]
+        }
+
+
+        """
+
+        self.args = args
+        self.name = name
+        self.gen_docs = {}
+        self.encoding = encoding
+
+        size = 0
+        if not len(self.args) == 0:
+            size = 1
+            for arg in self.args:
+                size *= len(arg)
+
+        KVGenerator.__init__(self, name, 0, size)
+        random.seed(0,1)
+
+        if 'start' in kwargs:
+            self.start = int(kwargs['start'])
+            self.itr = int(kwargs['start'])
+        if 'end' in kwargs:
+            self.end = int(kwargs['end'])
+
+        if op_type == "create":
+            self.read_from_napa_dump()
+        elif op_type == "delete":
+            # for deletes, just keep/return empty docs with just type field
+            for count in range(self.start, self.end):
+                self.gen_docs[count] = {'type': 'napa'}
+
+    def read_from_napa_dump(self):
+        count = 0
+        done = False
+        while not done:
+            try:
+                with gzip.open("lib/couchbase_helper/napa/napa_dataset.txt.gz", "r") as f:
+                    for doc in f:
+                        self.gen_docs[count] = doc
+                        if count >= self.end:
+                            f.close()
+                            done = True
+                            break
+                        count += 1
+                    f.close()
+            except IOError:
+                print("Unable to find file lib/couchbase_helper/napa/"
+                       "napa_dataset.txt.gz. Downloading from {0}...".format(NAPADATASET))
+                import urllib.request, urllib.parse, urllib.error
+                urllib.request.URLopener().retrieve(
+                    NAPADATASET,
+                    "lib/couchbase_helper/napa/napa_dataset.txt.gz")
+                print("Download complete!")
+
+    def __next__(self):
+        if self.itr >= self.end:
+            raise StopIteration
+        doc = {}
+        try:
+            doc = eval(self.gen_docs[self.itr])
+        except TypeError:
+            # happens with 'delete' gen
+            pass
+        doc['type'] = 'napa'
+        self.itr += 1
+        return self.name+str(10000000+self.itr), \
+               json.dumps(doc, indent=3).encode(self.encoding, "ignore")

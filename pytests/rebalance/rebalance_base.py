@@ -3,6 +3,7 @@ from couchbase_helper.document import View
 from couchbase_helper.documentgenerator import BlobGenerator
 from membase.api.rest_client import RestConnection
 import json
+import time
 
 
 class RebalanceBaseTest(BaseTestCase):
@@ -160,6 +161,31 @@ class RebalanceBaseTest(BaseTestCase):
         remote_client.reboot_node()
         remote_client.disconnect()
         # wait for restart and warmup on all node
-        self.sleep(self.wait_timeout * 5)
+        ClusterOperationHelper.wait_for_ns_servers_or_assert([server], self, wait_if_warmup=True)
         # disable firewall on these nodes
         self.stop_firewall_on_node(server)
+
+    def wait_for_failover_or_assert(self, expected_failover_count, timeout=180):
+        time_start = time.time()
+        time_max_end = time_start + timeout
+        actual_failover_count = 0
+        while time.time() < time_max_end:
+            actual_failover_count = self.get_failover_count()
+            if actual_failover_count == expected_failover_count:
+                break
+            time.sleep(20)
+        time_end = time.time()
+        self.assertTrue(actual_failover_count == expected_failover_count, "{0} nodes failed over, expected : {1}".
+                        format(actual_failover_count, expected_failover_count))
+        self.log.info(
+            "{0} nodes failed over as expected in {1} seconds".format(actual_failover_count, time_end - time_start))
+
+    def get_failover_count(self):
+        rest = RestConnection(self.master)
+        cluster_status = rest.cluster_status()
+        failover_count = 0
+        # check for inactiveFailed
+        for node in cluster_status['nodes']:
+            if node['clusterMembership'] == "inactiveFailed":
+                failover_count += 1
+        return failover_count

@@ -2,7 +2,7 @@ import copy
 import datetime
 
 from lib.couchbase_helper.documentgenerator import JSONNonDocGenerator
-from lib.membase.api.rest_client import RestConnection
+from lib.membase.api.rest_client import RestConnection, RestHelper
 from lib.testconstants import STANDARD_BUCKET_PORT
 from pytests.eventing.eventing_constants import HANDLER_CODE, HANDLER_CODE_ERROR
 from pytests.eventing.eventing_base import EventingBaseTest, log
@@ -14,10 +14,9 @@ import json
 class EventingN1QL(EventingBaseTest):
     def setUp(self):
         super(EventingN1QL, self).setUp()
-        self.rest.set_service_memoryQuota(service='memoryQuota', memoryQuota=1200)
+        self.rest.set_service_memoryQuota(service='memoryQuota', memoryQuota=1400)
         if self.create_functions_buckets:
-            self.bucket_size = 200
-            log.info(self.bucket_size)
+            self.bucket_size = 100
             bucket_params = self._create_bucket_params(server=self.server, size=self.bucket_size,
                                                        replicas=self.num_replicas)
             self.cluster.create_standard_bucket(name=self.src_bucket_name, port=STANDARD_BUCKET_PORT + 1,
@@ -41,6 +40,8 @@ class EventingN1QL(EventingBaseTest):
                                       master=self.master,
                                       use_rest=True
                                       )
+        self.handler_code=self.input.param('handler_code', 'bucket_op')
+
 
     def tearDown(self):
         super(EventingN1QL, self).tearDown()
@@ -53,7 +54,7 @@ class EventingN1QL(EventingBaseTest):
         try:
             self.deploy_function(body)
         except Exception as ex:
-            if "Can not execute DML query on bucket" not in str(ex):
+            if "ERR_INTER_BUCKET_RECURSION" not in str(ex):
                 self.fail("recursive mutations are allowed through n1ql")
 
     def test_n1ql_prepare_statement(self):
@@ -172,20 +173,17 @@ class EventingN1QL(EventingBaseTest):
     def test_global_variable(self):
         self.load(self.gens_load, buckets=self.src_bucket, flag=self.item_flag, verify_data=False,
                   batch_size=self.batch_size)
-        body = self.create_save_function_body(self.function_name, HANDLER_CODE_ERROR.GLOBAL_VARIABLE,
+        try:
+            body = self.create_save_function_body(self.function_name, HANDLER_CODE_ERROR.GLOBAL_VARIABLE,
                                               dcp_stream_boundary="from_now")
-        try :
-            self.deploy_function(body, deployment_fail=True)
         except Exception as e:
-            if "Only function declaration are allowed in global scope" not in str(e):
+            if "ERR_HANDLER_COMPILATION" not in str(e):
                 self.fail("Deployment is expected to be failed but no message of failure")
 
     def test_empty_handler(self):
-        self.load(self.gens_load, buckets=self.src_bucket, flag=self.item_flag, verify_data=False,
-                  batch_size=self.batch_size)
-        body = self.create_save_function_body(self.function_name, HANDLER_CODE_ERROR.EMPTY,
-                                              dcp_stream_boundary="from_now")
         try:
+            body = self.create_save_function_body(self.function_name, HANDLER_CODE_ERROR.EMPTY,
+                                              dcp_stream_boundary="from_now")
             self.deploy_function(body, deployment_fail=True)
         except Exception as e:
             if "Function handler should not be empty" not in str(e):
@@ -194,14 +192,13 @@ class EventingN1QL(EventingBaseTest):
     def test_without_update_delete(self):
         self.load(self.gens_load, buckets=self.src_bucket, flag=self.item_flag, verify_data=False,
                   batch_size=self.batch_size)
-        body = self.create_save_function_body(self.function_name, HANDLER_CODE_ERROR.RANDOM,
-                                              dcp_stream_boundary="from_now")
-        # MB-27126
         try:
+            body = self.create_save_function_body(self.function_name, HANDLER_CODE_ERROR.RANDOM,
+                                              dcp_stream_boundary="from_now")
             self.deploy_function(body, deployment_fail=True)
         except Exception as e:
-            if "Handler code is missing OnUpdate() and OnDelete() functions. At least one of them is needed to deploy the handler" not in str(e):
-                self.fail("Function deployment succeeded with missing OnUpdate() and OnDelete()")
+            self.log.info(e)
+            assert "ERR_HANDLER_COMPILATION" in str(e) and "handler must have at least OnUpdate() or OnDelete() function" in str(e), True
 
 
     def test_anonymous_with_cron_timer(self):
@@ -300,6 +297,7 @@ class EventingN1QL(EventingBaseTest):
         self.n1ql_helper.run_cbq_query(query=query, server=self.n1ql_node)
         # Wait for eventing to catch up with all the delete mutations and verify results
         self.verify_eventing_results(self.function_name, 0, skip_stats_validation=True)
+        self.undeploy_and_delete_function(body)
 
     def test_n1ql_with_iterator_break_continue(self):
         self.n1ql_helper.create_primary_index(using_gsi=True, server=self.n1ql_node)
@@ -316,6 +314,7 @@ class EventingN1QL(EventingBaseTest):
         self.n1ql_helper.run_cbq_query(query=query, server=self.n1ql_node)
         # Wait for eventing to catch up with all the delete mutations and verify results
         self.verify_eventing_results(self.function_name, 0, skip_stats_validation=True)
+        self.undeploy_and_delete_function(body)
 
 
     def test_n1ql_close_before_complete(self):
@@ -333,6 +332,7 @@ class EventingN1QL(EventingBaseTest):
         self.n1ql_helper.run_cbq_query(query=query, server=self.n1ql_node)
         # Wait for eventing to catch up with all the delete mutations and verify results
         self.verify_eventing_results(self.function_name, 0, skip_stats_validation=True)
+        self.undeploy_and_delete_function(body)
 
     def test_n1ql_variable_substitution(self):
         self.n1ql_helper.create_primary_index(using_gsi=True, server=self.n1ql_node)
@@ -349,7 +349,7 @@ class EventingN1QL(EventingBaseTest):
         self.n1ql_helper.run_cbq_query(query=query, server=self.n1ql_node)
         # Wait for eventing to catch up with all the delete mutations and verify results
         self.verify_eventing_results(self.function_name, 0, skip_stats_validation=True)
-
+        self.undeploy_and_delete_function(body)
 
     def test_n1ql_timeout(self):
         self.n1ql_helper.create_primary_index(using_gsi=True, server=self.n1ql_node)
@@ -363,10 +363,14 @@ class EventingN1QL(EventingBaseTest):
         self.sleep(30)
         stats = self.rest.get_all_eventing_stats()
         log.info("Stats {0}".format(json.dumps(stats, sort_keys=True, indent=4)))
-        if stats[0]["lcb_exception_stats"]["23"]==1:
+        if stats[0]["failure_stats"]["timeout_count"] !=1:
+            if stats[0]["lcb_exception_stats"]["201"]==1:
+                pass
+            else:
+                raise Exception("Timeout not happened for the long running query")
+        elif stats[0]["failure_stats"]["timeout_count"] ==1:
             pass
-        else:
-            raise Exception("Timeout not happened for the long running query")
+        self.undeploy_and_delete_function(body)
 
 
     def test_n1ql_slow_queries(self):
@@ -383,6 +387,7 @@ class EventingN1QL(EventingBaseTest):
         self.load(gen_load_del, buckets=self.src_bucket, flag=self.item_flag, verify_data=False,
                   batch_size=self.batch_size, op_type='delete')
         self.verify_eventing_results(self.function_name, 0, skip_stats_validation=True)
+        self.undeploy_and_delete_function(body)
 
     def test_n1ql_with_set_expiry(self):
         bucket_params = self._create_bucket_params(server=self.server, size=self.bucket_size,
@@ -396,10 +401,12 @@ class EventingN1QL(EventingBaseTest):
                                               dcp_stream_boundary="everything", execution_timeout=60)
         self.deploy_function(body)
         self.verify_eventing_results(self.function_name, 2016, skip_stats_validation=True)
-        body = self.create_save_function_body(self.function_name+"_check", "handler_code/check_for_expiry.js",
+        body1 = self.create_save_function_body(self.function_name+"_check", "handler_code/check_for_expiry.js",
                                               dcp_stream_boundary="everything", execution_timeout=60,multi_dst_bucket=True)
-        self.deploy_function(body)
+        self.deploy_function(body1)
         self.verify_eventing_results(self.function_name, 2016,bucket=self.dst_bucket_name1, skip_stats_validation=True)
+        self.undeploy_and_delete_function(body)
+        self.undeploy_and_delete_function(body1)
 
     def test_n1ql_with_ttl(self):
         dst_bucket = self.rest.get_bucket(self.dst_bucket_name)
@@ -425,3 +432,50 @@ class EventingN1QL(EventingBaseTest):
                 break
             self.sleep(timeout=2, message="Waiting for docs to get expired")
         self.assertNotEqual(count, 20, "All docs didn't expired in dst_bucket. Check eventing logs for details.")
+        self.undeploy_and_delete_function(body)
+
+    #MB-42513
+    def test_delete_query(self):
+        self.n1ql_helper.create_primary_index(using_gsi=True, server=self.n1ql_node)
+        self.load(self.gens_load, buckets=self.src_bucket, flag=self.item_flag, verify_data=False,
+                  batch_size=self.batch_size)
+        body = self.create_save_function_body(self.function_name, HANDLER_CODE.N1QL_DELETE_QUERY_TEST, worker_count=3)
+        self.deploy_function(body)
+        self.verify_eventing_results(self.function_name, self.docs_per_day * 2016, skip_stats_validation=True)
+        self.load(self.gens_load, buckets=self.src_bucket, flag=self.item_flag, verify_data=False,
+                 batch_size=self.batch_size, op_type='delete')
+        self.verify_eventing_results(self.function_name, 0, skip_stats_validation=True)
+        self.undeploy_and_delete_function(body)
+
+    def test_n1ql_gc_rebalance(self):
+        self.n1ql_helper.create_primary_index(using_gsi=True, server=self.n1ql_node)
+        self.load_sample_buckets(self.server, "travel-sample")
+        worker_count = self.input.param('worker_count', 12)
+        body = self.create_save_function_body(self.function_name, self.handler_code, worker_count=worker_count)
+        self.deploy_function(body)
+        # load data
+        self.load(self.gens_load, buckets=self.src_bucket, flag=self.item_flag, verify_data=False,
+                  batch_size=self.batch_size)
+        if self.pause_resume:
+            self.pause_function(body)
+        # rebalance in a eventing node when eventing is processing mutations
+        services_in = ["eventing"]
+        rebalance = self.cluster.async_rebalance(self.servers[:self.nodes_init], [self.servers[self.nodes_init]], [],
+                                                 services=services_in)
+        reached = RestHelper(self.rest).rebalance_reached(retry_count=150)
+        self.assertTrue(reached, "rebalance failed, stuck or did not complete")
+        rebalance.result()
+        if self.pause_resume:
+            self.resume_function(body)
+        # Wait for eventing to catch up with all the update mutations and verify results after rebalance
+        self.verify_eventing_results(self.function_name, self.docs_per_day * 2016, skip_stats_validation=True)
+        # delete json documents
+        self.load(self.gens_load, buckets=self.src_bucket, flag=self.item_flag, verify_data=False,
+                  batch_size=self.batch_size, op_type='delete')
+        if self.pause_resume:
+            self.pause_function(body)
+            self.sleep(30)
+            self.resume_function(body)
+        # Wait for eventing to catch up with all the delete mutations and verify results
+        self.verify_eventing_results(self.function_name, 0, skip_stats_validation=True)
+        self.undeploy_and_delete_function(body)

@@ -8,6 +8,7 @@ from mc_bin_client import MemcachedClient, MemcachedError
 from membase.api.exception import XDCRCheckpointException
 from memcached.helper.data_helper import MemcachedClientHelper, VBucketAwareMemcached
 from remote.remote_util import RemoteMachineShellConnection
+from collection.collections_rest_client import CollectionsRest
 
 from .xdcrnewbasetests import NodeHelper
 from .xdcrnewbasetests import XDCRNewBaseTest, REPLICATION_TYPE
@@ -174,10 +175,10 @@ class XDCRCheckpointUnitTest(XDCRNewBaseTest):
             total_successful_chkpts = 0
         self.log.info(total_successful_chkpts)
         chkpts, count = NodeHelper.check_goxdcr_log(node,
-                                                  "num_failedckpts",
-                                                  log_name="stats.log",
-                                                  print_matches=True,
-                                                  timeout=10)
+                                                    "num_failedckpts",
+                                                    log_name="stats.log",
+                                                    print_matches=False,
+                                                    timeout=10)
         if count > 0:
             total_failed_chkpts = int((chkpts[-1].split('num_failedckpts,')[1]).rstrip('},'))
         else:
@@ -190,7 +191,7 @@ class XDCRCheckpointUnitTest(XDCRNewBaseTest):
                                                         "POST /_goxdcr/_pre_replicate",
                                                         log_name="http_access.log",
                                                         timeout=10,
-                                                        print_matches=True)
+                                                        print_matches=False)
         if count > 0:
             total_successful_prereps = 0
             for call in prerep_calls:
@@ -223,11 +224,11 @@ class XDCRCheckpointUnitTest(XDCRNewBaseTest):
     def was_pre_rep_successful(self):
         self.sleep(30)
         node = self.get_active_vb0_node(self.dest_master)
-        success = self.get_pre_replicate_call_history(node)
-        if success > self.num_successful_prereps_so_far :
+        total_commit_calls = self.get_pre_replicate_call_history(node)
+        if total_commit_calls > self.num_successful_prereps_so_far :
             self.log.info("_pre_replicate was successful: last recorded success :{0} , now :{1}".
-                          format(self.num_successful_prereps_so_far, success))
-            self.num_successful_prereps_so_far = success
+                          format(self.num_successful_prereps_so_far, total_commit_calls))
+            self.num_successful_prereps_so_far = total_commit_calls
             return True
         elif total_commit_calls == self.num_successful_prereps_so_far:
             self.log.error("ERROR: Pre-replication did NOT happen!")
@@ -312,18 +313,18 @@ class XDCRCheckpointUnitTest(XDCRNewBaseTest):
     def mutate_and_check_error404(self, n=1):
         # get vb0 active source node
         active_src_node = self.get_active_vb0_node(self.src_master)
-        num_404_errors_before_load = NodeHelper.check_goxdcr_log(
+        _, num_404_errors_before_load = NodeHelper.check_goxdcr_log(
                                             active_src_node,
                                             "ERRO GOXDCR.CheckpointMgr: GetRemoteMemcachedConnection Operation failed after max retries",
-                                            timeout=30)
+                                            timeout=30, print_matches=False)
         self.sleep(60)
         self.log.info("################ New mutation:{0} ##################".format(self.key_counter+1))
         self.load_one_mutation_into_source_vb0(active_src_node)
         self.sleep(5)
-        num_404_errors_after_load = NodeHelper.check_goxdcr_log(
+        _, num_404_errors_after_load = NodeHelper.check_goxdcr_log(
                                             active_src_node,
                                             "ERRO GOXDCR.CheckpointMgr: GetRemoteMemcachedConnection Operation failed after max retries",
-                                            timeout=30)
+                                            timeout=30, print_matches=False)
         if num_404_errors_after_load > num_404_errors_before_load:
             self.log.info("Topology change verified after dest failover/rebalance out")
             return True
@@ -484,6 +485,7 @@ class XDCRCheckpointUnitTest(XDCRNewBaseTest):
         RestConnection(self.src_master).start_replication(REPLICATION_TYPE.CONTINUOUS,
             'default',
             "remote_cluster_%s-%s" % (self.src_cluster.get_name(), self.dest_cluster.get_name()))
+        self.src_cluster.set_global_checkpt_interval(60)
         self.key_counter = 0
         self.keys_loaded = []
         if self.was_pre_rep_successful():
@@ -585,6 +587,8 @@ class XDCRCheckpointUnitTest(XDCRNewBaseTest):
             mem_client.stop_persistence()
 
         self.src_cluster.pause_all_replications()
+        CollectionsRest(self.src_master).create_scope_collection(
+            "not_persisted_scope", "not_persisted_collection", "default")
 
         gen = BlobGenerator("C1-", "C1-", self._value_size, end=self._num_items)
         self.src_cluster.load_all_buckets_from_generator(gen)
@@ -617,19 +621,21 @@ class XDCRCheckpointUnitTest(XDCRNewBaseTest):
 
         goxdcr_log = NodeHelper.get_goxdcr_log_dir(self._input.servers[0]) \
                      + '/goxdcr.log*'
-        count1 = NodeHelper.check_goxdcr_log(
+        _, count1 = NodeHelper.check_goxdcr_log(
             nodes[0],
             "Received rollback from DCP stream",
             goxdcr_log,
-            timeout=30)
+            timeout=30, print_matches=False)
         self.assertGreater(count1, 0, "full rollback not received from DCP as expected")
         self.log.info("full rollback received from DCP as expected")
-        count2 = NodeHelper.check_goxdcr_log(
+        # scope_1, collection_1 create events occur before disabling persistence,
+        # so seqno will be rolled back to 2 not 0
+        _, count2 = NodeHelper.check_goxdcr_log(
             nodes[0],
-            "Rolled back startSeqno to 0",
+            "Rolled back startSeqno to 2",
             goxdcr_log,
-            timeout=30)
-        self.assertGreater(count2, 0, "startSeqno not rolled back to 0 as expected")
-        self.log.info("startSeqno rolled back to 0 as expected")
+            timeout=30, print_matches=False)
+        self.assertGreater(count2, 2, "startSeqno not rolled back to 2 as expected")
+        self.log.info("startSeqno rolled back to 2 as expected")
 
         shell.disconnect()

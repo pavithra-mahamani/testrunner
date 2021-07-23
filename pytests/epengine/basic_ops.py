@@ -91,6 +91,93 @@ class basic_ops(BaseTestCase):
         except MemcachedError as exp:
             self.fail("Exception with del_with meta - {0}".format(exp) )
 
+    def test_MB_32114(self):
+        try:
+            from sdk_client import SDKClient
+        except:
+            from sdk_client3 import SDKClient
+        import couchbase.subdocument as SD
+
+        rest = RestConnection(self.master)
+        client = VBucketAwareMemcached(rest, 'default')
+        if self.maxttl:
+            self._expiry_pager(self.master)
+        sdk_client = SDKClient(scheme='couchbase', hosts=[self.master.ip], bucket='default')
+        KEY_NAME = 'key1'
+
+        for i in range(1000):
+            mcd = client.memcached(KEY_NAME + str(i))
+            rc = mcd.set(KEY_NAME + str(i), 0, 0, json.dumps({'value': 'value2'}))
+            sdk_client.mutate_in(KEY_NAME + str(i), SD.upsert("subdoc_key", "subdoc_val",
+                                                              xattr=True,
+                                                              create_parents=True))
+            # wait for it to persist
+            persisted = 0
+            while persisted == 0:
+                opaque, rep_time, persist_time, persisted, cas = client.observe(KEY_NAME + str(i))
+
+        self._load_doc_data_all_buckets(batch_size=1000)
+
+        for i in range(1000):
+            try:
+                mcd = client.memcached(KEY_NAME + str(i))
+                _, flags, exp, seqno, cas = client.memcached(KEY_NAME + str(i)).getMeta(KEY_NAME + str(i))
+                rc = mcd.del_with_meta(KEY_NAME + str(i), 0, 0, 2, cas + 1)
+            except MemcachedError as exp:
+                self.fail("Exception with del_with meta - {0}".format(exp))
+        self.cluster.compact_bucket(self.master, "default")
+        if self.maxttl:
+            self.sleep(self.maxttl)
+        else:
+            self.sleep(60)
+        active_bucket_items = rest.get_active_key_count("default")
+        replica_bucket_items = rest.get_replica_key_count("default")
+        print('active_bucket_items ', active_bucket_items)
+        print('replica_bucket_items ', replica_bucket_items)
+        if active_bucket_items * self.num_replicas != replica_bucket_items:
+            self.fail("Mismatch in data !!!")
+
+    def test_MB_36087(self):
+        try:
+            from sdk_client import SDKClient
+        except:
+            from sdk_client3 import SDKClient
+        import couchbase.subdocument as SD
+
+        g_key = "test_doc"
+        bucket_name = "default"
+        sdk_client = SDKClient(scheme='couchbase', hosts=[self.master.ip],
+                               bucket=bucket_name)
+        rest = RestConnection(self.master)
+        client = VBucketAwareMemcached(rest, bucket_name)
+        for i in range(self.num_items):
+            key = g_key + str(i)
+            mcd = client.memcached(key)
+            rc = mcd.set(key, 0, 0, json.dumps({'value': 'value2'}))
+            sdk_client.mutate_in(key,
+                                 SD.upsert("subdoc_key", "subdoc_val",
+                                           xattr=True,
+                                           create_parents=True))
+            # Wait for key to persist
+            persisted = 0
+            while persisted == 0:
+                opaque, rep_time, persist_time, persisted, cas = \
+                    client.observe(key)
+
+            # Evict the key
+            try:
+                rc = mcd.evict_key(key)
+            except MemcachedError as exp:
+                self.fail("Exception with evict meta - %s" % exp)
+
+            # Perform del_with_meta
+            try:
+                mcd = client.memcached(key)
+                _, flags, exp, seqno, cas = client.memcached(key).getMeta(key)
+                rc = mcd.del_with_meta(key, 0, 0, 2, cas+1)
+            except MemcachedError as exp:
+                self.fail("Exception with del_with meta - {0}".format(exp))
+
     # Reproduce test case for MB-28078
     def do_setWithMeta_twice(self):
 
@@ -119,7 +206,7 @@ class basic_ops(BaseTestCase):
             if int(stats['curr_temp_items']) == 1:
                 self.fail("Error on second setWithMeta(), expected curr_temp_items to be 0")
             else:
-                self.log.info("<MemcachedError #%d ``%s''>" % (error.status, error.message))
+                self.log.info("expected error is %s" % (error))
 
     def generate_docs_bigdata(self, docs_per_day, start=0, document_size=1024000):
         json_generator = JsonGenerator()
@@ -222,11 +309,13 @@ class basic_ops(BaseTestCase):
             else:
                 self.assertNotEqual("API is accessible from localhost only", output[0])
 
-    def verify_stat(self,items, value=b"active" ):
+    def verify_stat(self, items, value=b"active"):
         mc = MemcachedClient(self.master.ip, 11210)
         mc.sasl_auth_plain(self.master.rest_username, self.master.rest_password)
         mc.bucket_select('default')
         stats = mc.stats()
+        if type(value) is bytes:
+            value = value.decode("utf-8")
         self.assertEqual(stats['ep_compression_mode'], value)
         self.assertEqual(int(stats['ep_item_compressor_num_compressed']), items)
         self.assertNotEqual(int(stats['vb_active_itm_memory']), int(stats['vb_active_itm_memory_uncompressed']))

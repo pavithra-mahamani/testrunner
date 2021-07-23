@@ -78,7 +78,7 @@ class EventingDataset(EventingBaseTest):
         body = self.create_save_function_body(self.function_name, self.handler_code)
         self.deploy_function(body)
         # Wait for eventing to catch up with all the update mutations and verify results
-        self.verify_eventing_results(self.function_name, self.docs_per_day * 2016, skip_stats_validation=True)
+        self.verify_eventing_results(self.function_name, self.docs_per_day * 2016 * 2, skip_stats_validation=True)
         # delete both binary and json documents
         self.cluster.load_gen_docs(self.master, self.src_bucket_name, gen_load, self.buckets[0].kvs[1], 'delete',
                                    exp=0, flag=0, batch_size=1000, compression=self.sdk_compression)
@@ -101,8 +101,6 @@ class EventingDataset(EventingBaseTest):
         self.deploy_function(body)
         # convert data from binary to json
         # use the same doc-id's as binary to update from binary to json
-        self.cluster.load_gen_docs(self.master, self.src_bucket_name, gen_load_binary_del, self.buckets[0].kvs[1],
-                                   'delete', batch_size=1000, compression=self.sdk_compression)
         self.cluster.load_gen_docs(self.master, self.src_bucket_name, gen_load_json, self.buckets[0].kvs[1], 'create',
                                    batch_size=1000, compression=self.sdk_compression)
         # Wait for eventing to catch up with all the update mutations and verify results
@@ -127,12 +125,12 @@ class EventingDataset(EventingBaseTest):
         body = self.create_save_function_body(self.function_name, self.handler_code)
         self.deploy_function(body)
         # Wait for eventing to catch up with all the update mutations and verify results
-        self.verify_eventing_results(self.function_name, self.docs_per_day * 2016, skip_stats_validation=True)
+        self.verify_eventing_results(self.function_name, self.docs_per_day * 2016 * 2, skip_stats_validation=True)
         # delete non json documents
         self.cluster.load_gen_docs(self.master, self.src_bucket_name, gen_load_non_json_del, self.buckets[0].kvs[1],
                                    'delete', compression=self.sdk_compression)
         # Wait for eventing to catch up with all the delete mutations and verify results
-        self.verify_eventing_results(self.function_name, 0, skip_stats_validation=True)
+        self.verify_eventing_results(self.function_name, 2016, skip_stats_validation=True)
         self.undeploy_and_delete_function(body)
 
     # See MB-26706
@@ -246,12 +244,9 @@ class EventingDataset(EventingBaseTest):
             bucket.mutate_in(docid, SD.upsert('my2', {'value': 2}, xattr=True))
             bucket.mutate_in(docid, SD.upsert('fax', '775-867-5309'))
         self.verify_eventing_results(self.function_name, 3, skip_stats_validation=True)
+        self.sleep(60)
         # add new multiple xattrs , delete old xattrs and delete the documents
         for docid in ['customer123', 'customer1234', 'customer12345']:
-            bucket.mutate_in(docid, SD.upsert('my3', {'value': 3}, xattr=True))
-            bucket.mutate_in(docid, SD.upsert('my4', {'value': 4}, xattr=True))
-            bucket.mutate_in(docid, SD.remove('my3', xattr=True))
-            bucket.mutate_in(docid, SD.remove('my4', xattr=True))
             bucket.remove(docid)
         self.verify_eventing_results(self.function_name, 0, skip_stats_validation=True)
         self.undeploy_and_delete_function(body)
@@ -375,4 +370,36 @@ class EventingDataset(EventingBaseTest):
             fiid = bucket.lookup_in(docid, SD.exists('_eventing.fiid', xattr=True))
             crc = bucket.lookup_in(docid, SD.exists('_eventing.crc', xattr=True))
             if fiid_value != fiid['_eventing.fiid'] or crc_value !=crc['_eventing.crc']:
-                self.fail("fiid {} or crc {} values are not same:".format(fiid, crc))
+                self.fail("fiid {} or crc {} values are not same:".format(fiid,crc))
+        self.undeploy_and_delete_function(body)
+
+
+    def test_read_cas_bucket_op(self):
+        self.n1ql_helper.create_primary_index(using_gsi=True, server=self.n1ql_node)
+        self.load(self.gens_load, buckets=self.src_bucket, flag=self.item_flag, verify_data=False,
+                  batch_size=self.batch_size)
+        body = self.create_save_function_body(self.function_name, "handler_code/bucket_op_cas.js")
+        self.deploy_function(body)
+        # Wait for eventing to catch up with all the update mutations and verify results
+        self.verify_eventing_results(self.function_name, self.docs_per_day * 2016)
+        self.load(self.gens_load, buckets=self.src_bucket, flag=self.item_flag, verify_data=False,
+                  batch_size=self.batch_size, op_type='delete')
+        # Wait for eventing to catch up with all the delete mutations and verify results
+        self.verify_eventing_results(self.function_name, 0, skip_stats_validation=True)
+        self.undeploy_and_delete_function(body)
+
+
+    def test_read_expiration_bucket_op(self):
+        self.n1ql_helper.create_primary_index(using_gsi=True, server=self.n1ql_node)
+        self.load(self.gens_load, buckets=self.src_bucket, flag=self.item_flag, verify_data=False,
+                  batch_size=self.batch_size)
+        body = self.create_save_function_body(self.function_name, "handler_code/bucket_op_exipration.js")
+        self.deploy_function(body)
+        # Wait for eventing to catch up with all the update mutations and verify results
+        self.verify_eventing_results(self.function_name, self.docs_per_day * 2016)
+        self.load(self.gens_load, buckets=self.src_bucket, flag=self.item_flag, verify_data=False,
+                  batch_size=self.batch_size, op_type='delete')
+        # Wait for eventing to catch up with all the delete mutations and verify results
+        self.verify_eventing_results(self.function_name, 0, skip_stats_validation=True)
+        self.undeploy_and_delete_function(body)
+

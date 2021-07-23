@@ -1,7 +1,8 @@
 """
 Base class for FTS/CBFT/Couchbase Full Text Search
 """
-
+import ast
+import os
 import unittest
 import time
 import copy
@@ -11,6 +12,7 @@ import re
 import json
 import math
 import random
+import subprocess
 
 from couchbase_helper.cluster import Cluster
 from membase.api.rest_client import RestConnection, Bucket
@@ -25,9 +27,11 @@ from membase.helper.bucket_helper import BucketOperationHelper
 from memcached.helper.data_helper import MemcachedClientHelper
 from TestInput import TestInputSingleton
 from lib.couchbase_helper.documentgenerator import GeoSpatialDataLoader, WikiJSONGenerator
+from lib.collection.collections_stats import CollectionsStats
 from lib.memcached.helper.data_helper import KVStoreAwareSmartClient
 from scripts.collect_server_info import cbcollectRunner
 from couchbase_helper.documentgenerator import *
+from tasks.taskmanager import TaskManager
 
 from couchbase_helper.documentgenerator import JsonDocGenerator
 from lib.membase.api.exception import FTSException
@@ -39,6 +43,9 @@ from security.ntonencryptionBase import ntonencryptionBase
 from lib.ep_mc_bin_client import MemcachedClient
 from lib.mc_bin_client import MemcachedClient as MC_MemcachedClient
 from security.SecretsMasterBase import SecretsMasterBase
+from lib.collection.collections_cli_client import CollectionsCLI
+from scripts.java_sdk_setup import JavaSdkSetup
+from couchbase_cli import CouchbaseCLI
 
 
 class RenameNodeException(FTSException):
@@ -62,6 +69,16 @@ def raise_if(cond, ex):
     """
     if cond:
         raise ex
+
+
+def download_from_s3(source, dest):
+    print( "Downloading from {0}...".
+           format(source))
+    import urllib.request, urllib.parse, urllib.error
+    urllib.request.URLopener().retrieve(
+        source,
+        dest)
+    print("Download complete!")
 
 
 class OPS:
@@ -162,6 +179,165 @@ class INDEX_DEFAULTS:
         "planParams": {}
     }
 
+    FUZZY_SMALL_INDEX_MAPPING = {
+        "analysis": {},
+        "default_analyzer": "standard",
+        "default_datetime_parser": "dateTimeOptional",
+        "default_field": "_all",
+        "default_mapping": {
+            "dynamic": False,
+            "enabled": True,
+            "properties": {
+                "entity": {
+                    "dynamic": False,
+                    "enabled": True,
+                    "properties": {
+                        "country": {
+                            "dynamic": False,
+                            "enabled": True,
+                            "properties": {
+                                "countryCode": {
+                                    "dynamic": False,
+                                    "enabled": True,
+                                    "fields": [
+                                        {
+                                            "include_in_all": True,
+                                            "include_term_vectors": True,
+                                            "index": True,
+                                            "name": "countryCode",
+                                            "store": True,
+                                            "type": "text"
+                                        }
+                                    ]
+                                },
+                                "subdiv": {
+                                    "dynamic": False,
+                                    "enabled": True,
+                                    "fields": [
+                                        {
+                                            "include_in_all": True,
+                                            "include_term_vectors": True,
+                                            "index": True,
+                                            "name": "subdiv",
+                                            "store": True,
+                                            "type": "text"
+                                        }
+                                    ]
+                                }
+                            }
+                        },
+                        "state": {
+                            "dynamic": False,
+                            "enabled": True,
+                            "fields": [
+                                {
+                                    "docvalues": True,
+                                    "include_in_all": True,
+                                    "include_term_vectors": True,
+                                    "index": True,
+                                    "name": "state",
+                                    "type": "text"
+                                }
+                            ]
+                        }
+                    }
+                }
+            }
+        },
+        "default_type": "_default",
+        "docvalues_dynamic": True,
+        "index_dynamic": True,
+        "store_dynamic": False,
+        "type_field": "_type"
+
+    }
+
+    FUZZY_LARGE_INDEX_MAPPING = {
+        "analysis": {},
+        "default_analyzer": "standard",
+        "default_datetime_parser": "dateTimeOptional",
+        "default_field": "_all",
+        "default_mapping": {
+            "dynamic": False,
+            "enabled": True,
+            "properties": {
+                "class": {
+                    "dynamic": False,
+                    "enabled": True,
+                    "fields": [
+                        {
+                            "docvalues": True,
+                            "include_in_all": True,
+                            "include_term_vectors": True,
+                            "index": True,
+                            "name": "class",
+                            "type": "text"
+                        }
+                    ]
+                },
+                "entity": {
+                    "dynamic": False,
+                    "enabled": True,
+                    "properties": {
+                        "country": {
+                            "dynamic": False,
+                            "enabled": True,
+                            "properties": {
+                                "countryCode": {
+                                    "dynamic": False,
+                                    "enabled": True,
+                                    "fields": [
+                                        {
+                                            "include_in_all": True,
+                                            "include_term_vectors": True,
+                                            "index": True,
+                                            "name": "countryCode",
+                                            "store": True,
+                                            "type": "text"
+                                        }
+                                    ]
+                                },
+                                "subdiv": {
+                                    "dynamic": False,
+                                    "enabled": True,
+                                    "fields": [
+                                        {
+                                            "include_in_all": True,
+                                            "include_term_vectors": True,
+                                            "index": True,
+                                            "name": "subdiv",
+                                            "store": True,
+                                            "type": "text"
+                                        }
+                                    ]
+                                }
+                            }
+                        },
+                        "state": {
+                            "dynamic": False,
+                            "enabled": True,
+                            "fields": [
+                                {
+                                    "docvalues": True,
+                                    "include_in_all": True,
+                                    "include_term_vectors": True,
+                                    "index": True,
+                                    "name": "state",
+                                    "type": "text"
+                                }
+                            ]
+                        }
+                    }
+                }
+            }
+        },
+        "default_type": "_default",
+        "docvalues_dynamic": True,
+        "index_dynamic": True,
+        "store_dynamic": False,
+        "type_field": "_type"
+    }
+
 
 class QUERY:
     JSON = {
@@ -180,6 +356,78 @@ class QUERY:
             # it's better to get rid of hardcoding
         }
     }
+
+    FUZZY_LARGE_INDEX_QUERY = {
+        "must": {
+            "conjuncts": [
+                {
+                    "field": "class",
+                    "match": "clearancesnapshot"
+                },
+                {
+                    "field": "entity.state",
+                    "match": "SALLED",
+                    "fuzziness": 1
+                },
+                {
+                    "field": "entity.country.subdiv",
+                    "match": "XY",
+                    "fuzziness": 2
+                },
+                {
+                    "disjuncts": [
+                        {
+                            "field": "entity.country.countryCode",
+                            "match": "CD",
+                            "fuzziness": 1
+                        },
+                        {
+                            "field": "entity.country.countryCode",
+                            "match": "HI",
+                            "fuzziness": 1
+                        },
+                        {
+                            "field": "entity.country.countryCode",
+                            "match": "NY",
+                            "fuzziness": 2
+                        }
+                    ]
+                }
+            ]
+        }
+    }
+
+    FUZZY_SMALL_INDEX_QUERY = {
+        "must": {
+            "conjuncts": [
+                {
+                    "field": "entity.state",
+                    "match": "SALLED",
+                    "fuzziness": 1
+                },
+                {
+                    "field": "entity.country.subdiv",
+                    "match": "XY",
+                    "fuzziness": 1
+                },
+                {
+                    "disjuncts": [
+                        {
+                            "field": "entity.country.countryCode",
+                            "match": "CD",
+                            "fuzziness": 1
+                        },
+                        {
+                            "field": "entity.country.countryCode",
+                            "match": "HI",
+                            "fuzziness": 1
+                        }
+                    ]
+                }
+            ]
+        }
+    }
+
 
 
 # Event Definition:
@@ -335,8 +583,11 @@ class NodeHelper:
         start = time.time()
         for server in warmupnodes:
             for bucket in bucket_names:
-                while time.time() - start < 150:
+                while time.time() - start < 2100:
+                    mc = None
                     try:
+                        NodeHelper._log.info("Sleep for 1 minute to aviod timing issues")
+                        time.sleep(60)
                         mc = MemcachedClientHelper.direct_client(server, bucket)
                         if mc.stats()["ep_warmup_thread"] == "complete":
                             NodeHelper._log.info(
@@ -356,10 +607,10 @@ class NodeHelper:
                     except Exception as e:
                         NodeHelper._log.info(e)
                         time.sleep(10)
-                if mc.stats()["ep_warmup_thread"] == "running":
-                    NodeHelper._log.info(
-                        "ERROR: ep_warmup_thread's status not complete")
-                mc.close()
+                    if mc.stats()["ep_warmup_thread"] == "running":
+                        NodeHelper._log.info(
+                            "ERROR: ep_warmup_thread's status not complete")
+                    mc.close()
 
     @staticmethod
     def wait_node_restarted(
@@ -462,27 +713,27 @@ class NodeHelper:
         return version[:version.rfind('-')]
 
     @staticmethod
-    def get_cbcollect_info(server):
+    def get_cbcollect_info(servers):
         """Collect cbcollectinfo logs for all the servers in the cluster.
         """
         path = TestInputSingleton.input.param("logs_folder", "/tmp")
-        print(("grabbing cbcollect from {0}".format(server.ip)))
         path = path or "."
-        try:
-            cbcollectRunner(server, path).run()
+        runner = cbcollectRunner(servers, path)
+        runner.run()
+        if len(runner.succ) > 0:
             TestInputSingleton.input.test_params[
                 "get-cbcollect-info"] = False
-        except Exception as e:
+        for (server, e) in runner.fail:
             NodeHelper._log.error(
                 "IMPOSSIBLE TO GRAB CBCOLLECT FROM {0}: {1}".format(
                     server.ip,
                     e))
 
     @staticmethod
-    def collect_logs(server):
+    def collect_logs(servers):
         """Grab cbcollect before we cleanup
         """
-        NodeHelper.get_cbcollect_info(server)
+        NodeHelper.get_cbcollect_info(servers)
 
 
 class FloatingServers:
@@ -511,7 +762,8 @@ class FTSIndex:
 
     def __init__(self, cluster, name, source_type='couchbase',
                  source_name=None, index_type='fulltext-index', index_params=None,
-                 plan_params=None, source_params=None, source_uuid=None):
+                 plan_params=None, source_params=None, source_uuid=None, dataset=None, index_storage_type=None,
+                 type_mapping=None, collection_index=False, scope=None, collections=None):
 
         """
          @param name : name of index/alias
@@ -539,7 +791,13 @@ class FTSIndex:
         self._source_name = source_name
         self._one_time = False
         self.index_type = index_type
-        self.index_storage_type = TestInputSingleton.input.param("index_type", None)
+        self.collection_index = collection_index
+        self.scope = scope
+        self.collections = collections
+        if not index_storage_type:
+            self.index_storage_type = TestInputSingleton.input.param("index_type", None)
+        else:
+            self.index_storage_type = index_storage_type
         self.num_pindexes = 0
         self.index_definition = {
             "type": "fulltext-index",
@@ -564,17 +822,20 @@ class FTSIndex:
             self.index_definition['sourceType'] = self._source_type
             self.index_definition['sourceName'] = self._source_name
 
-        self.dataset = TestInputSingleton.input.param("dataset", "emp")
+        self.dataset = dataset
+        if not self.dataset:
+            self.dataset = TestInputSingleton.input.param("dataset", "emp")
 
         # Support for custom map
         self.custom_map = TestInputSingleton.input.param("custom_map", False)
         self.custom_map_add_non_indexed_fields = TestInputSingleton.input.param("custom_map_add_non_indexed_fields",
                                                                                 True)
         self.num_custom_analyzers = TestInputSingleton.input.param("num_custom_analyzers", 0)
+        self.text_analyzer = TestInputSingleton.input.param("text_analyzer", None)
         self.multiple_filters = TestInputSingleton.input.param("multiple_filters", False)
         self.cm_id = TestInputSingleton.input.param("cm_id", 0)
         if self.custom_map:
-            self.generate_new_custom_map(seed=self.cm_id)
+            self.generate_new_custom_map(seed=self.cm_id, type_mapping=type_mapping, collection_index=collection_index)
 
         self.fts_queries = []
 
@@ -634,6 +895,9 @@ class FTSIndex:
                 self.index_definition['params']['store'] = {}
             self.index_definition['params']['store']['kvStoreMossAllow'] = False
 
+    def get_cluster(self):
+        return self.__cluster
+
     def is_scorch(self):
         return self.get_index_type() == "scorch"
 
@@ -655,12 +919,13 @@ class FTSIndex:
             self.__log.error("No 'indexType' present in index definition")
             return None
 
-    def generate_new_custom_map(self, seed):
+    def generate_new_custom_map(self, seed, type_mapping=None, collection_index=False):
         from .custom_map_generator.map_generator import CustomMapGenerator
         cm_gen = CustomMapGenerator(seed=seed, dataset=self.dataset,
                                     num_custom_analyzers=self.num_custom_analyzers,
                                     multiple_filters=self.multiple_filters,
-                                    custom_map_add_non_indexed_fields=self.custom_map_add_non_indexed_fields)
+                                    custom_map_add_non_indexed_fields=self.custom_map_add_non_indexed_fields,
+                                    text_analyzer=self.text_analyzer, type_mapping=type_mapping, collection_index=collection_index)
         fts_map, self.es_custom_map = cm_gen.get_map()
         self.smart_query_fields = cm_gen.get_smart_query_fields()
         print((self.smart_query_fields))
@@ -695,8 +960,10 @@ class FTSIndex:
                     ["analysis"]["analyzers"]["customAnalyzer1"]["token_filters"]
                 for custom_filter in custom_filters:
                     self.__log.info("custom filter = " + custom_filter)
-                    del self.index_definition['params']['mapping']['analysis'] \
-                        ['token_filters'][custom_filter]
+                    if custom_filter in self.index_definition['params']['mapping']['analysis'] \
+                        ['token_filters'].keys():
+                        del self.index_definition['params']['mapping']['analysis'] \
+                            ['token_filters'][custom_filter]
             else:
                 from .custom_map_generator.map_generator import CustomMapGenerator
                 cm_gen = CustomMapGenerator(seed=seed, dataset=self.dataset,
@@ -745,7 +1012,6 @@ class FTSIndex:
         child_field['fields'] = [
             {
                 "analyzer": analyzer,
-                "display_order": "0",
                 "include_in_all": True,
                 "include_term_vectors": True,
                 "index": True,
@@ -779,6 +1045,53 @@ class FTSIndex:
             self.index_definition['params']['mapping']['default_mapping'] \
                 ['properties'][fields.pop()] = field_maps.pop()
 
+    def add_child_field_to_default_collection_mapping(self, field_name, field_type,
+                                           field_alias=None, analyzer=None, scope=None, collection=None):
+        """
+        This method will add a field mapping to a default mapping
+        """
+        fields = str.split(field_name, '.')
+        nesting_level = len(fields)
+
+        child_map = {}
+        child_map['dynamic'] = False
+        child_map['enabled'] = True
+        child_map['properties'] = {}
+
+        child_field = {}
+        child_field['dynamic'] = False
+        child_field['enabled'] = True
+        if not field_alias:
+            field_alias = fields[len(fields) - 1]
+        child_field['fields'] = [
+            {
+                "analyzer": analyzer,
+                "include_in_all": True,
+                "include_term_vectors": True,
+                "index": True,
+                "name": field_alias,
+                "store": True,
+                "type": field_type
+            }
+        ]
+
+        field_maps = []
+        field_maps.append(child_field)
+
+        if nesting_level > 1:
+            for x in range(0, nesting_level - 1):
+                field = fields.pop()
+                # Do a deepcopy of child_map into field_map since we dont
+                # want to have child_map altered because of changes on field_map
+                field_map = copy.deepcopy(child_map)
+                field_map['properties'][field] = field_maps.pop()
+                field_maps.append(field_map)
+
+        map = {}
+        if 'properties' not in self.index_definition['params']['mapping']['types'][f'{scope}.{collection}']:
+            self.index_definition['params']['mapping']['types'][f'{scope}.{collection}']['properties'] = {}
+        self.index_definition['params']['mapping']['types'][f'{scope}.{collection}']['properties'][fields.pop()] = field_maps.pop()
+
     def add_analyzer_to_existing_field_map(self, field_name, field_type,
                                            field_alias=None, analyzer=None):
         """
@@ -792,7 +1105,6 @@ class FTSIndex:
 
         child_field = {
             "analyzer": analyzer,
-            "display_order": "0",
             "include_in_all": True,
             "include_term_vectors": True,
             "index": True,
@@ -832,7 +1144,6 @@ class FTSIndex:
         type_map = {}
         type_map[type] = {}
         type_map[type]['default_analyzer'] = analyzer
-        type_map[type]['display_order'] = 0
         type_map[type]['dynamic'] = True
         type_map[type]['enabled'] = True
 
@@ -917,6 +1228,16 @@ class FTSIndex:
         rest.create_fts_index(self.name, self.index_definition)
         self.__cluster.get_indexes().append(self)
 
+    def create_no_check(self, rest=None):
+        if not rest:
+            rest = RestConnection(self.__cluster.get_random_fts_node())
+        self.__log.info("Creating {0} {1} on {2}".format(
+            self.index_type,
+            self.name,
+            rest.ip))
+        rest.create_fts_index(self.name, self.index_definition)
+        self.__cluster.get_indexes().append(self)
+
     def update(self, rest=None):
         if not rest:
             rest = RestConnection(self.__cluster.get_random_fts_node())
@@ -925,8 +1246,8 @@ class FTSIndex:
             self.name,
             rest.ip))
         rest.update_fts_index(self.name, self.index_definition)
-        self.__log.info("sleeping for 200")
-        time.sleep(200)
+        #self.__log.info("sleeping for 200")
+        #time.sleep(200)
 
     def update_index_to_upside_down(self):
         if self.is_upside_down():
@@ -970,10 +1291,10 @@ class FTSIndex:
         self.index_definition['uuid'] = self.get_uuid()
         self.update()
 
-    def update_docvalues_email_custom_index(self, new):
+    def update_docvalues_email_custom_index(self, new, type):
         status, index_def = self.get_index_defn()
         self.index_definition = index_def["indexDef"]
-        self.index_definition['params']['mapping']['types']['emp']['properties']['email']['fields'][0][
+        self.index_definition['params']['mapping']['types'][type]['properties']['join_date']['fields'][0][
             'docvalues'] = new
         self.index_definition['uuid'] = self.get_uuid()
         self.update()
@@ -983,6 +1304,9 @@ class FTSIndex:
         self.index_definition['uuid'] = self.get_uuid()
         self.update()
 
+    def get_num_replicas(self):
+        return self.index_definition['planParams']['numReplicas']
+
     def delete(self, rest=None):
         if not rest:
             rest = RestConnection(self.__cluster.get_random_fts_node())
@@ -990,7 +1314,9 @@ class FTSIndex:
             self.index_type,
             self.name,
             rest.ip))
-        status = rest.delete_fts_index(self.name)
+        status, content, header = rest.delete_fts_index_extended_output(self.name)
+        content1 = content.decode()
+        content_json = json.loads(str(content1))
         if status:
             self.__cluster.get_indexes().remove(self)
             if not self.__cluster.are_index_files_deleted_from_disk(self.name):
@@ -999,6 +1325,9 @@ class FTSIndex:
             else:
                 self.__log.info("Validated: all index files for {0} deleted from "
                                 "disk".format(self.name))
+        elif not status and "index not found" in content_json['error']:
+            self.__log.warning(f"The following index is found in testware cluster, but is not found in CB cluster: {self.name}. Testware cluster is cleaned up.")
+            self.__cluster.get_indexes().remove(self)
         else:
             raise FTSException("Index/alias {0} not deleted".format(self.name))
 
@@ -1029,6 +1358,9 @@ class FTSIndex:
 
     def get_src_bucket_doc_count(self):
         return self.__cluster.get_doc_count_in_bucket(self.source_bucket)
+
+    def get_src_collections_doc_count(self):
+        return self.__cluster.get_doc_count_in_collections(self.source_bucket, self.scope, self.collections)
 
     def get_uuid(self):
         rest = RestConnection(self.__cluster.get_random_fts_node())
@@ -1145,7 +1477,7 @@ class FTSIndex:
                       return_raw_hits=False, sort_fields=None,
                       explain=False, show_results_from_item=0, highlight=False,
                       highlight_style=None, highlight_fields=None, consistency_level='',
-                      consistency_vectors={}, timeout=60000, rest=None, score='', expected_no_of_results=None):
+                      consistency_vectors={}, timeout=60000, rest=None, score='', expected_no_of_results=None, node=None):
         """
         Takes a query dict, constructs a json, runs and returns results
         """
@@ -1173,12 +1505,17 @@ class FTSIndex:
             else:
                 rest_timeout = timeout // 1000 + 10
             hits, matches, time_taken, status = \
-                self.__cluster.run_fts_query(self.name, query_dict, timeout=rest_timeout)
+                self.__cluster.run_fts_query(self.name, query_dict, node=node, timeout=rest_timeout)
         except ServerUnavailableException:
+            if zero_results_ok and (expected_hits is None or expected_hits <= 0):
+                return hits, doc_ids, time_taken, status
             # query time outs
             raise ServerUnavailableException
         except Exception as e:
             self.__log.error("Error running query: %s" % e)
+
+        if status == 'fail':
+            return hits, matches, time_taken, status
         if hits:
             for doc in matches:
                 doc_ids.append(doc['id'])
@@ -1677,6 +2014,7 @@ class CouchbaseCluster:
         self._kv_gen = {}
         self.__indexes = []
         self.__fts_nodes = []
+        self.__kv_nodes = []
         self.__non_fts_nodes = []
         # to avoid querying certain nodes that undergo crash/reboot scenarios
         self.__bypass_fts_nodes = []
@@ -1709,6 +2047,9 @@ class CouchbaseCluster:
                 cluster_run = True
         return cluster_run
 
+    def async_log_scan(self, servers, file_prefix):
+        return self.__clusterop.async_log_scan(servers, file_prefix)
+
     def __separate_nodes_on_services(self):
         self.__fts_nodes = []
         self.__n1ql_nodes = []
@@ -1730,9 +2071,17 @@ class CouchbaseCluster:
                 if "n1ql" in services:
                     self.__n1ql_nodes.append(node)
 
+                if "kv" in services:
+                    if node not in self.__kv_nodes:
+                        self.__kv_nodes.append(node)
+
     def get_fts_nodes(self):
         self.__separate_nodes_on_services()
         return self.__fts_nodes
+
+    def get_kv_nodes(self):
+        self.__separate_nodes_on_services()
+        return self.__kv_nodes
 
     def get_num_fts_nodes(self):
         return len(self.get_fts_nodes())
@@ -1872,12 +2221,18 @@ class CouchbaseCluster:
             node_services = []
             node_num = 0
             for index, node_service in enumerate(cluster_services):
+                print(f"index ::{index}:: node_service ::{node_service}::")
+                print(f"cluster_services ::{cluster_services}::")
                 if index == 0 and node_service == "kv":
                     continue
+                print(f"available nodes ::{available_nodes}::")
+                print(f"node_num {node_num}")
+                node_to_add = available_nodes[node_num]
                 self.__log.info("%s will be configured with services %s" % (
-                    available_nodes[node_num].ip,
+                    node_to_add.ip,
                     node_service))
-                nodes_to_add.append(available_nodes[node_num])
+                node_to_add.services = node_service
+                nodes_to_add.append(node_to_add)
                 node_services.append(node_service)
                 node_num = node_num + 1
             try:
@@ -1948,7 +2303,8 @@ class CouchbaseCluster:
 
     def _create_bucket_params(self, server, replicas=1, size=0, port=11211, password=None,
                               bucket_type='membase', enable_replica_index=1, eviction_policy='valueOnly',
-                              bucket_priority=None, flush_enabled=1, lww=False, maxttl=None):
+                              bucket_priority=None, flush_enabled=1, lww=False, maxttl=None,
+                              bucket_storage='couchstore'):
         """Create a set of bucket_parameters to be sent to all of the bucket_creation methods
         Parameters:
             server - The server to create the bucket on. (TestInputServer)
@@ -1980,13 +2336,16 @@ class CouchbaseCluster:
         bucket_params['flush_enabled'] = flush_enabled
         bucket_params['lww'] = lww
         bucket_params['maxTTL'] = maxttl
+        if bucket_type == "membase":
+            bucket_params['bucket_storage'] = bucket_storage
         return bucket_params
 
     def create_sasl_buckets(
             self, bucket_size, num_buckets=1, num_replicas=1,
             eviction_policy=EVICTION_POLICY.VALUE_ONLY,
             bucket_priority=BUCKET_PRIORITY.HIGH,
-            bucket_type=None, maxttl=None):
+            bucket_type=None, maxttl=None,
+            bucket_storage='couchstore'):
         """Create sasl buckets.
         @param bucket_size: size of the bucket.
         @param num_buckets: number of buckets to create.
@@ -2005,28 +2364,87 @@ class CouchbaseCluster:
                 eviction_policy=eviction_policy,
                 bucket_priority=bucket_priority,
                 bucket_type=bucket_type,
-                maxttl=maxttl)
+                maxttl=maxttl,
+                bucket_storage=bucket_storage)
 
             bucket_tasks.append(self.__clusterop.async_create_sasl_bucket(name=name, password='password',
                                                                           bucket_params=sasl_params))
             self.__buckets.append(
                 Bucket(
-                    name=name, authType="sasl", saslPassword="password",
+                    name=name,
                     num_replicas=num_replicas, bucket_size=bucket_size,
                     eviction_policy=eviction_policy,
                     bucket_priority=bucket_priority,
-                    maxttl=maxttl
+                    maxttl=maxttl,
+                    bucket_storage=bucket_storage
                 ))
 
         for task in bucket_tasks:
             task.result()
+
+    def create_bucket_scope_collection_multi_structure(self, existing_buckets=None, bucket_params=None,
+                                                       data_structure=None, cli_client=None):
+        if data_structure is None:
+            data_structure = {}
+        if bucket_params is None:
+            bucket_params = {}
+        if existing_buckets is None:
+            existing_buckets = []
+        try:
+            buckets = data_structure["buckets"]
+            for bucket in buckets:
+                if bucket not in existing_buckets:
+                    self.create_standard_buckets(bucket_size=100, name=bucket["name"])
+                if "scopes" in bucket.keys():
+                    scopes = bucket["scopes"]
+                    for scope in scopes:
+                        if not scope["name"] == "_default":
+                            result = self._create_scope(bucket=bucket["name"], scope=scope["name"], cli_client=cli_client)
+                            if not result:
+                                return False, f"Scope {scope['name']} creation is failed."
+                        collections = scope["collections"]
+                        for collection in collections:
+                            result = self._create_collection(bucket=bucket["name"], scope=scope["name"],
+                                                            collection=collection["name"], cli_client=cli_client)
+                            if not result:
+                                return False, f"Collection {collection['name']} creation is failed."
+        except Exception as err:
+            return False, str(err)
+        return True, ""
+
+    def _create_collection(self, bucket=None, scope=None, collection=None, cli_client=None):
+        if scope != '_default':
+            stdout,_,_ = cli_client.get_bucket_scopes(bucket=bucket)
+            if scope not in stdout:
+                cli_client.create_scope(bucket=bucket, scope=scope)
+                time.sleep(10)
+        if collection != '_default':
+            return cli_client.create_collection(bucket=bucket, scope=scope, collection=collection)
+        else:
+            return True
+
+    def _drop_collection(self, bucket=None, scope=None, collection=None, cli_client=None):
+        cli_client.delete_collection(bucket=bucket, scope=scope, collection=collection)
+
+    def _create_scope(self, bucket=None, scope=None, cli_client=None):
+        status = False
+        if scope != '_default':
+            stdout,_,status = cli_client.get_bucket_scopes(bucket=bucket)
+            if scope not in stdout:
+                cli_client.create_scope(bucket=bucket, scope=scope)
+                time.sleep(10)
+        return status
+
+    def _drop_scope(self, bucket=None, scope=None, cli_client=None):
+        cli_client.delete_scope(bucket=bucket, scope=scope)
 
     def create_standard_buckets(
             self, bucket_size, name=None, num_buckets=1,
             port=None, num_replicas=1,
             eviction_policy=EVICTION_POLICY.VALUE_ONLY,
             bucket_priority=BUCKET_PRIORITY.HIGH,
-            bucket_type=None, maxttl=None):
+            bucket_type=None, maxttl=None,
+            bucket_storage='couchstore'):
         """Create standard buckets.
         @param bucket_size: size of the bucket.
         @param num_buckets: number of buckets to create.
@@ -2052,7 +2470,8 @@ class CouchbaseCluster:
                 eviction_policy=eviction_policy,
                 bucket_priority=bucket_priority,
                 bucket_type=bucket_type,
-                maxttl=maxttl)
+                maxttl=maxttl,
+                bucket_storage=bucket_storage)
 
             bucket_tasks.append(
                 self.__clusterop.async_create_standard_bucket(
@@ -2062,14 +2481,13 @@ class CouchbaseCluster:
             self.__buckets.append(
                 Bucket(
                     name=name,
-                    authType=None,
-                    saslPassword=None,
                     num_replicas=num_replicas,
                     bucket_size=bucket_size,
                     port=start_port + i,
                     eviction_policy=eviction_policy,
                     bucket_priority=bucket_priority,
-                    maxttl=maxttl
+                    maxttl=maxttl,
+                    bucket_storage=bucket_storage
                 ))
 
         for task in bucket_tasks:
@@ -2079,7 +2497,9 @@ class CouchbaseCluster:
             self, bucket_size, num_replicas=1,
             eviction_policy=EVICTION_POLICY.VALUE_ONLY,
             bucket_priority=BUCKET_PRIORITY.HIGH,
-            bucket_type=None, maxttl=None):
+            bucket_type=None, maxttl=None,
+            bucket_storage='couchstore',
+            bucket_name=None):
         """Create default bucket.
         @param bucket_size: size of the bucket.
         @param num_replicas: number of replicas (1-3).
@@ -2093,25 +2513,27 @@ class CouchbaseCluster:
             eviction_policy=eviction_policy,
             bucket_priority=bucket_priority,
             bucket_type=bucket_type,
-            maxttl=maxttl
+            maxttl=maxttl,
+            bucket_storage=bucket_storage
         )
+        if bucket_name:
+            bucket_params['bucket_name'] = bucket_name
         self.__clusterop.create_default_bucket(bucket_params)
         self.__buckets.append(
             Bucket(
                 name=BUCKET_NAME.DEFAULT,
-                authType="sasl",
-                saslPassword="",
                 num_replicas=num_replicas,
                 bucket_size=bucket_size,
                 eviction_policy=eviction_policy,
                 bucket_priority=bucket_priority,
-                maxttl=maxttl
+                maxttl=maxttl,
+                bucket_storage=bucket_storage
             ))
 
     def create_fts_index(self, name, source_type='couchbase',
                          source_name=None, index_type='fulltext-index',
                          index_params=None, plan_params=None,
-                         source_params=None, source_uuid=None):
+                         source_params=None, source_uuid=None, collection_index=False, _type=None, analyzer="standard", scope=None, collections=None, no_check=False):
         """Create fts index/alias
         @param node: Node on which index is created
         @param name: name of the index/alias
@@ -2129,6 +2551,9 @@ class CouchbaseCluster:
                                 INDEX_DEFAULTS.SOURCE_CB_PARAMS or
                                 INDEX_DEFAULTS.SOURCE_FILE_PARAMS
         @param source_uuid: UUID of the source, may not be used
+        @param collection_index: is collection index
+        @param type: type mapping for collection index
+        @analyzer: index analyzer
         """
         index = FTSIndex(
             self,
@@ -2139,13 +2564,36 @@ class CouchbaseCluster:
             index_params,
             plan_params,
             source_params,
-            source_uuid
+            source_uuid,
+            type_mapping=_type,
+            collection_index=collection_index,
+            scope=scope,
+            collections=collections
         )
-        index.create()
+        if collection_index:
+            if not index.custom_map:
+                if type(_type) is list:
+                    for typ in _type:
+                        index.add_type_mapping_to_index_definition(type=typ, analyzer=analyzer)
+                else:
+                    index.add_type_mapping_to_index_definition(type=_type, analyzer=analyzer)
+
+            doc_config = {}
+            doc_config['mode'] = 'scope.collection.type_field'
+            doc_config['type_field'] = "type"
+            index.index_definition['params']['doc_config'] = {}
+            index.index_definition['params']['doc_config'] = doc_config
+
+        if no_check:
+            index.create_no_check()
+        else:
+            index.create()
         return index
 
-    def create_fts_index_wait_for_completion(self, sample_index_name_1, sample_bucket_name):
-        fts_idx = self.create_fts_index(name=sample_index_name_1, source_name=sample_bucket_name)
+    def create_fts_index_wait_for_completion(self, sample_index_name_1, sample_bucket_name,
+                                             collection_index=False, _type=None):
+        fts_idx = self.create_fts_index(name=sample_index_name_1, source_name=sample_bucket_name,
+                                        collection_index=collection_index, _type=_type)
 
         indexed_doc_count = 0
         self.__log.info(RestConnection(self.get_master_node()).get_buckets_itemCount()[sample_bucket_name])
@@ -2175,6 +2623,10 @@ class CouchbaseCluster:
         for index in self.__indexes:
             index.delete()
 
+    def clean_fts_indexes_array(self):
+        """ Delete all FTSIndex objects from self.__indexes """
+        self.__indexes.clear()
+
     def run_fts_query(self, index_name, query_dict, node=None, timeout=70):
         """ Runs a query defined in query_json against an index/alias and
         a specific node
@@ -2192,6 +2644,22 @@ class CouchbaseCluster:
             RestConnection(node).run_fts_query(index_name, query_dict, timeout=timeout)
         return total_hits, hit_list, time_taken, status
 
+    def run_fts_query_generalized(self, index_name, query_dict, node=None, timeout=70):
+        """ Runs a query defined in query_json against an index/alias and
+        a specific node
+
+        @return total_hits : total hits for the query,
+        @return hit_list : list of docs that match the query
+
+        """
+        if not node:
+            node = self.get_random_fts_node()
+        self.__log.info("Running query %s on node: %s:%s"
+                        % (json.dumps(query_dict, ensure_ascii=False),
+                           node.ip, node.fts_port))
+        content = RestConnection(node).run_fts_query_generalized(index_name, query_dict, timeout=timeout)
+        return content
+
     def run_n1ql_query(self, query="", node=None, timeout=70):
         """ Runs a query defined in query_json against an index/alias and
         a specific node
@@ -2199,7 +2667,7 @@ class CouchbaseCluster:
         """
         if not node:
             node = self.get_random_n1ql_node()
-        res = RestConnection(node).query_tool(query)
+        res = RestConnection(node).query_tool(query, timeout=timeout)
         return res
 
     def run_fts_query_with_facets(self, index_name, query_dict, node=None):
@@ -2239,6 +2707,13 @@ class CouchbaseCluster:
 
     def get_doc_count_in_bucket(self, bucket):
         return RestConnection(self.__master_node).get_active_key_count(bucket)
+
+    def get_doc_count_in_collections(self, bucket, scope, collections):
+        stat = CollectionsStats(self.__master_node)
+        count = 0
+        for c in collections:
+            count = count + stat.get_collection_item_count_cumulative(bucket, scope, c, self.get_kv_nodes())
+        return count
 
     def delete_bucket(self, bucket_name):
         """Delete bucket with given name
@@ -2351,7 +2826,8 @@ class CouchbaseCluster:
 
     def async_load_all_buckets(self, num_items, exp=0,
                                kv_store=1, flag=0, only_store_hash=True,
-                               batch_size=1000, pause_secs=1, timeout_secs=30):
+                               batch_size=1000, pause_secs=1, timeout_secs=30, container_type='bucket',
+                               scope=None, collection=None):
         """Load data asynchronously on all buckets of the cluster.
         Function don't wait for load data to finish, return immidiately.
         @param num_items: number of items to load
@@ -2366,10 +2842,18 @@ class CouchbaseCluster:
         @return: task objects list
         """
         prefix = "%s-" % self.__name
-        self._kv_gen[OPS.CREATE] = JsonDocGenerator(prefix,
-                                                    encoding="utf-8",
-                                                    start=0,
-                                                    end=num_items)
+        if container_type == 'collection':
+            self._kv_gen[OPS.CREATE] = SDKDataLoader(num_ops=num_items, percent_create=100,
+                                                     percent_update=0, percent_delete=0,
+                                                     load_pattern="uniform", start_seq_num=1, key_prefix=prefix,
+                                                     key_suffix="",
+                                                     scope=scope, collection=collection, json_template="emp",
+                                                     start=0, end=0, op_type="create")
+        else:
+            self._kv_gen[OPS.CREATE] = JsonDocGenerator(prefix,
+                                                        encoding="utf-8",
+                                                        start=0,
+                                                        end=num_items)
         tasks = []
         for bucket in self.__buckets:
             gen = copy.deepcopy(self._kv_gen[OPS.CREATE])
@@ -2383,7 +2867,8 @@ class CouchbaseCluster:
 
     def load_all_buckets(self, num_items, value_size=512, exp=0,
                          kv_store=1, flag=0, only_store_hash=True,
-                         batch_size=1000, pause_secs=1, timeout_secs=30):
+                         batch_size=1000, pause_secs=1, timeout_secs=30,
+                         container_type='bucket', scope=None, collection=None):
         """Load data synchronously on all buckets. Function wait for
         load data to finish.
         @param num_items: number of items to load
@@ -2398,7 +2883,7 @@ class CouchbaseCluster:
         """
         tasks = self.async_load_all_buckets(
             num_items, exp, kv_store, flag, only_store_hash,
-            batch_size, pause_secs, timeout_secs)
+            batch_size, pause_secs, timeout_secs, container_type=container_type, scope=scope, collection=collection)
         for task in tasks:
             task.result()
 
@@ -2444,12 +2929,29 @@ class CouchbaseCluster:
             self.__buckets = RestConnection(self.__master_node).get_buckets()
         for bucket in self.__buckets:
             kv_gen = copy.deepcopy(self._kv_gen[ops])
-            tasks.append(
-                self.__clusterop.async_load_gen_docs(
-                    self.__master_node, bucket.name, kv_gen,
-                    bucket.kvs[kv_store], ops, exp, flag,
-                    only_store_hash, batch_size, pause_secs, timeout_secs, compression=self.sdk_compression)
-            )
+            if isinstance(kv_gen, list):
+                if kv_gen[0].isGenerator():
+                    tasks.append(
+                        self.__clusterop.async_load_gen_docs(
+                            self.__master_node, bucket.name, kv_gen,
+                            bucket.kvs[kv_store], ops, exp, flag,
+                            only_store_hash, batch_size, pause_secs, timeout_secs, compression=self.sdk_compression)
+                    )
+                else:
+                    for g in kv_gen:
+                        tasks.append(
+                            self.__clusterop.async_load_gen_docs(
+                                self.__master_node, bucket.name, g,
+                                bucket.kvs[kv_store], ops, exp, flag,
+                                only_store_hash, batch_size, pause_secs, timeout_secs, compression=self.sdk_compression)
+                        )
+            else:
+                tasks.append(
+                    self.__clusterop.async_load_gen_docs(
+                        self.__master_node, bucket.name, kv_gen,
+                        bucket.kvs[kv_store], ops, exp, flag,
+                        only_store_hash, batch_size, pause_secs, timeout_secs, compression=self.sdk_compression)
+                )
         return tasks
 
     def async_load_bucket_from_generator(self, bucket, kv_gen, ops=OPS.CREATE, exp=0,
@@ -2684,7 +3186,8 @@ class CouchbaseCluster:
             )
         return tasks
 
-    def async_run_fts_query_compare(self, fts_index, es, query_index, es_index_name=None, n1ql_executor=None):
+    def async_run_fts_query_compare(self, fts_index, es, query_index, es_index_name=None, n1ql_executor=None,
+                                    use_collections=False):
         """
         Asynchronously run query against FTS and ES and compare result
         note: every task runs a single query
@@ -2693,7 +3196,8 @@ class CouchbaseCluster:
                                                             es_instance=es,
                                                             query_index=query_index,
                                                             es_index_name=es_index_name,
-                                                            n1ql_executor=n1ql_executor)
+                                                            n1ql_executor=n1ql_executor,
+                                                            use_collections=use_collections)
         return task
 
     def run_expiry_pager(self, val=10):
@@ -2753,6 +3257,24 @@ class CouchbaseCluster:
 
         return task
 
+    def __async_rebalance_out_node(self, node=None, sleep_before_rebalance=None):
+        """Rebalance-out nodes from Cluster
+        @param node: Node to rebalance-out.
+        @param sleep_before_rebalance: Sleep between taking out and rebalance.
+        """
+        raise_if(
+            len(self.__nodes) <= 1,
+            FTSException(
+                "Cluster needs at least 2 nodes for rebalance-out, current: 1"))
+        self.__log.info(
+            "Starting rebalance-out nodes:{0} at {1} cluster {2}".format(
+                node, self.__name, self.__master_node.ip))
+        task = self.__clusterop.async_rebalance(self.__nodes, [], [node], sleep_before_rebalance=sleep_before_rebalance)
+
+        self.__nodes.remove(node)
+
+        return task
+
     def async_rebalance_out_master(self):
         return self.__async_rebalance_out(master=True)
 
@@ -2766,6 +3288,11 @@ class CouchbaseCluster:
     def rebalance_out(self, num_nodes=1):
         task = self.__async_rebalance_out(num_nodes=num_nodes)
         task.result()
+
+    def rebalance_out_node(self, node=None, sleep_before_rebalance=None):
+        task = self.__async_rebalance_out_node(node=node, sleep_before_rebalance=sleep_before_rebalance)
+        task.result()
+        return task
 
     def enable_retry_rebalance(self, retry_time, num_retries):
         body = {"enabled": "true", "afterTimePeriod": retry_time, "maxAttempts": num_retries}
@@ -2801,11 +3328,38 @@ class CouchbaseCluster:
         self.__nodes.extend(to_add_node)
         return task
 
+    def async_rebalance_in_node(self, nodes_in=None, services=None, sleep_before_rebalance=0):
+        """Rebalance-in single node into Cluster asynchronously
+        @param node_in: node to rebalance-in to cluster.
+        @param services: services list for a new node
+        @param sleep_before_rebalance: sleep between nede addition and cluster rebalance
+        """
+        if isinstance(nodes_in, list):
+            to_add_nodes = []
+            for n in nodes_in:
+                to_add_nodes.append(n)
+        else:
+            to_add_nodes = [nodes_in]
+        self.__log.info(
+            "Starting rebalance-in nodes:{0} at {1} cluster {2}".format(
+                to_add_nodes, self.__name, self.__master_node.ip))
+        task = self.__clusterop.async_rebalance(self.__nodes, to_add_nodes, [],
+                                                services=services, sleep_before_rebalance=sleep_before_rebalance)
+        self.__nodes.extend(to_add_nodes)
+        return task
+
     def rebalance_in(self, num_nodes=1, services=None):
         """Rebalance-in nodes
         @param num_nodes: number of nodes to add to cluster.
         """
         task = self.async_rebalance_in(num_nodes, services=services)
+        task.result()
+
+    def rebalance_in_node(self, nodes_in=None, services=None, sleep_before_rebalance=0):
+        """Rebalance-in nodes
+        @param num_nodes: number of nodes to add to cluster.
+        """
+        task = self.async_rebalance_in_node(nodes_in=nodes_in, services=services, sleep_before_rebalance=sleep_before_rebalance)
         task.result()
 
     def __async_swap_rebalance(self, master=False, num_nodes=1, services=None):
@@ -2889,7 +3443,7 @@ class CouchbaseCluster:
         return tasks
 
     def failover(self, master=False, num_nodes=1,
-                 graceful=False):
+                 graceful=False, node=None):
         """synchronously failover nodes from Cluster
         @param master: True if failover master node only.
         @param num_nodes: number of nodes to rebalance-out from cluster.
@@ -2897,7 +3451,7 @@ class CouchbaseCluster:
         """
         task = self.__async_failover(master=master,
                                      num_nodes=num_nodes,
-                                     graceful=graceful)
+                                     graceful=graceful, node=node)
         task.result()
 
     def __async_failover(self, master=False, num_nodes=1, graceful=False, node=None):
@@ -2971,6 +3525,26 @@ class CouchbaseCluster:
         self.__clusterop.rebalance(self.__nodes, [], self.__fail_over_nodes)
         [self.__nodes.remove(node) for node in self.__fail_over_nodes]
         self.__fail_over_nodes = []
+
+    def add_back_specific_node(self, recovery_type=None, services=None, node=None):
+        """add-back failed-over node to the cluster.
+            @param recovery_type: delta/full
+        """
+        rest = RestConnection(self.__master_node)
+        if recovery_type:
+            rest.set_recovery_type(otpNode=node.id, recoveryType=recovery_type)
+
+        server_nodes = rest.node_statuses()
+        for server_node in server_nodes:
+            if node.ip == server_node.ip:
+                rest.add_back_node(server_node.id)
+                break
+        for nd in self.__fail_over_nodes:
+            if nd not in self.__nodes:
+                self.__nodes.append(nd)
+        self.__clusterop.rebalance(self.__nodes, [], [], services=services)
+        self.__fail_over_nodes = []
+
 
     def add_back_node(self, recovery_type=None, services=None):
         """add-back failed-over node to the cluster.
@@ -3106,7 +3680,25 @@ class FTSBaseTest(unittest.TestCase):
         self.field_alias = self._input.param("field_alias", None)
         self.enable_secrets = self._input.param("enable_secrets", False)
         self.secret_password = self._input.param("secret_password", 'p@ssw0rd')
+        self.container_type = TestInputSingleton.input.param("container_type", "bucket")
+        self.scope = TestInputSingleton.input.param("scope", "scope1")
+        self.skip_log_scan = self._input.param("skip_log_scan", False)
+        self.collection = str(TestInputSingleton.input.param("collection", "collection1"))
+        if self.collection.startswith("["):
+            self.collection = eval(self.collection)
+        use_hostanames = self._input.param("use_hostnames", False)
+        sdk_compression = self._input.param("sdk_compression", True)
+        self.num_index_partitions = TestInputSingleton.input.param("num_partitions", 1)
 
+        self.master = self._input.servers[0]
+        first_node = copy.deepcopy(self.master)
+        self.cli_client = CollectionsCLI(self.master)
+
+        self._cb_cluster = CouchbaseCluster("C1",
+                                            [first_node],
+                                            self.log,
+                                            use_hostanames,
+                                            sdk_compression=sdk_compression)
         self.log.info(
             "==== FTSbasetests setup is started for test #{0} {1} ===="
                 .format(self.__case_number, self._testMethodName))
@@ -3114,16 +3706,39 @@ class FTSBaseTest(unittest.TestCase):
         # workaround for MB-16794
         # self.sleep(30, "working around MB-16794")
 
+        self.java_sdk_client = self._input.param("java_sdk_client", False)
+        if self.java_sdk_client:
+            self.log.info("Building docker image with java sdk client")
+            JavaSdkSetup()
+
         self.__setup_for_test()
 
         self.log.info(
             "==== FTSbasetests setup is finished for test #{0} {1} ===="
                 .format(self.__case_number, self._testMethodName))
+        if not self.skip_log_scan:
+            self.log_scan_file_prefix = f'{self._testMethodName}_test_{self.__case_number}'
+            _tasks = self._cb_cluster.async_log_scan(self._input.servers, self.log_scan_file_prefix+"_BEFORE")
+            for _task in _tasks:
+                _task.result()
+
+    def __decode_fail(self, errors):
+        for err in errors:
+            if err[0] is self:
+                if err[1]:
+                    return err[1]
+        return None
 
     def __is_test_failed(self):
-        return (hasattr(self, '_resultForDoCleanups')
-                and len(self._resultForDoCleanups.failures
-                        or self._resultForDoCleanups.errors)) \
+        test_failed = False
+        if hasattr(self, '_outcome'):
+            result = self.defaultTestResult()
+            self._feedErrorsToResult(result, self._outcome.errors)
+            error = self.__decode_fail(result.errors)
+            failure = self.__decode_fail(result.failures)
+            test_failed = error or failure
+
+        return test_failed \
                or (hasattr(self, '_exc_info')
                    and self._exc_info()[1] is not None)
 
@@ -3169,22 +3784,60 @@ class FTSBaseTest(unittest.TestCase):
                 self.log.info("Retry rebalanced fixed the rebalance failure")
                 break
 
+    def compare_logscan_keyword_count(self):
+        keyword_count_before_filename = self.log_scan_file_prefix+"_BEFORE"
+        keyword_count_after_filename = self.log_scan_file_prefix+"_AFTER"
+        keyword_count_diff = {}
+        for server in self._input.servers:
+            before_keyword_counts = {}
+            after_keyword_counts = {}
+            before_file_exists = False
+            after_file_exists = False
+            if os.path.exists(f'{server.ip}_{keyword_count_before_filename}'):
+                before_file_exists = True
+                s = open(f'{server.ip}_{keyword_count_before_filename}', 'r').read()
+                before_keyword_counts = ast.literal_eval(s)
+                os.remove(f'{server.ip}_{keyword_count_before_filename}')
+            if os.path.exists(f'{server.ip}_{keyword_count_after_filename}'):
+                after_file_exists = True
+                s = open(f'{server.ip}_{keyword_count_after_filename}', 'r').read()
+                after_keyword_counts = ast.literal_eval(s)
+                os.remove(f'{server.ip}_{keyword_count_after_filename}')
+
+            if before_file_exists and after_file_exists:
+                for log, keyword_count in after_keyword_counts.items():
+                    if log in before_keyword_counts.keys():
+                        for keyword, count in keyword_count.items():
+                            if keyword in before_keyword_counts[log].keys():
+                                if count > before_keyword_counts[log][keyword]:
+                                    keyword_count_diff[f'{server.ip}:{log}:{keyword}'] = int(count) - int(before_keyword_counts[log][keyword])
+                            else:
+                                keyword_count_diff[f'{server.ip}:{log}:{keyword}'] = count
+                    else:
+                        keyword_count_diff[f'{server.ip}:{log}'] = keyword_count
+
+        return keyword_count_diff
+
     def tearDown(self):
         """Clusters cleanup"""
-        if len(self.__report_error_list) > 0:
-            error_logger = self.check_error_count_in_fts_log()
-            if error_logger:
-                self.fail("Errors found in logs : {0}".format(error_logger))
-        
+        self.log_scan_file_prefix = f'{self._testMethodName}_test_{self.__case_number}'
+        collect_logs = False
+        keyword_count_diff = {}
+        if not self.skip_log_scan:
+            _tasks = self._cb_cluster.async_log_scan(self._input.servers, self.log_scan_file_prefix+"_AFTER")
+            for _task in _tasks:
+                _task.result()
+
+            keyword_count_diff = self.compare_logscan_keyword_count()
+            if keyword_count_diff:
+                collect_logs = True
+
         if self.enable_secrets:
             self._setup_node_secret("")
 
         if self._input.param("negative_test", False):
-            if hasattr(self, '_resultForDoCleanups') \
-                    and len(self._resultForDoCleanups.failures
-                            or self._resultForDoCleanups.errors):
-                self._resultForDoCleanups.failures = []
-                self._resultForDoCleanups.errors = []
+            if hasattr(self, '_outcome') and self._outcome.errors[1][1]:
+                self._outcome.errors = []
                 self.log.info("This is marked as a negative test and contains "
                               "errors as expected, hence not failing it")
             else:
@@ -3195,10 +3848,8 @@ class FTSBaseTest(unittest.TestCase):
 
         # collect logs before tearing down clusters
         if self._input.param("get-cbcollect-info", False) and \
-                self.__is_test_failed():
-            for server in self._input.servers:
-                self.log.info("Collecting logs @ {0}".format(server.ip))
-                NodeHelper.collect_logs(server)
+                self.__is_test_failed() or collect_logs:
+            NodeHelper.collect_logs(self._input.servers)
 
         # ---backup pindex_data if the test has failed
         # if self._input.param('backup_pindex_data', False) and \
@@ -3239,6 +3890,8 @@ class FTSBaseTest(unittest.TestCase):
                 #self.log.info(str(ins))
                 ins.close()
             self.__cluster_op.shutdown(force=True)
+            if not self.skip_log_scan and keyword_count_diff:
+                self.fail(f'Log scan completed, detected new occurrences of error keywords : {keyword_count_diff}')
             unittest.TestCase.tearDown(self)
 
     def __init_logger(self):
@@ -3288,22 +3941,26 @@ class FTSBaseTest(unittest.TestCase):
         role_list = [{'id': 'cbadminbucket', 'name': 'cbadminbucket', 'roles': 'admin'}]
         RbacBase().add_user_role(role_list, RestConnection(master), 'builtin')
 
+        self.enable_dp = self._input.param("enable_dp", False)
+        if self.enable_dp:
+            for node in self._input.servers:
+                print("Enabling DP for %s" % node)
+                cli = CouchbaseCLI(node)
+                cli.enable_dp()
+
         self._set_bleve_max_result_window()
 
         self.__set_free_servers()
         if not no_buckets:
             self.__create_buckets()
+            if self.container_type == "collection":
+                for bucket in self._cb_cluster.get_buckets():
+                    if type(self.collection) is list:
+                        for c in self.collection:
+                            self._cb_cluster._create_collection(bucket=bucket.name, scope=self.scope, collection=c, cli_client=self.cli_client)
+                    else:
+                        self._cb_cluster._create_collection(bucket=bucket.name, scope=self.scope, collection=self.collection, cli_client=self.cli_client)
         self._master = self._cb_cluster.get_master_node()
-
-        # simply append to this list, any error from log we want to fail test on
-        self.__report_error_list = []
-        if self.__fail_on_errors:
-            self.__report_error_list = ["panic:"]
-
-        # for format {ip1: {"panic": 2}}
-        self.__error_count_dict = {}
-        if len(self.__report_error_list) > 0:
-            self.__initialize_error_count_dict()
             
         if self.ntonencrypt == 'enable':
             self.setup_nton_encryption()
@@ -3353,6 +4010,7 @@ class FTSBaseTest(unittest.TestCase):
         self.__num_stand_buckets = self._input.param("standard_buckets", 0)
         self.__eviction_policy = self._input.param("eviction_policy", 'valueOnly')
         self.__mixed_priority = self._input.param("mixed_priority", None)
+        self.__bucket_storage = self._input.param('bucket_storage', 'couchstore')
         self.expected_no_of_results = self._input.param("expected_no_of_results", None)
         self.polygon_feature = self._input.param("polygon_feature", "regular")
         self.num_vertices = self._input.param("num_vertices", None)
@@ -3411,7 +4069,12 @@ class FTSBaseTest(unittest.TestCase):
             self.es.restart_es()
         else:
             self.es = None
-        self.run_via_n1ql = self._input.param("run_via_n1ql", False)
+
+        #todo: combine skip_n1ql and run_via_n1ql params into single parameter.
+        self.run_via_n1ql = False
+        if not self._input.param("skip_n1ql", False):
+            self.run_via_n1ql = self._input.param("run_via_n1ql", False)
+
         if self.run_via_n1ql:
             self.n1ql = N1QLHelper(version="sherlock", shell=None,
                                    item_flag=None, n1ql_port=8903,
@@ -3459,15 +4122,19 @@ class FTSBaseTest(unittest.TestCase):
         self.ntonencrypt = self._input.param('ntonencrypt','disable')
         self.ntonencrypt_level = self._input.param('ntonencrypt_level','control')
 
-    def __initialize_error_count_dict(self):
-        """
-            initializes self.__error_count_dict with ip, error and err count
-            like {ip1: {"panic": 2}}
-        """
-        for node in self._input.servers:
-            self.__error_count_dict[node.ip] = {}
-        self.check_error_count_in_fts_log(initial=True)
-        self.log.info(self.__error_count_dict)
+    def _get_mutation_vectors(self):
+        self.log.info("Grepping for 'MutationResult' in java_sdk_loader.log")
+        return set(subprocess.check_output(['grep', 'MutationResult', 'java_sdk_loader.log'],
+                                              universal_newlines=True).split('\n'))
+
+    def _convert_mutation_vector_to_scan_vector(self, mvectors):
+        vectors = re.findall(r'.*?vbID=(.*?), vbUUID=(.*?), seqno=(.*?),', str(mvectors))
+        scan_vector = {}
+        for vector in vectors:
+            vector = list(vector)
+            if len(vector) == 3:
+                scan_vector[f'{vector[0]}/{vector[1]}'] = int(vector[2])
+        return scan_vector
 
     def __cleanup_previous(self):
         self._cb_cluster.cleanup_cluster(self, cluster_shutdown=False)
@@ -3497,9 +4164,9 @@ class FTSBaseTest(unittest.TestCase):
             # buckets cannot be created if size<100MB
             bucket_size = 256
         elif quota_percent is not None:
-            bucket_size = int(float(cluster_quota - 500) * float(quota_percent / 100.0) / float(num_buckets))
+            bucket_size = int(float(cluster_quota - 1250) * float(quota_percent / 100.0) / float(num_buckets))
         else:
-            bucket_size = int((float(cluster_quota) - 500) / float(num_buckets))
+            bucket_size = int((float(cluster_quota) - 1250) / float(num_buckets))
         return bucket_size
 
     def __create_buckets(self):
@@ -3516,7 +4183,6 @@ class FTSBaseTest(unittest.TestCase):
         bucket_size = self.__calculate_bucket_size(
             total_quota,
             num_buckets)
-
         bucket_type = TestInputSingleton.input.param("bucket_type", "membase")
         maxttl = TestInputSingleton.input.param("maxttl", None)
 
@@ -3527,7 +4193,8 @@ class FTSBaseTest(unittest.TestCase):
                 eviction_policy=self.__eviction_policy,
                 bucket_priority=bucket_priority,
                 bucket_type=bucket_type,
-                maxttl=maxttl)
+                maxttl=maxttl,
+                bucket_storage=self.__bucket_storage)
 
         self._cb_cluster.create_sasl_buckets(
             bucket_size, num_buckets=self.__num_sasl_buckets,
@@ -3535,7 +4202,8 @@ class FTSBaseTest(unittest.TestCase):
             eviction_policy=self.__eviction_policy,
             bucket_priority=bucket_priority,
             bucket_type=bucket_type,
-            maxttl=maxttl)
+            maxttl=maxttl,
+            bucket_storage=self.__bucket_storage)
 
         self._cb_cluster.create_standard_buckets(
             bucket_size, num_buckets=self.__num_stand_buckets,
@@ -3543,7 +4211,8 @@ class FTSBaseTest(unittest.TestCase):
             eviction_policy=self.__eviction_policy,
             bucket_priority=bucket_priority,
             bucket_type=bucket_type,
-            maxttl=maxttl)
+            maxttl=maxttl,
+            bucket_storage=self.__bucket_storage)
 
     def create_buckets_on_cluster(self):
         # if mixed priority is set by user, set high priority for sasl and
@@ -3559,6 +4228,71 @@ class FTSBaseTest(unittest.TestCase):
         shell.disconnect()
         self.sleep(20)
 
+    def cbimport_data(self, data_json_path, server, format="json"):
+
+        from lib.remote.remote_util import RemoteMachineShellConnection
+        shell = RemoteMachineShellConnection(server)
+
+        self.im_path = "/tmp/import/"
+        self.log.info("copy import file from local to remote")
+        shell.execute_command("rm -rf  %s " % self.im_path)
+        shell.execute_command("mkdir  -p %s " % self.im_path)
+        if data_json_path is not None:
+            src_file = data_json_path
+        else:
+            self.fail("Need import_file param")
+        des_file = self.im_path + data_json_path.split("/")[-1]
+        shell.copy_file_local_to_remote(src_file, des_file)
+
+        import_method = self._input.param("import_method", "file://")
+        format_flag = self._input.param("format_flag", "-f")
+        format_type = self._input.param("format_type", "list")
+        key_gen = self._input.param("key_gen", "%key%")
+        cli_command_path = self._input.param("cli_command_path", "/opt/couchbase/bin/")
+        for bucket in self._cb_cluster.get_buckets():
+            """ ./cbimport json -c 12.11.10.132 -u Administrator -p password
+            -b default -d file:///tmp/export/default -f list -g key::%index%  """
+            imp_cmd_str = "%s%s %s -c %s -u %s -p %s -b %s -d %s%s %s %s -g %s" \
+                          % (cli_command_path, "cbimport", format,
+                             server.ip, self._input.membase_settings.rest_username,
+                             self._input.membase_settings.rest_password, bucket.name,
+                             import_method, des_file,
+                             format_flag, format_type, key_gen)
+            output, error = shell.execute_command(imp_cmd_str)
+            self.log.info("Output from execute command %s " % output)
+            """ Json `file:///root/json_list` imported to `http://host:8091` successfully """
+            if not shell._check_output("successfully", output):
+                self.fail("Failed to execute command")
+
+    def get_fts_ram_used(self):
+        fts_ram_used = []
+        for node in self._cb_cluster.get_fts_nodes():
+            status, fts_node_ram_used = RestConnection(node).get_fts_stats(stat_name="num_bytes_used_ram")
+            fts_ram_used.append({"nodeip": node.ip, "mem_usage": fts_node_ram_used})
+        return fts_ram_used
+
+    def check_if_fts_ram_usage_high(self, nodeip, threshold):
+        mem_high = False
+        for node in self._cb_cluster.get_fts_nodes():
+            if nodeip in node.ip:
+                status, fts_node_ram_used = RestConnection(node).get_fts_stats(stat_name="num_bytes_used_ram")
+                self.log.info("Ram used on node: {0} is {1} and threshold is {2}".format(nodeip,
+                                                                                         fts_node_ram_used, threshold))
+                if float(fts_node_ram_used) > threshold:
+                    mem_high = True
+        return mem_high
+
+    def start_task_managers(self, num):
+        self.task_managers = []
+        for count in range(num):
+            task_manager = TaskManager("task_manager{0}".format(count))
+            task_manager.start()
+            self.task_managers.append(task_manager)
+
+    def shutdown_task_managers(self):
+        for manager in self.task_managers:
+            manager.shutdown(True)
+
     def load_employee_dataset(self, num_items=None):
         """
             Loads the default JSON dataset
@@ -3568,7 +4302,8 @@ class FTSBaseTest(unittest.TestCase):
         if not num_items:
             num_items = self._num_items
         if not self._dgm_run:
-            self._cb_cluster.load_all_buckets(num_items, self._value_size)
+            self._cb_cluster.load_all_buckets(num_items, self._value_size, container_type=self.container_type,
+                                              scope=self.scope, collection=self.collection)
 
         else:
             self._cb_cluster.load_all_buckets_till_dgm(
@@ -3581,11 +4316,14 @@ class FTSBaseTest(unittest.TestCase):
         """
         if not num_keys:
             num_keys = self._num_items
-
-        gen = JsonDocGenerator("C1",
-                               encoding="utf-16",
-                               start=0,
-                               end=num_keys)
+        if self.container_type == 'bucket':
+            gen = JsonDocGenerator("C1",
+                                   encoding="utf-16",
+                                   start=0,
+                                   end=num_keys)
+        else:
+            self.populate_create_gen()
+            gen = self.create_gen
         self._cb_cluster.load_all_buckets_from_generator(gen)
 
     def load_wiki(self, num_keys=None, lang="EN", encoding="utf-8"):
@@ -3593,14 +4331,18 @@ class FTSBaseTest(unittest.TestCase):
         Loads the Wikipedia dump.
         Languages supported : EN(English)/ES(Spanish)/DE(German)/FR(French)
         """
+        self.dataset = "wiki"
         if not num_keys:
             num_keys = self._num_items
-
-        gen = WikiJSONGenerator("wiki",
-                                lang=lang,
-                                encoding=encoding,
-                                start=0,
-                                end=num_keys)
+        if self.container_type == "bucket":
+            gen = WikiJSONGenerator("wiki",
+                                    lang=lang,
+                                    encoding=encoding,
+                                    start=0,
+                                    end=num_keys)
+        else:
+            self.populate_create_gen()
+            gen = self.create_gen
         self._cb_cluster.load_all_buckets_from_generator(gen)
 
     def load_earthquakes(self, num_keys=None):
@@ -3649,8 +4391,8 @@ class FTSBaseTest(unittest.TestCase):
         if self._update:
             self.log.info("Updating keys @ {0} with expiry={1}".
                           format(self._cb_cluster.get_name(), self._expires))
-            self.populate_update_gen(fields_to_update)
-            if self.compare_es:
+            self.populate_update_gen(fields_to_update, expiration=self._expires)
+            if self.compare_es and self.container_type == 'bucket':
                 gen = copy.deepcopy(self.update_gen)
                 if not self._expires:
                     if isinstance(gen, list):
@@ -3692,7 +4434,7 @@ class FTSBaseTest(unittest.TestCase):
         if self._delete:
             self.log.info("Deleting keys @ {0}".format(self._cb_cluster.get_name()))
             self.populate_delete_gen()
-            if self.compare_es:
+            if self.compare_es and self.container_type == 'bucket':
                 del_gen = copy.deepcopy(self.delete_gen)
                 if isinstance(del_gen, list):
                     for generator in del_gen:
@@ -3728,51 +4470,47 @@ class FTSBaseTest(unittest.TestCase):
             self.log.info(line)
         shell.disconnect()
 
-    def check_error_count_in_fts_log(self, initial=False):
-        """
-        checks if new errors from self.__report_error_list
-        were found on any of the goxdcr.logs
-        """
-        error_found_logger = []
-        fts_log = NodeHelper.get_log_dir(self._input.servers[0]) + '/fts.log*'
-        for node in self._input.servers:
-            shell = RemoteMachineShellConnection(node)
-            for error in self.__report_error_list:
-                count, err = shell.execute_command(
-                    "zgrep \"{0}\" {1} | wc -l".format(error, fts_log))
-                if isinstance(count, list):
-                    count = int(count[0])
-                else:
-                    count = int(count)
-                NodeHelper._log.info(count)
-                if initial:
-                    self.__error_count_dict[node.ip][error] = count
-                else:
-                    self.log.info("Initial '{0}' count on {1} :{2}, now :{3}".
-                                  format(error,
-                                         node.ip,
-                                         self.__error_count_dict[node.ip][error],
-                                         count))
-                    if node.ip in list(self.__error_count_dict.keys()):
-                        if (count > self.__error_count_dict[node.ip][error]):
-                            error_found_logger.append("{0} found on {1}".format(error,
-                                                                                node.ip))
-                            self.print_crash_stacktrace(node, error)
-            shell.disconnect()
-        if not initial:
-            if error_found_logger:
-                self.log.error(error_found_logger)
-            return error_found_logger
-
     def sleep(self, timeout=1, message=""):
         self.log.info("sleep for {0} secs. {1} ...".format(timeout, message))
         time.sleep(timeout)
 
-    def wait_for_indexing_complete(self, item_count=None):
+    def wait_for_indexing_complete_simple(self, item_count=0, index=None):
+        retry = self._input.param("index_retry", 20)
+        if index.index_type == "fulltext-alias":
+            return
+        retry_count = retry
+        prev_count = 0
+        while retry_count > 0:
+            fail = False
+            try:
+                index_doc_count = index.get_indexed_doc_count()
+                self.log.info(f"Expected docs count = {item_count}, "
+                              f"docs in FTS index '{index.name}': {index_doc_count}")
+
+                if item_count and index_doc_count > item_count:
+                    return
+
+                if item_count == index_doc_count:
+                    return
+
+                if prev_count < index_doc_count or prev_count > index_doc_count:
+                    prev_count = index_doc_count
+                    retry_count = retry
+                else:
+                    retry_count -= 1
+            except Exception as e:
+                self.log.info(e)
+                if fail:
+                    self.fail(e)
+                retry_count -= 1
+            time.sleep(6)
+
+    def wait_for_indexing_complete(self, item_count=None, es_index="es_index"):
         """
         Wait for index_count for any index to stabilize or reach the
         index count specified by item_count
         """
+
         retry = self._input.param("index_retry", 20)
         for index in self._cb_cluster.get_indexes():
             if index.index_type == "fulltext-alias":
@@ -3781,24 +4519,37 @@ class FTSBaseTest(unittest.TestCase):
             prev_count = 0
             es_index_count = 0
             while retry_count > 0:
+                fail = False
                 try:
                     index_doc_count = index.get_indexed_doc_count()
-                    bucket_doc_count = index.get_src_bucket_doc_count()
-                    if not self.compare_es:
-                        self.log.info("Docs in bucket = %s, docs in FTS index '%s': %s"
-                                      % (bucket_doc_count,
-                                         index.name,
-                                         index_doc_count))
+
+                    if index.collections:
+                        container_doc_count = index.get_src_collections_doc_count()
                     else:
-                        self.es.update_index('es_index')
-                        es_index_count = self.es.get_index_count('es_index')
-                        self.log.info("Docs in bucket = %s, docs in FTS index '%s':"
-                                      " %s, docs in ES index: %s "
-                                      % (bucket_doc_count,
-                                         index.name,
-                                         index_doc_count,
-                                         es_index_count))
-                    if bucket_doc_count == 0:
+                        container_doc_count = index.get_src_bucket_doc_count()
+
+                    if not self.compare_es:
+                        self.log.info(f"Docs in bucket = {container_doc_count}, "
+                                      f"docs in FTS index '{index.name}': {index_doc_count}")
+                        if retry_count == 1:
+                            fail = True
+                            rest = RestConnection(self._cb_cluster.get_random_fts_node())
+
+                            self.fail(f"FTS index count not matching bucket count even after {retry} tries: "
+                                      f"Docs in bucket = {container_doc_count}, "
+                                      f"docs in FTS index '{index.name}': {index_doc_count}")
+                    else:
+                        self.es.update_index(es_index)
+                        es_index_count = self.es.get_index_count(es_index)
+                        self.log.info(f"Docs in bucket = {container_doc_count}, docs in FTS index '{index.name}':"
+                                      f" {index_doc_count}, docs in ES index: {es_index_count} ")
+                        if retry_count == 1:
+                            fail = True
+                            self.fail(f"FTS/ES index count not matching bucket count even after {retry} tries: "
+                                      f"Docs in bucket = {container_doc_count}, "
+                                      f"docs in FTS index '{index.name}': {index_doc_count}, "
+                                      f"docs in ES index: {es_index_count}")
+                    if container_doc_count == 0:
                         if item_count and item_count != 0:
                             self.sleep(5,
                                        "looks like docs haven't been loaded yet...")
@@ -3808,10 +4559,17 @@ class FTSBaseTest(unittest.TestCase):
                     if item_count and index_doc_count > item_count:
                         break
 
-                    if bucket_doc_count == index_doc_count:
+                    if container_doc_count == index_doc_count:
                         if self.compare_es:
-                            if bucket_doc_count == es_index_count:
+                            if container_doc_count == es_index_count:
                                 break
+                            elif retry_count == 1:
+                                fail = True
+                                self.fail(
+                                    f"ES index count not matching with bucket_doc_count. "
+                                    f"Docs in bucket = {container_doc_count}, docs "
+                                    f"in FTS index '{index.name}': {index_doc_count}, "
+                                    f"docs in ES index: {es_index_count} ")
                         else:
                             break
 
@@ -3822,6 +4580,8 @@ class FTSBaseTest(unittest.TestCase):
                         retry_count -= 1
                 except Exception as e:
                     self.log.info(e)
+                    if fail:
+                        self.fail(e)
                     retry_count -= 1
                 time.sleep(6)
             # now wait for num_mutations_to_index to become zero to handle the pure
@@ -3831,7 +4591,7 @@ class FTSBaseTest(unittest.TestCase):
                 while True and retry_count:
                     num_mutations_to_index = index.get_num_mutations_to_index()
                     if num_mutations_to_index > 0:
-                        self.sleep(5, "num_mutations_to_index: {0} > 0".format(num_mutations_to_index))
+                        self.sleep(5, f"num_mutations_to_index: {num_mutations_to_index} > 0")
                         retry_count -= 1
                     else:
                         break
@@ -3843,6 +4603,7 @@ class FTSBaseTest(unittest.TestCase):
             plan_params['numReplicas'] = self.index_replicas
         if self.partitions_per_pindex:
             plan_params['maxPartitionsPerPIndex'] = self.partitions_per_pindex
+        plan_params['indexPartitions'] = self.num_index_partitions
         return plan_params
 
     def populate_node_partition_map(self, index):
@@ -4052,34 +4813,59 @@ class FTSBaseTest(unittest.TestCase):
             return index.fts_queries
 
     def create_index(self, bucket, index_name, index_params=None,
-                     plan_params=None):
+                     plan_params=None, collection_index=False, _type=None, analyzer="standard", scope=None, collections=None, no_check=False):
         """
         Creates a default index given bucket, index_name and plan_params
         """
-        bucket_password = ""
-        if bucket.authType == "sasl":
-            bucket_password = bucket.saslPassword
         if not plan_params:
             plan_params = self.construct_plan_params()
         index = self._cb_cluster.create_fts_index(
             name=index_name,
             source_name=bucket.name,
             index_params=index_params,
-            plan_params=plan_params)
+            plan_params=plan_params,
+            collection_index=collection_index,
+            _type=_type,
+            analyzer=analyzer,
+            scope=scope,
+            collections=collections,
+            no_check=no_check)
         self.is_index_partitioned_balanced(index)
         return index
 
-    def create_fts_indexes_all_buckets(self, plan_params=None):
+    def create_fts_indexes_all_buckets(self, plan_params=None, analyzer='standard'):
         """
         Creates 'n' default indexes for all buckets.
         'n' is defined by 'index_per_bucket' test param.
         """
         for bucket in self._cb_cluster.get_buckets():
+            collection_index, tp, index_scope, index_collections = self.define_index_parameters_collection_related()
             for count in range(self.index_per_bucket):
                 self.create_index(
                     bucket,
-                    "%s_index_%s" % (bucket.name, count + 1),
-                    plan_params=plan_params)
+                    f"{bucket.name}_index_{count + 1}",
+                    plan_params=plan_params, _type=tp, collection_index=collection_index,
+                    scope=index_scope, collections=index_collections, analyzer=analyzer)
+
+    def define_index_parameters_collection_related(self):
+        collection_index = self.container_type == 'collection'
+        if self.container_type == 'bucket':
+            _type = self.dataset
+            index_scope = None
+            index_collections = None
+        else:
+            index_scope = self.scope
+            index_collections = []
+            if type(self.collection) is list:
+                _type = []
+                for c in self.collection:
+                    _type.append(f"{self.scope}.{c}")
+                    index_collections.append(c)
+            else:
+                _type = f"{self.scope}.{self.collection}"
+                index_collections.append(self.collection)
+        return collection_index, _type, index_scope, index_collections
+
 
     def create_alias(self, target_indexes, name=None, alias_def=None):
         """
@@ -4106,19 +4892,23 @@ class FTSBaseTest(unittest.TestCase):
         index_name_count_map = {}
         for index in self._cb_cluster.get_indexes():
             docs_indexed = index.get_indexed_doc_count()
-            bucket_count = self._cb_cluster.get_doc_count_in_bucket(
-                index.source_bucket)
+
+            if index.collections:
+                container_doc_count = index.get_src_collections_doc_count()
+            else:
+                container_doc_count = index.get_src_bucket_doc_count()
+
             self.log.info("Docs in index {0}={1}, bucket docs={2}".
-                          format(index.name, docs_indexed, bucket_count))
+                          format(index.name, docs_indexed, container_doc_count))
             if must_equal and docs_indexed != int(must_equal):
                 self.fail("Number of docs indexed is not %s" % must_equal)
             if docs_indexed == 0 and not zero_rows_ok:
                 self.fail("No docs were indexed for index %s" % index.name)
             if equal_bucket_doc_count:
 
-                if docs_indexed != bucket_count:
+                if docs_indexed != container_doc_count:
                     self.fail("Bucket doc count = %s, index doc count=%s" %
-                              (bucket_count, docs_indexed))
+                              (container_doc_count, docs_indexed))
             index_name_count_map[index.name] = docs_indexed
         return index_name_count_map
 
@@ -4130,12 +4920,15 @@ class FTSBaseTest(unittest.TestCase):
         for index in self._cb_cluster.get_indexes():
             if index.name == name:
                 docs_indexed = index.get_indexed_doc_count()
-                bucket_count = self._cb_cluster.get_doc_count_in_bucket(
-                    index.source_bucket)
+
+                if index.collections:
+                    container_doc_count = index.get_src_collections_doc_count()
+                else:
+                    container_doc_count = index.get_src_bucket_doc_count()
 
                 self.log.info("Docs in index {0}={1}, bucket docs={2}".
-                              format(index.name, docs_indexed, bucket_count))
-                if docs_indexed != bucket_count:
+                              format(index.name, docs_indexed, container_doc_count))
+                if docs_indexed != container_doc_count:
                     return False
                 else:
                     return True
@@ -4171,16 +4964,20 @@ class FTSBaseTest(unittest.TestCase):
                               doc['_type'],
                               key)
 
-    def get_zap_docvalue_disksize(self):
-        shell = RemoteMachineShellConnection(self._cb_cluster.get_random_fts_node())
+    def get_zap_docvalue_disksize(self, fts_node):
+        shell = RemoteMachineShellConnection(fts_node)
         command = 'cd /opt/couchbase/var/lib/couchbase/data/\\@fts; find . -name "*.zap"|  sort -n | ' \
-                  'tail -1 | xargs -I {} sh -c "/opt/couchbase/bin/cbft-bleve zap docvalue {} | tail -1"'
+                  'tail -1 | xargs -I {} sh -c "/opt/couchbase/bin/cbft-bleve zap v15 docvalue {} | tail -1"'
         output, error = shell.execute_command(command)
         if error and "remoteClients registered for tls config updates" not in error[0]:
             self.fail("error running command : {0} , error : {1}".format(command, error))
         self.log.info(output)
-        self.log.info(re.findall(r"\d+\.\d+", output[0]))
-        return re.findall(r"\d+\.\d+", output[0])[0]
+        if output:
+            self.log.info(re.findall(r"\d+\.\d+", output[0]))
+            ds = re.findall(r"\d+\.\d+", output[0])[0]
+        else:
+            ds = None
+        return ds
 
     def create_geo_index_and_load(self):
         """
@@ -4256,27 +5053,47 @@ class FTSBaseTest(unittest.TestCase):
                       % index_name)
 
     def get_generator(self, dataset, num_items, start=0, encoding="utf-8",
-                      lang="EN"):
+                      lang="EN", data_loader_output=False):
         """
            Returns a generator depending on the dataset
         """
-        if dataset == "emp":
-            return JsonDocGenerator(name="emp",
-                                    encoding=encoding,
-                                    start=start,
-                                    end=start + num_items)
-        elif dataset == "wiki":
-            return WikiJSONGenerator(name="wiki",
-                                     lang=lang,
-                                     encoding=encoding,
-                                     start=start,
-                                     end=start + num_items)
-        elif dataset == "earthquakes":
-            return GeoSpatialDataLoader(name="earthquake",
+        if self.container_type == 'bucket':
+            if dataset == "emp":
+                return JsonDocGenerator(name="emp",
+                                        encoding=encoding,
                                         start=start,
                                         end=start + num_items)
+            elif dataset == "wiki":
+                return WikiJSONGenerator(name="wiki",
+                                         lang=lang,
+                                         encoding=encoding,
+                                         start=start,
+                                         end=start + num_items)
+            elif dataset == "earthquakes":
+                return GeoSpatialDataLoader(name="earthquake",
+                                            start=start,
+                                            end=start + num_items)
+        else:
+            elastic_ip = None
+            elastic_port = None
+            elastic_username = None
+            elastic_password = None
+            if self.compare_es:
+                elastic_ip = self.elastic_node.ip
+                elastic_port = self.elastic_node.port
+                elastic_username = self.elastic_node.es_username
+                elastic_password = self.elastic_node.es_password
+            return SDKDataLoader(num_ops = self._num_items, percent_create = 100,
+                                           percent_update=0, percent_delete=0, scope=self.scope,
+                                           collection=self.collection,
+                                           json_template=dataset,
+                                           start=start, end=start+num_items,
+                                           es_compare=self.compare_es, es_host=elastic_ip, es_port=elastic_port,
+                                           es_login=elastic_username, es_password=elastic_password, key_prefix=dataset+"_",
+                                           upd_del_shift=self._num_items, output=data_loader_output
+                                 )
 
-    def populate_create_gen(self):
+    def populate_create_gen(self,data_loader_output=False):
         if self.dataset == "all":
             # only emp and wiki
             self.create_gen = []
@@ -4286,18 +5103,20 @@ class FTSBaseTest(unittest.TestCase):
                 "wiki", num_items=self._num_items // 2))
         else:
             self.create_gen = self.get_generator(
-                self.dataset, num_items=self._num_items)
+                self.dataset, num_items=self._num_items, data_loader_output=data_loader_output)
 
-    def populate_update_gen(self, fields_to_update=None):
+    def populate_update_gen(self, fields_to_update=None, expiration=0):
         if self.dataset == "emp":
             self.update_gen = copy.deepcopy(self.create_gen)
             self.update_gen.start = 0
             self.update_gen.end = int(self.create_gen.end *
                                       (float)(self._perc_upd) / 100)
+            self.update_gen.doc_expiry = expiration
             self.update_gen.update(fields_to_update=fields_to_update)
         elif self.dataset == "wiki":
             self.update_gen = copy.deepcopy(self.create_gen)
             self.update_gen.start = 0
+            self.update_gen.doc_expiry = expiration
             self.update_gen.end = int(self.create_gen.end *
                                       (float)(self._perc_upd) / 100)
         elif self.dataset == "all":
@@ -4307,43 +5126,66 @@ class FTSBaseTest(unittest.TestCase):
                 self.update_gen[itr].start = 0
                 self.update_gen[itr].end = int(self.create_gen[itr].end *
                                                (float)(self._perc_upd) / 100)
-                if self.update_gen[itr].name == "emp":
+                if self.container_type == 'collection':
                     self.update_gen[itr].update(fields_to_update=fields_to_update)
+                else:
+                    if self.update_gen[itr].name == "emp":
+                        self.update_gen[itr].update(fields_to_update=fields_to_update)
+                self.update_gen[itr].doc_expiry = expiration
 
     def populate_delete_gen(self):
         if self.dataset == "emp":
-            self.delete_gen = JsonDocGenerator(
-                self.create_gen.name,
-                op_type=OPS.DELETE,
-                encoding="utf-8",
-                start=int((self.create_gen.end)
-                          * (float)(100 - self._perc_del) / 100),
-                end=self.create_gen.end)
+            if self.container_type == 'collection':
+                self.delete_gen = copy.deepcopy(self.create_gen)
+                self.delete_gen.op_type = OPS.DELETE
+                self.delete_gen.encoding = "utf-8"
+                self.delete_gen.start = int((self.create_gen.end)
+                                            * (float)(100 - self._perc_del) / 100)
+                self.delete_gen.end = self.create_gen.end
+                self.delete_gen.delete()
+            else:
+                self.delete_gen = JsonDocGenerator(
+                    self.create_gen.name,
+                    op_type=OPS.DELETE,
+                    encoding="utf-8",
+                    start=int((self.create_gen.end)
+                              * (float)(100 - self._perc_del) / 100),
+                    end=self.create_gen.end)
         elif self.dataset == "wiki":
-            self.delete_gen = WikiJSONGenerator(name="wiki",
-                                                encoding="utf-8",
-                                                start=int((self.create_gen.end)
-                                                          * (float)(100 - self._perc_del) / 100),
-                                                end=self.create_gen.end,
-                                                op_type=OPS.DELETE)
-
+            if self.container_type == 'collection':
+                self.delete_gen = copy.deepcopy(self.create_gen)
+                self.delete_gen.op_type = OPS.DELETE
+                self.delete_gen.encoding = "utf-8"
+                self.delete_gen.start = int((self.create_gen.end)
+                                            * (float)(100 - self._perc_del) / 100)
+                self.delete_gen.end = self.create_gen.end
+            else:
+                self.delete_gen = WikiJSONGenerator(name="wiki",
+                                                    encoding="utf-8",
+                                                    start=int((self.create_gen.end)
+                                                              * (float)(100 - self._perc_del) / 100),
+                                                    end=self.create_gen.end,
+                                                    op_type=OPS.DELETE)
         elif self.dataset == "all":
-            self.delete_gen = []
-            self.delete_gen.append(JsonDocGenerator(
-                "emp",
-                op_type=OPS.DELETE,
-                encoding="utf-8",
-                start=int((self.create_gen[0].end)
-                          * (float)(100 - self._perc_del) / 100),
-                end=self.create_gen[0].end))
-            self.delete_gen.append(WikiJSONGenerator(name="wiki",
-                                                     encoding="utf-8",
-                                                     start=int((self.create_gen[1].end)
-                                                               * (float)(100 - self._perc_del) / 100),
-                                                     end=self.create_gen[1].end,
-                                                     op_type=OPS.DELETE))
+            if self.container_type == 'collection':
+                self.delete_gen = copy.deepcopy(self.create_gen)
+            else:
+                self.delete_gen = []
+                self.delete_gen.append(JsonDocGenerator(
+                    "emp",
+                    op_type=OPS.DELETE,
+                    encoding="utf-8",
+                    start=int((self.create_gen[0].end)
+                              * (float)(100 - self._perc_del) / 100),
+                    end=self.create_gen[0].end))
+                self.delete_gen.append(WikiJSONGenerator(name="wiki",
+                                                         encoding="utf-8",
+                                                         start=int((self.create_gen[1].end)
+                                                                   * (float)(100 - self._perc_del) / 100),
+                                                         end=self.create_gen[1].end,
+                                                         op_type=OPS.DELETE))
 
-    def load_data(self):
+    def load_data(self, generator=None, data_loader_output=False):
         """
          Blocking call to load data to Couchbase and ES
         """
@@ -4352,33 +5194,33 @@ class FTSBaseTest(unittest.TestCase):
                 self._active_resident_ratio,
                 self.compare_es)
             return
-        load_tasks = self.async_load_data()
+        load_tasks = self.async_load_data(generator=generator, data_loader_output=data_loader_output)
         for task in load_tasks:
             task.result()
         self.log.info("Loading phase complete!")
 
-    def async_load_data(self):
+    def async_load_data(self, generator=None, data_loader_output=False):
         """
          For use to run with parallel tasks like rebalance, failover etc
         """
         load_tasks = []
-        self.populate_create_gen()
-        if self.compare_es:
-            gen = copy.deepcopy(self.create_gen)
-            if isinstance(gen, list):
-                for generator in gen:
+        self.populate_create_gen(data_loader_output=data_loader_output)
+        if self.compare_es and self.container_type != 'collection':
+            if self.container_type == 'bucket':
+                gen = copy.deepcopy(self.create_gen)
+                if isinstance(gen, list):
+                    for g in gen:
+                        load_tasks.append(self.es.async_bulk_load_ES(index_name='es_index',
+                                                                     gen=g,
+                                                                     op_type='create'))
+                else:
                     load_tasks.append(self.es.async_bulk_load_ES(index_name='es_index',
-                                                                 gen=generator,
+                                                                 gen=gen,
                                                                  op_type='create'))
-            else:
-                load_tasks.append(self.es.async_bulk_load_ES(index_name='es_index',
-                                                             gen=gen,
-                                                             op_type='create'))
-        load_tasks += self._cb_cluster.async_load_all_buckets_from_generator(
-            self.create_gen)
+        load_tasks += self._cb_cluster.async_load_all_buckets_from_generator(self.create_gen)
         return load_tasks
 
-    def run_query_and_compare(self, index=None, es_index_name=None, n1ql_executor=None):
+    def run_query_and_compare(self, index=None, es_index_name=None, n1ql_executor=None, use_collections=False):
         """
         Runs every fts query and es_query and compares them as a single task
         Runs as many tasks as there are queries
@@ -4392,7 +5234,8 @@ class FTSBaseTest(unittest.TestCase):
                 es=self.es,
                 es_index_name=es_index_name,
                 query_index=count,
-                n1ql_executor=n1ql_executor))
+                n1ql_executor=n1ql_executor,
+                use_collections=use_collections))
 
         num_queries = len(tasks)
 
@@ -4437,7 +5280,7 @@ class FTSBaseTest(unittest.TestCase):
                     'Authorization': 'Basic %s' % authorization,
                     'Accept': '*/*'}
                 filename = "{0}_fts_diag.json".format(serverInfo.ip)
-                page = urllib.request.urlopen(req)
+                page = urllib.request.urlopen(req, timeout=60)
                 with open(path + '/' + filename, 'wb') as output:
                     os.write(1, "downloading {0} ...".format(serverInfo.ip))
                     while True:
@@ -4570,3 +5413,4 @@ class FTSBaseTest(unittest.TestCase):
                     if counter > 20:
                         self.log.info("Exiting load sleep loop after 21s")
                         return
+

@@ -97,8 +97,8 @@ class AutoCompactionTests(BaseTestCase):
             items = (int(available_ram * 1000) // 2) // item_size
             print("ITEMS =============%s" % items)
 
-            rest.create_bucket(bucket=bucket_name, ramQuotaMB=int(available_ram), authType='sasl',
-                               saslPassword='password', replicaNumber=1, proxyPort=11211)
+            rest.create_bucket(bucket=bucket_name, ramQuotaMB=int(available_ram),
+                               replicaNumber=1, proxyPort=11211)
             BucketOperationHelper.wait_for_memcached(serverInfo, bucket_name)
             BucketOperationHelper.wait_for_vbuckets_ready_state(serverInfo, bucket_name)
 
@@ -182,6 +182,7 @@ class AutoCompactionTests(BaseTestCase):
         result = compaction_task.result(self.wait_timeout * 5)
         self.assertTrue(result, "Compaction didn't finished correctly. Please check diags")
         rebalance.result()
+        self.sleep(30)
         self.verify_cluster_stats(self.servers[:self.nodes_in + 1])
 
     def rebalance_in_with_auto_DB_compaction(self):
@@ -195,6 +196,7 @@ class AutoCompactionTests(BaseTestCase):
         compact_run = remote_client.wait_till_compaction_end(rest, self.default_bucket_name,
                                                                      timeout_in_seconds=(self.wait_timeout * 5))
         rebalance.result()
+        self.sleep(30)
         monitor_fragm = self.cluster.async_monitor_db_fragmentation(self.master, 0, self.default_bucket_name)
         result = monitor_fragm.result()
         if compact_run:
@@ -219,6 +221,7 @@ class AutoCompactionTests(BaseTestCase):
         result = compaction_task.result(self.wait_timeout * 5)
         self.assertTrue(result, "Compaction didn't finished correctly. Please check diags")
         rebalance.result()
+        self.sleep(30)
         self.verify_cluster_stats(self.servers[:self.num_servers - self.nodes_out])
 
     def rebalance_out_with_auto_DB_compaction(self):
@@ -235,6 +238,7 @@ class AutoCompactionTests(BaseTestCase):
         compact_run = remote_client.wait_till_compaction_end(rest, self.default_bucket_name,
                                                                      timeout_in_seconds=(self.wait_timeout * 5))
         rebalance.result()
+        self.sleep(30)
         monitor_fragm = self.cluster.async_monitor_db_fragmentation(self.master, 0, self.default_bucket_name)
         result = monitor_fragm.result()
         if compact_run:
@@ -262,6 +266,7 @@ class AutoCompactionTests(BaseTestCase):
             result = compaction_task.result(self.wait_timeout * 5)
             self.assertTrue(result, "Compaction didn't finished correctly. Please check diags")
         rebalance.result()
+        self.sleep(30)
         self.verify_cluster_stats(result_nodes)
 
     def rebalance_in_out_with_auto_DB_compaction(self):
@@ -281,6 +286,7 @@ class AutoCompactionTests(BaseTestCase):
             compact_run = remote_client.wait_till_compaction_end(rest, self.default_bucket_name,
                                                                  timeout_in_seconds=(self.wait_timeout * 5))
         rebalance.result()
+        self.sleep(30)
         monitor_fragm = self.cluster.async_monitor_db_fragmentation(self.master, 0, self.default_bucket_name)
         result = monitor_fragm.result()
         if compact_run:

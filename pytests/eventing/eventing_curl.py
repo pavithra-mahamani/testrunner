@@ -8,7 +8,7 @@ from lib.couchbase_helper.tuq_helper import N1QLHelper
 from string import Template
 import os
 import logging
-import datetime
+import datetime, json
 
 log = logging.getLogger()
 
@@ -228,5 +228,46 @@ class EventingCurl(EventingBaseTest):
                       batch_size=self.batch_size, op_type='delete')
             self.verify_eventing_results(self.function_name, 0,skip_stats_validation=True)
             self.undeploy_and_delete_function(body)
+
+        def test_curl_parent_binding(self):
+            self.load(self.gens_load, buckets=self.src_bucket, flag=self.item_flag, verify_data=False,
+                      batch_size=self.batch_size)
+            self.hostname = self.hostname[:-1]
+            body = self.create_save_function_body(self.function_name, "handler_code/curl/bucket_op_curl_get_parent.js", worker_count=3,hostpath="/a/b/")
+            self.deploy_function(body)
+            # Wait for eventing to catch up with all the create mutations and verify results
+            self.verify_eventing_results(self.function_name, self.docs_per_day * 2016, skip_stats_validation=True)
+            # delete json documents
+            self.load(self.gens_load, buckets=self.src_bucket, flag=self.item_flag, verify_data=False,
+                      batch_size=self.batch_size, op_type='delete')
+            self.verify_eventing_results(self.function_name, 0, skip_stats_validation=True)
+            self.undeploy_and_delete_function(body)
+
+        def test_bad_ssl_cert(self):
+            self.load(self.gens_load, buckets=self.src_bucket, flag=self.item_flag, verify_data=False,
+                      batch_size=self.batch_size)
+            body = self.create_save_function_body(self.function_name, "handler_code/curl/bad_ssl_cert.js",validate_ssl=True)
+            self.deploy_function(body)
+            # Wait for eventing to catch up with all the create mutations and verify results
+            self.verify_eventing_results(self.function_name, self.docs_per_day * 2016, skip_stats_validation=True)
+            # delete json documents
+            self.load(self.gens_load, buckets=self.src_bucket, flag=self.item_flag, verify_data=False,
+                      batch_size=self.batch_size, op_type='delete')
+            self.verify_eventing_results(self.function_name, 0, skip_stats_validation=True)
+            self.undeploy_and_delete_function(body)
+
+        def test_curl_restrict_access_to_diag_eval_endpoint_via_eventing(self):
+            self.load(self.gens_load, buckets=self.src_bucket, flag=self.item_flag, verify_data=False,
+                      batch_size=self.batch_size)
+            body = self.create_save_function_body(self.function_name, self.handler_code,
+                                                  worker_count=3)
+            self.deploy_function(body)
+            self.verify_eventing_results(self.function_name, self.docs_per_day * 2016, skip_stats_validation=True)
+            self.load(self.gens_load, buckets=self.src_bucket, flag=self.item_flag, verify_data=False,
+                      batch_size=self.batch_size, op_type='delete')
+            self.verify_eventing_results(self.function_name, 0, skip_stats_validation=True)
+            self.undeploy_and_delete_function(body)
+
+
 
 

@@ -1,34 +1,34 @@
-import copy
 import builtins as exceptions
+import copy
+import ctypes
+import socket
 import time
 import uuid
 import zlib
+from collections import defaultdict
+from queue import Queue
+from subprocess import call
+from threading import Thread
+
+import crc32
 import logger
 import mc_bin_client
-import crc32
-import socket
-import ctypes
-from membase.api.rest_client import RestConnection, RestHelper
 import memcacheConstants
-from memcached.helper.data_helper import MemcachedClientHelper, VBucketAwareMemcached
-from mc_bin_client import MemcachedClient
-from threading import Thread
-import queue
-from collections import defaultdict
 from couchbase_helper.stats_tools import StatsCommon
+from mc_bin_client import MemcachedClient
+from membase.api.rest_client import RestConnection, RestHelper
+from memcached.helper.data_helper import MemcachedClientHelper, VBucketAwareMemcached
 from remote.remote_util import RemoteMachineShellConnection
-from subprocess import call
-from membase.api.exception import ServerUnavailableException
-from queue import Queue
 
-class BucketOperationHelper():
 
-    #this function will assert
+class BucketOperationHelper:
+
+    # this function will assert
 
     @staticmethod
     def base_bucket_ratio(servers):
         ratio = 1.0
-        #check if ip is same for all servers
+        # check if ip is same for all servers
         ip = servers[0].ip
         dev_environment = True
         for server in servers:
@@ -44,7 +44,8 @@ class BucketOperationHelper():
     @staticmethod
     def create_multiple_buckets(server, replica, bucket_ram_ratio=(2.0 / 3.0),
                                 howmany=3, sasl=True, saslPassword='password',
-                                bucketType='membase', evictionPolicy='valueOnly'):
+                                bucketType='membase', evictionPolicy='valueOnly',
+                                bucket_storage='couchstore'):
         success = True
         log = logger.Logger.get_logger()
         rest = RestConnection(server)
@@ -58,7 +59,7 @@ class BucketOperationHelper():
                 bucket_ram = int(available_ram / howmany)
             else:
                 bucket_ram = 100
-                #choose a port that is not taken by this ns server
+                # choose a port that is not taken by this ns server
             port = info.moxi + 1
             for i in range(0, howmany):
                 name = "bucket-{0}".format(i)
@@ -66,16 +67,16 @@ class BucketOperationHelper():
                     rest.create_bucket(bucket=name,
                                        ramQuotaMB=bucket_ram,
                                        replicaNumber=replica,
-                                       authType="sasl",
-                                       saslPassword=saslPassword,
                                        proxyPort=port,
                                        bucketType=bucketType,
-                                       evictionPolicy=evictionPolicy)
+                                       evictionPolicy=evictionPolicy,
+                                       storageBackend=bucket_storage)
                 else:
                     rest.create_bucket(bucket=name,
                                        ramQuotaMB=bucket_ram,
                                        replicaNumber=replica,
-                                       proxyPort=port)
+                                       proxyPort=port,
+                                       storageBackend=bucket_storage)
                 port += 1
                 msg = "create_bucket succeeded but bucket \"{0}\" does not exist"
                 bucket_created = BucketOperationHelper.wait_for_bucket_creation(name, rest)
@@ -91,9 +92,9 @@ class BucketOperationHelper():
         for serverInfo in servers:
             ip_rest = RestConnection(serverInfo)
             ip_rest.create_bucket(bucket='default',
-                               ramQuotaMB=256,
-                               replicaNumber=number_of_replicas,
-                               proxyPort=11220)
+                                  ramQuotaMB=256,
+                                  replicaNumber=number_of_replicas,
+                                  proxyPort=11220)
             msg = 'create_bucket succeeded but bucket "default" does not exist'
             removed_all_buckets = BucketOperationHelper.wait_for_bucket_creation('default', ip_rest)
             if not removed_all_buckets:
@@ -109,17 +110,10 @@ class BucketOperationHelper():
             info = rest.get_nodes_self()
             bucket_ram = info.memoryQuota * 2 // 3
 
-        if password == None:
-            authType = "sasl"
-        else:
-            authType = "none"
-
         rest.create_bucket(bucket=name,
                            ramQuotaMB=bucket_ram,
                            replicaNumber=replica,
-                           proxyPort=port,
-                           authType=authType,
-                           saslPassword=password)
+                           proxyPort=port)
         msg = 'create_bucket succeeded but bucket "{0}" does not exist'
         bucket_created = BucketOperationHelper.wait_for_bucket_creation(name, rest)
         if not bucket_created:
@@ -129,47 +123,39 @@ class BucketOperationHelper():
         return bucket_created
 
     @staticmethod
-    def delete_all_buckets_or_assert(servers, test_case):
+    def delete_all_buckets_or_assert(servers, test_case, timeout=200):
         log = logger.Logger.get_logger()
         for serverInfo in servers:
             rest = RestConnection(serverInfo)
-            buckets = []
-            try:
-                buckets = rest.get_buckets()
-            except Exception as e:
-                log.error(e)
-                log.error('15 seconds sleep before calling get_buckets again...')
-                time.sleep(15)
-                buckets = rest.get_buckets()
+            # retrying to get buckets with poll_interval and limit of retries
+            buckets = rest.get_buckets(num_retries=3, poll_interval=5)
             if len(buckets) > 0:
                 log.info('deleting existing buckets {0} on {1}'.format([b.name for b in buckets], serverInfo.ip))
                 for bucket in buckets:
-                    log.info("remove bucket {0} ...".format(bucket.name))
-                    try:
-                        status = rest.delete_bucket(bucket.name)
-                    except ServerUnavailableException as e:
-                        log.error(e)
-                        log.error('5 seconds sleep before calling delete_bucket again...')
-                        time.sleep(5)
-                        status = rest.delete_bucket(bucket.name)
+                    # trying to send rest call to delete bucket with poll_interval and limit of retries
+                    status = rest.delete_bucket(bucket.name, num_retries=3, poll_interval=5)
                     if not status:
                         try:
                             BucketOperationHelper.print_dataStorage_content(servers)
                             log.info(StatsCommon.get_stats([serverInfo], bucket.name, "timings"))
                         except:
                             log.error("Unable to get timings for bucket")
-                    log.info('deleted bucket : {0} from {1}'.format(bucket.name, serverInfo.ip))
-                    msg = 'bucket "{0}" was not deleted even after waiting for two minutes'.format(bucket.name)
-                    if test_case:
-                        if not BucketOperationHelper.wait_for_bucket_deletion(bucket.name, rest, 200):
-                            try:
-                                BucketOperationHelper.print_dataStorage_content(servers)
-                                log.info(StatsCommon.get_stats([serverInfo], bucket.name, "timings"))
-                            except:
-                                log.error("Unable to get timings for bucket")
+                    # trying to check if bucket already deleted? poll_interval=0.1, timeout=200
+                    is_bucket_deleted = BucketOperationHelper.wait_for_bucket_deletion(bucket.name, rest, timeout)
+                    if not is_bucket_deleted:
+                        try:
+                            BucketOperationHelper.print_dataStorage_content(servers)
+                            log.info(StatsCommon.get_stats([serverInfo], bucket.name, "timings"))
+                        except:
+                            log.error("Unable to get timings for bucket")
+                        if test_case:
+                            msg = 'bucket "{0}" was not deleted even after waiting for {1} seconds.'.format(bucket.name,
+                                                                                                            timeout)
                             test_case.fail(msg)
-                log.info("sleep 2 seconds to make sure all buckets ({}) were deleted completely.".format([b.name for b in buckets]))
-                time.sleep(2)
+                    else:
+                        log.info('deleted bucket : {0} from {1}'.format(bucket.name, serverInfo.ip))
+            else:
+                log.info("Could not find any buckets for node {0}, nothing to delete".format(serverInfo.ip))
 
     @staticmethod
     def delete_bucket_or_assert(serverInfo, bucket='default', test_case=None):
@@ -196,11 +182,10 @@ class BucketOperationHelper():
                     log.error("Unable to get timings for bucket")
                 test_case.fail(msg)
 
-
     @staticmethod
     def print_dataStorage_content(servers):
         """"printout content of data and index path folders"""
-        #Determine whether its a cluster_run/not
+        # Determine whether its a cluster_run/not
         cluster_run = True
 
         firstIp = servers[0].ip
@@ -225,11 +210,11 @@ class BucketOperationHelper():
                     log.info("Total number of files.  No need to printout all "
                              "that flood the test log.")
                     shell = RemoteMachineShellConnection(serverInfo)
-                    #o, r = shell.execute_command("ls -LR '{0}'".format(path))
+                    # o, r = shell.execute_command("ls -LR '{0}'".format(path))
                     o, r = shell.execute_command("wc -l '{0}'".format(path))
                     shell.log_command_output(o, r)
 
-    #TODO: TRY TO USE MEMCACHED TO VERIFY BUCKET DELETION BECAUSE
+    # TODO: TRY TO USE MEMCACHED TO VERIFY BUCKET DELETION BECAUSE
     # BUCKET DELETION IS A SYNC CALL W.R.T MEMCACHED
     @staticmethod
     def wait_for_bucket_deletion(bucket,
@@ -275,14 +260,14 @@ class BucketOperationHelper():
         vbuckets = rest.get_vbuckets(bucket)
         obj = VBucketAwareMemcached(rest, bucket)
         memcacheds, vbucket_map, vbucket_map_replica = obj.request_map(rest, bucket)
-        #Create dictionary with key:"ip:port" and value: a list of vbuckets
+        # Create dictionary with key:"ip:port" and value: a list of vbuckets
         server_dict = defaultdict(list)
         for everyID in range(0, vbucket_count):
             memcached_ip_port = str(vbucket_map[everyID])
             server_dict[memcached_ip_port].append(everyID)
         while time.time() < end_time and len(ready_vbuckets) < vbucket_count:
             for every_ip_port in server_dict:
-                #Retrieve memcached ip and port
+                # Retrieve memcached ip and port
                 ip = every_ip_port.rsplit(":", 1)[0]
                 port = every_ip_port.rsplit(":", 1)[1]
                 client = MemcachedClient(ip, int(port), timeout=30)
@@ -298,8 +283,8 @@ class BucketOperationHelper():
                              "version. Using the old ssl auth to connect to "
                              "bucket.")
                     client.sasl_auth_plain(
-                    bucket_info.name.encode('ascii'),
-                    bucket_info.saslPassword.encode('ascii'))
+                        bucket_info.name.encode('ascii'),
+                        bucket_info.saslPassword.encode('ascii'))
                 else:
                     client.sasl_auth_plain(admin_user, admin_pass)
                     try:
@@ -348,13 +333,22 @@ class BucketOperationHelper():
         log = logger.Logger.get_logger()
         msg = "waiting for memcached bucket : {0} in {1} to accept set ops"
         log.info(msg.format(bucket, node.ip))
-        all_vbuckets_ready = BucketOperationHelper.wait_for_vbuckets_ready_state(node,
-                                                bucket, timeout_in_seconds, log_msg)
+        try:
+            all_vbuckets_ready = \
+                BucketOperationHelper.wait_for_vbuckets_ready_state(
+                    node, bucket, timeout_in_seconds, log_msg)
+        except Exception as err:
+            log.warning("Exception during wait_for_vbs: %s, will retry" % err)
+            time.sleep(5)
+            all_vbuckets_ready = \
+                BucketOperationHelper.wait_for_vbuckets_ready_state(
+                    node, bucket, timeout_in_seconds, log_msg)
         # return (counter == vbucket_count) and all_vbuckets_ready
         return all_vbuckets_ready
 
     @staticmethod
-    def verify_data(server, keys, value_equal_to_key, verify_flags, test, debug=False, bucket="default", collection=None):
+    def verify_data(server, keys, value_equal_to_key, verify_flags, test, debug=False, bucket="default",
+                    scope=None, collection=None):
         log = logger.Logger.get_logger()
         log_error_count = 0
         # verify all the keys
@@ -369,7 +363,7 @@ class BucketOperationHelper():
                 index += 1
                 vbucketId = crc32.crc32_hash(key) & (vbucket_count - 1)
                 client.vbucketId = vbucketId
-                flag, keyx, value = client.get(key=key, collection=collection)
+                flag, keyx, value = client.get(key=key, scope=scope, collection=collection)
                 if value_equal_to_key:
                     test.assertEqual(value.decode(), key, msg='values dont match')
                 if verify_flags:
@@ -393,23 +387,24 @@ class BucketOperationHelper():
         return all_verified
 
     @staticmethod
-    def keys_dont_exist(server, keys, bucket, collection=None):
+    def keys_dont_exist(server, keys, bucket, scope=None, collection=None):
         log = logger.Logger.get_logger()
-        #verify all the keys
+        # verify all the keys
         client = MemcachedClientHelper.direct_client(server, bucket)
         vbucket_count = len(RestConnection(server).get_vbuckets(bucket))
-        #populate key
+        # populate key
         for key in keys:
             try:
                 vbucketId = crc32.crc32_hash(key) & (vbucket_count - 1)
                 client.vbucketId = vbucketId
-                client.get(key=key, collection=collection)
+                client.get(key=key, scope=scope, collection=collection)
                 client.close()
                 log.error('key {0} should not exist in the bucket'.format(key))
                 return False
             except mc_bin_client.MemcachedError as error:
                 log.error(error)
-                log.error("expected memcachedError : {0} - unable to get a pre-inserted key : {1}".format(error.status, key))
+                log.error(
+                    "expected memcachedError : {0} - unable to get a pre-inserted key : {1}".format(error.status, key))
         client.close()
         return True
 
@@ -423,7 +418,7 @@ class BucketOperationHelper():
         return keys_chunks
 
     @staticmethod
-    def keys_exist_or_assert_in_parallel(keys, server, bucket_name, test, concurrency=2, collection=None):
+    def keys_exist_or_assert_in_parallel(keys, server, bucket_name, test, concurrency=2, scope=None, collection=None):
         log = logger.Logger.get_logger()
         verification_threads = []
         queue = Queue()
@@ -431,7 +426,7 @@ class BucketOperationHelper():
             keys_chunk = BucketOperationHelper.chunks(keys, len(keys) // concurrency)
             t = Thread(target=BucketOperationHelper.keys_exist_or_assert,
                        name="verification-thread-{0}".format(i),
-                       args=(keys_chunk.get(i), server, bucket_name, test, queue, collection))
+                       args=(keys_chunk.get(i), server, bucket_name, test, queue, scope, collection))
             verification_threads.append(t)
         for t in verification_threads:
             t.start()
@@ -445,7 +440,7 @@ class BucketOperationHelper():
         return True
 
     @staticmethod
-    def keys_exist_or_assert(keys, server, bucket_name, test, queue=None, collection=None):
+    def keys_exist_or_assert(keys, server, bucket_name, test, queue=None, scope=None, collection=None):
         # we should try out at least three times
         log = logger.Logger.get_logger()
         # verify all the keys
@@ -462,7 +457,7 @@ class BucketOperationHelper():
             keys_not_verified = []
             for key in keys_left_to_verify:
                 try:
-                    client.get(key=key, collection=collection)
+                    client.get(key=key, scope=scope, collection=collection)
                 except mc_bin_client.MemcachedError as error:
                     keys_not_verified.append(key)
                     if log_count < 100:
@@ -494,13 +489,13 @@ class BucketOperationHelper():
 
     @staticmethod
     def load_some_data(serverInfo,
-                   fill_ram_percentage=10.0,
-                   bucket_name='default',collection=None):
+                       fill_ram_percentage=10.0,
+                       bucket_name='default', scope=None, collection=None):
         log = logger.Logger.get_logger()
         if fill_ram_percentage <= 0.0:
             fill_ram_percentage = 5.0
         client = MemcachedClientHelper.direct_client(serverInfo, bucket_name)
-        #populate key
+        # populate key
         rest = RestConnection(serverInfo)
         RestHelper(rest).vbucket_map_ready(bucket_name, 60)
         vbucket_count = len(rest.get_vbuckets(bucket_name))
@@ -522,7 +517,7 @@ class BucketOperationHelper():
             vbucketId = crc32.crc32_hash(key) & (vbucket_count - 1)
             client.vbucketId = vbucketId
             try:
-                client.set(key, 0, 0, key, collection=collection)
+                client.set(key, 0, 0, key, scope=scope, collection=collection)
                 inserted_keys.append(key)
             except mc_bin_client.MemcachedError as error:
                 log.error(error)

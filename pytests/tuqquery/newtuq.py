@@ -59,6 +59,8 @@ class QueryTests(BaseTestCase):
             for bucket in self.buckets:
                 self.cluster.bucket_flush(self.master, bucket=bucket,
                                           timeout=self.wait_timeout * 5)
+            # Adding sleep after flushing buckets (see CBQE-5838)
+            self.sleep(210)
             self.gens_load = self.generate_docs(self.docs_per_day)
             self.load(self.gens_load, flag=self.item_flag)
             if self.analytics:
@@ -246,9 +248,6 @@ class QueryTests(BaseTestCase):
         username = rest.username
         password = rest.password
         cred_params['creds'].append({'user': username, 'pass': password})
-        for bucket in self.buckets:
-            if bucket.saslPassword:
-                cred_params['creds'].append({'user': 'local:%s' % bucket.name, 'pass': bucket.saslPassword})
         query_params.update(cred_params)
         if self.use_rest:
             query_params.update({'scan_consistency': self.scan_consistency})

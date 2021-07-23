@@ -16,6 +16,7 @@ from remote.remote_util import RemoteMachineShellConnection
 from .newupgradebasetest import NewUpgradeBaseTest
 from rebalance.rebalance_base import RebalanceBaseTest
 from couchbase_helper.documentgenerator import BlobGenerator
+from testconstants import COUCHBASE_FROM_SPOCK, COUCHBASE_FROM_CHESHIRE_CAT
 
 
 
@@ -56,6 +57,7 @@ class UpgradeTests(NewUpgradeBaseTest, EventingBaseTest):
         self.final_events = []
         self.n1ql_helper = None
         self.total_buckets = 1
+        self.fts_port = 8094
         self.in_servers_pool = self._convert_server_map(self.servers[:self.nodes_init])
         """ Init nodes to not upgrade yet """
         for key in list(self.in_servers_pool.keys()):
@@ -131,7 +133,22 @@ class UpgradeTests(NewUpgradeBaseTest, EventingBaseTest):
             self.maxParallelReplicaIndexers, self.port)
         self.add_built_in_server_user(node=self.master)
         self.bucket_size = self._get_bucket_size(self.quota, self.total_buckets)
-        self.create_buckets()
+        if self.travel_sample_bucket:
+            shell = RemoteMachineShellConnection(self.master)
+            shell.execute_command("""curl -g -v -u Administrator:password \
+                         -X POST http://{0}:8091/sampleBuckets/install \
+                         -d  '["travel-sample"]'""".format(self.master.ip))
+            shell.disconnect()
+
+            buckets = RestConnection(self.master).get_buckets()
+            for bucket in buckets:
+                if bucket.name != "travel-sample":
+                    self.fail("travel-sample bucket did not create")
+            self.sleep(60, "time needs to load data to travel- sample")
+            if self.dgm_run:
+                self.create_buckets()
+        else:
+            self.create_buckets()
         self.n1ql_server = None
         self.success_run = True
         self.failed_thread = None
@@ -200,6 +217,8 @@ class UpgradeTests(NewUpgradeBaseTest, EventingBaseTest):
            doc-per-day=1,upgrade_type=offline,offline_upgrade_type=offline_failover
     """
     def test_upgrade(self):
+        from pytests.fts.fts_callable import FTSCallable
+        self.fts_obj = FTSCallable(nodes=self.servers, es_validate=True)
         self.event_threads = []
         self.after_event_threads = []
         try:
@@ -354,6 +373,7 @@ class UpgradeTests(NewUpgradeBaseTest, EventingBaseTest):
 
     def upgrade_event(self):
         self.log.info("upgrade_event")
+        self.start_upgrade_server = True
         thread_list = []
         if self.upgrade_type == "online":
             t = threading.Thread(target=self.online_upgrade, args=())
@@ -505,7 +525,7 @@ class UpgradeTests(NewUpgradeBaseTest, EventingBaseTest):
                 self.servers)
             info = self.rest.get_nodes_self()
             self.rest.create_bucket(bucket=bucket,
-                ramQuotaMB=512, authType='sasl', timeSynchronization=self.time_synchronization)
+                ramQuotaMB=512, timeSynchronization=self.time_synchronization)
             try:
                 ready = BucketOperationHelper.wait_for_memcached(self.master,
                     bucket)
@@ -555,6 +575,8 @@ class UpgradeTests(NewUpgradeBaseTest, EventingBaseTest):
                 self.sasl_buckets = 1
                 self.sasl_bucket_name = self.sasl_bucket_name + "_" \
                                             + str(self.total_buckets)
+            else:
+                self.bucket_size = 512
             self.rest = RestConnection(self.master)
             self._bucket_creation()
             self.sleep(5, "sleep after create bucket")
@@ -573,7 +595,7 @@ class UpgradeTests(NewUpgradeBaseTest, EventingBaseTest):
             #Change Bucket Properties
             for bucket in self.buckets:
                 self.rest.change_bucket_props(bucket, ramQuotaMB=None,\
-                       authType=None, saslPassword=None, replicaNumber=0,\
+                        replicaNumber=0,\
                     proxyPort=None, replicaIndex=None, flushEnabled=False)
         except Exception as ex:
             self.log.info(ex)
@@ -617,7 +639,13 @@ class UpgradeTests(NewUpgradeBaseTest, EventingBaseTest):
                 self.after_upgrade_services_in.pop(0)
             self.sleep(10, "wait 10 seconds after rebalance")
             if free_node_in and free_node_in[0] not in self.servers:
-                self.servers.append(free_node_in[0])
+                found_node = False
+                for server in self.servers:
+                    if free_node_in[0].ip in server.ip:
+                        found_node = True
+                        break
+                if not found_node:
+                    self.servers.append(free_node_in[0])
         except Exception as ex:
             self.log.info(ex)
             if queue is not None:
@@ -866,8 +894,12 @@ class UpgradeTests(NewUpgradeBaseTest, EventingBaseTest):
                 if node.ip not in kv_maps:
                     del kv_nodes[i]
             self.cbas_node = cbas_node
+            items_travel_sample = 63182
+            if cb_version[:5] in COUCHBASE_FROM_CHESHIRE_CAT:
+                items_travel_sample = 63288
             self.load_sample_buckets(servers=kv_nodes, bucketName="travel-sample",
-                                              total_items=31591, rest=cbas_rest)
+                                                  total_items=items_travel_sample,
+                                                  rest=cbas_rest)
             self.test_create_dataset_on_bucket()
         except Exception as e:
             self.log.info(e)
@@ -939,7 +971,8 @@ class UpgradeTests(NewUpgradeBaseTest, EventingBaseTest):
                     self.cluster.rebalance(list(servers.values()),
                                            list(servers_in.values()),
                                            list(servers_out.values()),
-                                           services=[servicesNodeOut])
+                                           services=[servicesNodeOut],
+                                           sleep_before_rebalance=15)
                 elif self.upgrade_services_in is not None \
                         and len(self.upgrade_services_in) > 0:
                     tem_services = self.upgrade_services_in[
@@ -948,15 +981,16 @@ class UpgradeTests(NewUpgradeBaseTest, EventingBaseTest):
                     self.cluster.rebalance(list(servers.values()),
                                            list(servers_in.values()),
                                            list(servers_out.values()),
-                                           services=tem_services)
+                                           services=tem_services,
+                                           sleep_before_rebalance=15)
                     start_services_num += len(list(servers_in.values()))
                 else:
                     self.cluster.rebalance(list(servers.values()),
                                            list(servers_in.values()),
-                                           list(servers_out.values()))
-            except Exception as ex:
-                self.log.info(ex)
-                raise
+                                           list(servers_out.values()),
+                                           sleep_before_rebalance=15)
+            except BaseException as ex:
+                self.fail(ex)
             self.out_servers_pool = servers_out
             self.in_servers_pool = new_servers
             servers = new_servers
@@ -1069,7 +1103,13 @@ class UpgradeTests(NewUpgradeBaseTest, EventingBaseTest):
                 self.after_upgrade_services_in.pop(0)
             self.sleep(10, "wait 10 seconds after rebalance")
             if free_node_in and free_node_in[0] not in self.servers:
-                self.servers.append(free_node_in[0])
+                found_node = False
+                for server in self.servers:
+                    if free_node_in[0].ip in server.ip:
+                        found_node = True
+                        break
+                if not found_node:
+                    self.servers.append(free_node_in[0])
         except Exception as ex:
             self.log.info("Rebalance failed with : {0}".format(str(ex)))
             self.check_retry_rebalance_succeeded()

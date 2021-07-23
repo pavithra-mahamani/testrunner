@@ -1,9 +1,13 @@
 import copy
 import os, shutil, ast, re, subprocess
 import json
+import uuid
 import random
+import queue
 import urllib.request, urllib.parse, urllib.error, datetime
 
+from boto3 import s3, resource
+from botocore.exceptions import ClientError
 from basetestcase import BaseTestCase
 from TestInput import TestInputSingleton, TestInputServer
 from couchbase_helper.data_analysis_helper import DataCollector
@@ -13,7 +17,7 @@ from ent_backup_restore.validation_helpers.backup_restore_validations \
     import BackupRestoreValidations
 from membase.helper.bucket_helper import BucketOperationHelper
 from membase.helper.cluster_helper import ClusterOperationHelper
-from remote.remote_util import RemoteMachineShellConnection
+from remote.remote_util import RemoteUtilHelper, RemoteMachineShellConnection
 from membase.api.rest_client import RestHelper, RestConnection, \
     Bucket as CBBucket
 from couchbase_helper.document import View
@@ -29,6 +33,8 @@ from couchbase.bucket import Bucket
 
 from lib.couchbase_helper.tuq_generators import JsonGenerator
 from lib.memcached.helper.data_helper import VBucketAwareMemcached, MemcachedClientHelper
+
+from ent_backup_restore.provider.s3 import S3
 
 SOURCE_CB_PARAMS = {
     "authUser": "default",
@@ -64,6 +70,12 @@ class EnterpriseBackupRestoreBase(BaseTestCase):
         self.cluster_flag = "--host"
         self.backupset = Backupset()
         self.cmd_ext = ""
+        self.backup_outputs = []
+        self.restore_outputs = []
+        self.backup_errors = []
+        self.restore_errors = []
+        self.create_bucket_count = 0
+        self.restore_consistent_metadata = self.input.param("restore_consistent_metadata", False)
         self.should_fail = self.input.param("should-fail", False)
         self.restore_should_fail = self.input.param("restore_should_fail", False)
         self.merge_should_fail = self.input.param("merge_should_fail", False)
@@ -155,7 +167,11 @@ class EnterpriseBackupRestoreBase(BaseTestCase):
         else:
             raise Exception("OS not supported.")
         self.backup_validation_files_location = "/tmp/backuprestore" + self.master.ip
-        self.backupset.backup_host = self.input.clusters[1][0]
+        if self.input.bkrs_client is not None:
+            self.backupset.backup_host = self.input.bkrs_client
+        else:
+            self.backupset.backup_host = self.input.clusters[1][0]
+
         self.backupset.directory += "_" + self.master.ip
         self.backupset.name = self.input.param("name", "backup")
         self.non_master_host = self.input.param("non-master", False)
@@ -184,6 +200,10 @@ class EnterpriseBackupRestoreBase(BaseTestCase):
         self.restore_only = self.input.param("restore-only", False)
         self.replace_ttl = self.input.param("replace-ttl", None)
         self.vbucket_filter = self.input.param("vbucket-filter", None)
+        self.bkinfo_start = self.input.param("bkinfo_start", 0)
+        self.bkinfo_date_start_ago = self.input.param("bkinfo_date_start_ago", 0)
+        self.bkinfo_end = self.input.param("bkinfo_end", 0)
+        self.bkinfo_start_end_with_bkname = self.input.param("bkinfo_start_end_with_bkname", None)
         self.restore_compression_mode = self.input.param("restore-compression-mode", None)
         self.force_version_upgrade = self.input.param("force-version-upgrade", None)
         if self.non_master_host:
@@ -215,6 +235,10 @@ class EnterpriseBackupRestoreBase(BaseTestCase):
         if self.cluster_new_user:
             self.backupset.cluster_host_username = self.cluster_new_user
             self.backupset.restore_cluster_host_username = self.cluster_new_user
+        """ Get cb version of cbm client from bkrs client server """
+        if self.backupset.current_bkrs_client_version is None:
+            self.backupset.current_bkrs_client_version = \
+                        self._get_current_bkrs_client_version()
         include_buckets = self.input.param("include-buckets", "")
         include_buckets = include_buckets.split(",") if include_buckets else []
         exclude_buckets = self.input.param("exclude-buckets", "")
@@ -225,9 +249,12 @@ class EnterpriseBackupRestoreBase(BaseTestCase):
         self.backupset.disable_views = self.input.param("disable-views", False)
         self.backupset.disable_gsi_indexes = self.input.param("disable-gsi-indexes", False)
         self.backupset.disable_ft_indexes = self.input.param("disable-ft-indexes", False)
+        self.backupset.disable_ft_alias = self.input.param("disable-ft-alias", False)
+        self.backupset.disable_analytics = self.input.param("disable-analytics", False)
         self.backupset.disable_data = self.input.param("disable-data", False)
-        self.backupset.disable_conf_res_restriction = self.input.param("disable-conf-res-restriction", None)
+        self.backupset.disable_conf_res_restriction = self.input.param("disable-conf-res-restriction", False)
         self.backupset.force_updates = self.input.param("force-updates", False)
+        self.backupset.auto_create_buckets = self.input.param("auto-create-buckets", False)
         self.backupset.resume = self.input.param("resume", False)
         self.backupset.purge = self.input.param("purge", False)
         self.backupset.threads = self.input.param("threads", self.number_of_processors())
@@ -253,14 +280,6 @@ class EnterpriseBackupRestoreBase(BaseTestCase):
         self.backupset.backup_compressed = \
             self.input.param("backup-conpressed", False)
         self.backups = []
-        self.validation_helper = BackupRestoreValidations(self.backupset,
-                                                          self.cluster_to_backup,
-                                                          self.cluster_to_restore,
-                                                          self.buckets,
-                                                          self.backup_validation_files_location,
-                                                          self.backups,
-                                                          self.num_items,
-                                                          self.vbuckets)
         self.number_of_backups_taken = 0
         self.vbucket_seqno = []
         self.expires = self.input.param("expires", 0)
@@ -286,43 +305,99 @@ class EnterpriseBackupRestoreBase(BaseTestCase):
             os.mkdir(self.backup_validation_files_location)
         shell.disconnect()
 
+        # Common configuration which are shared accross cloud providers
+        self.backupset.objstore_access_key_id = self.input.cbbackupmgr_param('access_key_id', '')
+        self.backupset.objstore_bucket = self.input.cbbackupmgr_param('bucket', str(uuid.uuid1()))
+        self.backupset.objstore_cacert = self.input.cbbackupmgr_param('cacert', '')
+        self.backupset.objstore_endpoint = self.input.cbbackupmgr_param('endpoint', '')
+        self.backupset.objstore_no_ssl_verify = self.input.cbbackupmgr_param('no_ssl_verify', False)
+        self.backupset.objstore_region = self.input.cbbackupmgr_param('region', '')
+        self.backupset.objstore_secret_access_key = self.input.cbbackupmgr_param('secret_access_key', '') # Required
+        self.backupset.objstore_staging_directory = self.change_root_of_path(info, self.input.cbbackupmgr_param('staging_directory'))
+
+        # S3 specific configuration
+        self.backupset.s3_force_path_style = self.input.cbbackupmgr_param('s3_force_path_style', False)
+
+        # The setup/teardown is provider specific, this is hidden behind the 'Provider' abstract class
+        self.objstore_provider = None
+        provider = self.input.param("objstore_provider", None)
+        if provider == "s3":
+            self.objstore_provider = S3(self.backupset.objstore_access_key_id, self.backupset.objstore_bucket,
+                                        self.backupset.objstore_cacert, self.backupset.objstore_endpoint,
+                                        self.backupset.objstore_no_ssl_verify, self.backupset.objstore_region,
+                                        self.backupset.objstore_secret_access_key,
+                                        self.backupset.objstore_staging_directory)
+
+        # We run in a separate branch so when we add more providers the setup will be run by default
+        if provider:
+            # Override and use the same archive directory across platforms
+            self.backupset.directory = f"archive-{self.master.ip}"
+            self.objstore_provider.setup()
+
+        self.validation_helper = BackupRestoreValidations(self.backupset,
+                                                          self.cluster_to_backup,
+                                                          self.cluster_to_restore,
+                                                          self.buckets,
+                                                          self.backup_validation_files_location,
+                                                          self.backups,
+                                                          self.num_items,
+                                                          self.vbuckets,
+                                                          self.objstore_provider)
+
+    def clean_up(self, server, skip_eject_and_rebalance=False):
+        """ Clean up files and directories left by backup testing.
+
+        Params:
+            server (TestInputServer): The server to clean up.
+        """
+        remote_client = RemoteMachineShellConnection(server)
+        info = remote_client.extract_remote_info().type.lower()
+        self.tmp_path = "/tmp/"
+        if info == 'linux' or info == 'mac':
+            backup_directory = "/tmp/entbackup"
+        elif info == 'windows':
+            self.tmp_path = WIN_TMP_PATH
+            backup_directory = WIN_TMP_PATH_RAW + "entbackup"
+        else:
+            raise Exception("OS not supported.")
+        backup_directory += "_" + self.master.ip
+        validation_files_location = "%sbackuprestore" % self.tmp_path + self.master.ip
+        if info == 'linux':
+            command = "rm -rf {0}".format(backup_directory)
+            output, error = remote_client.execute_command(command)
+            remote_client.log_command_output(output, error)
+        elif info == 'windows':
+            remote_client.remove_directory_recursive(backup_directory)
+        if info == 'linux':
+            command = "rm -rf /cbqe3043/entbackup"
+            output, error = remote_client.execute_command(command)
+            remote_client.log_command_output(output, error)
+        if not skip_eject_and_rebalance and self.input.clusters:
+            for key in list(self.input.clusters.keys()):
+                servers = self.input.clusters[key]
+                try:
+                    self.backup_reset_clusters(servers)
+                except:
+                    self.log.error("was not able to cleanup cluster the first time")
+                    self.backup_reset_clusters(servers)
+        if os.path.exists(validation_files_location):
+            self.log.info("delete dir %s" % validation_files_location)
+            shutil.rmtree(validation_files_location)
+
+        # testrunner runs the teardown before running setup which means the 'objstore_provider' will be undefined
+        # we can continue in this case knowing that we haven't yet loaded any data into the cloud.
+        try:
+            if self.objstore_provider:
+                self.objstore_provider.teardown(info, remote_client)
+        except AttributeError:
+            pass
+
+        remote_client.disconnect()
+
     def tearDown(self):
         super(EnterpriseBackupRestoreBase, self).tearDown()
         if not self.input.param("skip_cleanup", False):
-            remote_client = RemoteMachineShellConnection(self.input.clusters[1][0])
-            info = remote_client.extract_remote_info().type.lower()
-            self.tmp_path = "/tmp/"
-            if info == 'linux' or info == 'mac':
-                backup_directory = "/tmp/entbackup"
-            elif info == 'windows':
-                self.tmp_path = WIN_TMP_PATH
-                backup_directory = WIN_TMP_PATH_RAW + "entbackup"
-            else:
-                raise Exception("OS not supported.")
-            backup_directory += "_" + self.master.ip
-            validation_files_location = "%sbackuprestore" % self.tmp_path + self.master.ip
-            if info == 'linux':
-                command = "rm -rf {0}".format(backup_directory)
-                output, error = remote_client.execute_command(command)
-                remote_client.log_command_output(output, error)
-            elif info == 'windows':
-                remote_client.remove_directory_recursive(backup_directory)
-            if info == 'linux':
-                command = "rm -rf /cbqe3043/entbackup"
-                output, error = remote_client.execute_command(command)
-                remote_client.log_command_output(output, error)
-            if self.input.clusters:
-                for key in list(self.input.clusters.keys()):
-                    servers = self.input.clusters[key]
-                    try:
-                        self.backup_reset_clusters(servers)
-                    except:
-                        self.log.error("was not able to cleanup cluster the first time")
-                        self.backup_reset_clusters(servers)
-            if os.path.exists(validation_files_location):
-                self.log.info("delete dir %s" % validation_files_location)
-                shutil.rmtree(validation_files_location)
-            remote_client.disconnect()
+            self.clean_up(self.input.clusters[1][0])
 
     @property
     def cluster_to_backup(self):
@@ -347,6 +422,19 @@ class EnterpriseBackupRestoreBase(BaseTestCase):
             numprocs = sysinfo['Processor(s)'].split(' ')
             return numprocs[0]
 
+    def change_root_of_path(self, os_info, path):
+        """ If the operating system is windows changes the path's root to c:/ """
+        if os_info == "windows":
+            path = re.sub(r"^/", "c:/", path)
+        return path
+
+    def _get_current_bkrs_client_version(self):
+        self.backupset.current_bkrs_client_version = \
+                        RestConnection(self.backupset.backup_host).get_nodes_version()
+        self.backupset.current_bkrs_client_version = \
+                   "-".join(self.backupset.current_bkrs_client_version.split('-')[:2])
+        return self.backupset.current_bkrs_client_version
+
     def backup_reset_clusters(self, servers):
         BucketOperationHelper.delete_all_buckets_or_assert(servers, self)
         ClusterOperationHelper.cleanup_cluster(servers, master=servers[0])
@@ -367,11 +455,25 @@ class EnterpriseBackupRestoreBase(BaseTestCase):
                     self.fail(e)
 
     def backup_create(self, del_old_backup=True):
-        args = "config --archive {0} --repo {1}".format(self.backupset.directory, self.backupset.name)
+        args = (
+            f"config --archive {self.objstore_provider.schema_prefix() + self.backupset.objstore_bucket + '/' if self.objstore_provider else ''}{self.backupset.directory}"
+            f" --repo {self.backupset.name}"
+            f"{self._common_objstore_arguments()}"
+        )
+
+        cbbkmgr_version = RestConnection(self.backupset.backup_host).get_nodes_version()
+        exclude_bucket = " --exclude-data "
+        include_bucket = " --include-data "
+        if cbbkmgr_version[:3] == "6.6":
+            # in 6.6, flags keep the same name with 6.5
+            exclude_bucket = " --exclude-buckets "
+            include_bucket = " --include-buckets "
         if self.backupset.exclude_buckets:
-            args += " --exclude-data \"{0}\"".format(",".join(self.backupset.exclude_buckets))
+            args += " {0} \"{1}\"".format(exclude_bucket,
+                                          ",".join(self.backupset.exclude_buckets))
         if self.backupset.include_buckets:
-            args += " --include-data \"{0}\"".format(",".join(self.backupset.include_buckets))
+            args += " {0} \"{1}\"".format(include_bucket,
+                                          ",".join(self.backupset.include_buckets))
         if self.backupset.disable_bucket_config:
             args += " --disable-bucket-config"
         if self.backupset.disable_views:
@@ -380,8 +482,16 @@ class EnterpriseBackupRestoreBase(BaseTestCase):
             args += " --disable-gsi-indexes"
         if self.backupset.disable_ft_indexes:
             args += " --disable-ft-indexes"
+        if self.backupset.disable_ft_alias:
+            args += " --disable-ft-alias"
+        if self.backupset.disable_analytics:
+            args += " --disable-analytics"
         if self.backupset.disable_data:
             args += " --disable-data"
+        if self.backupset.current_bkrs_client_version[:3] >= "7.0":
+            if self.vbucket_filter is not None:
+                args += " --vbucket-filter {0}".format(self.vbucket_filter)
+
         if self.backupset.log_to_stdout:
             args += " --log-to-stdout"
         if self.vbucket_filter:
@@ -395,18 +505,33 @@ class EnterpriseBackupRestoreBase(BaseTestCase):
         remote_client = RemoteMachineShellConnection(self.backupset.backup_host)
         command = "{0}/cbbackupmgr {1}".format(self.cli_command_location, args)
         if del_old_backup:
-            self.log.info("Remove any old dir before create new one")
+            # Since we are just wiping out the archive here, we can just run the object store teardown
+            if self.objstore_provider:
+                self.objstore_provider.teardown(remote_client.extract_remote_info().type.lower(), remote_client)
+
             remote_client.execute_command("rm -rf {0}".format(self.backupset.directory))
+            if self.os_info == "windows":
+                remote_client.execute_command("rm -rf /cygdrive/c/tmp/cbbackupmgr-staging")
+
         output, error = remote_client.execute_command(command)
         remote_client.log_command_output(output, error)
         remote_client.disconnect()
         return output, error
 
-    def backup_info(self, json_out=True):
-        args = "info --archive {0} --repo {1}".format(self.backupset.directory, self.backupset.name)
-        if json_out:
-            args += " --json"
+    def backup_info(self, json_out=True, start=None, end=None):
+        args = (
+            f"info --archive {self.objstore_provider.schema_prefix() + self.backupset.objstore_bucket + '/' if self.objstore_provider else ''}{self.backupset.directory}"
+            f" --repo {self.backupset.name} "
+            f"{self._common_objstore_arguments()}"
+            f"{' --json' if json_out else ''}"
+        )
 
+        if start is not None:
+            args += " --start {}".format(start)
+            if end is not None:
+                args += " --end {}".format(end)
+            else:
+                self.fail("start flag needs end flag to work")
         remote_client = RemoteMachineShellConnection(self.backupset.backup_host)
         command = "{0}/cbbackupmgr {1}".format(self.cli_command_location, args)
         output, error = remote_client.execute_command(command)
@@ -416,18 +541,29 @@ class EnterpriseBackupRestoreBase(BaseTestCase):
 
     def _verify_backup_directory_count(self, expected):
         shell = RemoteMachineShellConnection(self.backupset.backup_host)
-        output, _ = shell.execute_command("ls -l {}/{} | wc -l".format(self.backupset.directory,
-                                                                       self.backupset.name))
+        command = (
+            f"ls -l {self.backupset.objstore_staging_directory + '/' if self.objstore_provider else ''}"
+            f"{self.backupset.directory}/{self.backupset.name} | wc -l"
+        )
+
+        output, _ = shell.execute_command(command)
         output = " ".join(output)
+
         try:
             count = int(output)
-            if count != expected + 2:
-                self.fail(
-                    "Number of backup directories {0} does not match expected {1}".format(count - 2, expected + 2))
+            self.assertEqual(count - 3, expected,
+                             "Number of backup directories {0} does not match expected {1}".format(count - 3, expected))
         except ValueError as e:
             self.fail("Could not get the number of backups in the archive due to: {0}".format(e))
 
         shell.disconnect()
+
+        # It's important that we check to ensure the backups were removed in object store as well as in the staging
+        # directory.
+        if self.objstore_provider:
+            count = len(self.objstore_provider.list_backups(self.backupset.directory, self.backupset.name))
+            self.assertEqual(count, expected,
+                             f"Number of remote backup directories {count} does not match expected {expected}")
 
     def backup_create_validate(self):
         output, error = self.backup_create()
@@ -461,21 +597,23 @@ class EnterpriseBackupRestoreBase(BaseTestCase):
 
         """ Print out of cbbackupmgr from 6.5 is different with older version """
         self.cbbkmgr_version = "6.5"
-        self.bk_printout = "Backup successfully completed".split(",")
+        self.bk_printout = ["Backup completed successfully", "Backup successfully completed"]
         if RestHelper(RestConnection(self.backupset.backup_host)).is_ns_server_running():
             self.cbbkmgr_version = RestConnection(self.backupset.backup_host).get_nodes_version()
 
         if "4.6" <= self.cbbkmgr_version[:3]:
             self.cluster_flag = "--cluster"
 
-        args = "backup --archive {0} --repo {1} {6} http{7}://{2}:{8}{3} " \
-               "{4} {5}".format(self.backupset.directory, self.backupset.name,
-                                self.backupset.cluster_host.ip,
-                                self.backupset.cluster_host.port,
-                                user_input,
-                                password_input,
-                                self.cluster_flag, url_format,
-                                secure_port)
+        args = (
+            f"backup --archive {self.objstore_provider.schema_prefix() + self.backupset.objstore_bucket + '/' if self.objstore_provider else ''}{self.backupset.directory}"
+            f" --repo {self.backupset.name}"
+            f" {self.cluster_flag} http{url_format}://{self.backupset.cluster_host.ip}:{secure_port}{self.backupset.cluster_host.port}"
+            f" {user_input}"
+            f" {password_input}"
+            f"{' --full-backup' if self.backupset.full_backup else ''}"
+            f"{self._common_objstore_arguments()}"
+        )
+
         if self.backupset.no_ssl_verify:
             args += " --no-ssl-verify"
         if self.backupset.secure_conn:
@@ -514,6 +652,8 @@ class EnterpriseBackupRestoreBase(BaseTestCase):
                                                        password_env, user_env)
 
         output, error = remote_client.execute_command(command)
+        self.backup_outputs.append(output)
+        self.backup_errors.append(error)
         if self.debug_logs:
             remote_client.log_command_output(output, error)
 
@@ -524,7 +664,12 @@ class EnterpriseBackupRestoreBase(BaseTestCase):
                 self.log.error("Failed to backup bucket {0}".format(bucket.name))
                 return output, error
 
-        command = "ls -tr {0}/{1} | tail -1".format(self.backupset.directory, self.backupset.name)
+        pattern = r"^\d{4}-\d{2}-\d{2}"
+        command = (
+            f"ls -tr {self.backupset.objstore_staging_directory + '/' if self.objstore_provider else ''}"
+            f"{self.backupset.directory}/{self.backupset.name}/ | grep -P '{pattern}' | tail -1"
+        )
+
         o, e = remote_client.execute_command(command)
         if o:
             self.backups.append(o[0])
@@ -564,11 +709,12 @@ class EnterpriseBackupRestoreBase(BaseTestCase):
             self.validation_helper.store_latest(self.cluster_to_backup, self.buckets, self.number_of_backups_taken,
                                                 self.backup_validation_files_location)
             self.validation_helper.store_range_json(self.buckets, self.number_of_backups_taken,
-                                                    self.backup_validation_files_location)
+                                                    self.backup_validation_files_location,
+                                                    self.objstore_provider)
 
     def backup_restore(self):
         if self.restore_only:
-            self.backups.append("2019-11-21T14_54_50.808254198-08_00")
+            self.backups.append("2020-07-28T16_20_05.720270674-07_00")
         if self.vbuckets_filter_no_data:
             self.log.info("No data in backup repo as expected.")
             return
@@ -600,19 +746,20 @@ class EnterpriseBackupRestoreBase(BaseTestCase):
             password_input = "-p "
 
         version = RestConnection(self.backupset.backup_host).get_nodes_version()
-        if "4.6" <= version:
+        if "4.6" <= self.backupset.current_bkrs_client_version[:3]:
             self.cluster_flag = "--cluster"
 
-        args = "restore --archive {0} --repo {1} {2} http{9}://{3}:{10}{4} " \
-               "{5} {6} --start {7} --end {8}" \
-            .format(self.backupset.directory,
-                    self.backupset.name,
-                    self.cluster_flag,
-                    self.backupset.restore_cluster_host.ip,
-                    self.backupset.restore_cluster_host.port,
-                    user_input,
-                    password_input,
-                    backup_start, backup_end, url_format, secure_port)
+        args = (
+            f"restore --archive {self.objstore_provider.schema_prefix() + self.backupset.objstore_bucket + '/' if self.objstore_provider else ''}{self.backupset.directory}"
+            f" --repo {self.backupset.name}"
+            f" {self.cluster_flag} http{url_format}://{self.backupset.restore_cluster_host.ip}:{secure_port}{self.backupset.restore_cluster_host.port}"
+            f" {user_input}"
+            f" {password_input}"
+            f" --start {backup_start}"
+            f" --end {backup_end}"
+            f"{self._common_objstore_arguments()}"
+        )
+
         if version >= "6.5" and self.backupset.auto_select_threads:
             args += " --auto-select-threads"
         if version >= "6.5" and self.backupset.log_to_stdout:
@@ -623,22 +770,22 @@ class EnterpriseBackupRestoreBase(BaseTestCase):
             if not self.backupset.rt_no_cert:
                 args += " --cacert %s" % cacert
         if self.backupset.exclude_buckets:
-            args += " --exclude-data {0}".format(self.backupset.exclude_buckets)
+            args += f" {'--exclude-data' if int(version[0]) >= 7 else '--exclude-buckets'} {''.join(self.backupset.exclude_buckets)}"
         if self.backupset.include_buckets:
-            args += " --include-data {0}".format(self.backupset.include_buckets)
-        if self.backupset.disable_bucket_config:
-            args += " --disable-bucket-config {0}".format(self.backupset.disable_bucket_config)
+            args += f" {'--include-data' if int(version[0]) >= 7 else '--include-buckets'} {''.join(self.backupset.include_buckets)}"
         if self.backupset.disable_views:
             args += " --disable-views "
         if self.backupset.disable_gsi_indexes:
-            args += " --disable-gsi-indexes {0}".format(self.backupset.disable_gsi_indexes)
+            args += " --disable-gsi-indexes"
         if self.backupset.disable_ft_indexes:
-            args += " --disable-ft-indexes {0}".format(self.backupset.disable_ft_indexes)
+            args += " --disable-ft-indexes"
         if self.backupset.disable_data:
-            args += " --disable-data {0}".format(self.backupset.disable_data)
-        if self.backupset.disable_conf_res_restriction is not None:
-            args += " --disable-conf-res-restriction {0}".format(
-                self.backupset.disable_conf_res_restriction)
+            args += " --disable-data"
+        if self.backupset.disable_conf_res_restriction:
+            args += " --disable-conf-res-restriction"
+        if self.backupset.auto_create_buckets:
+            RestConnection(self.backupset.cluster_host).delete_all_buckets()
+            args += " --auto-create-buckets"
         filter_chars = {"star": "*", "dot": "."}
         if self.backupset.filter_keys:
             for key in filter_chars:
@@ -680,10 +827,10 @@ class EnterpriseBackupRestoreBase(BaseTestCase):
             if len(self.buckets) > 0:
                 all_buckets = len(self.buckets)
             bucket_size = self._get_bucket_size(ram_size, all_buckets)
-            if "index" in restore_services and "fts" in restore_services:
-                bucket_size = bucket_size * .8
             if self.dgm_run:
                 bucket_size = 256
+            else:
+                bucket_size = int(bucket_size * .7)
 
             count = 0
             buckets = []
@@ -693,6 +840,8 @@ class EnterpriseBackupRestoreBase(BaseTestCase):
             reset_restore_cluster = False
             reset_cluster_count = 0
             for bucket in self.buckets:
+                if self.create_bucket_count > 0:
+                    break
                 bucket_name = bucket.name
                 if not rest_helper.bucket_exists(bucket_name):
                     if self.backupset.map_buckets is None:
@@ -714,15 +863,15 @@ class EnterpriseBackupRestoreBase(BaseTestCase):
                                 self._create_restore_cluster()
                                 reset_restore_cluster = True
                         if not self.dgm_run and int(kv_quota) > 0:
-                            bucket_size = kv_quota
+                            bucket_size = (kv_quota * 0.7)
                     if not reset_restore_cluster and reset_cluster_count == 0:
-                        self._create_restore_cluster()
+                        if self.create_bucket_count == 0:
+                            self._create_restore_cluster()
                     self.log.info("replica in bucket {0} is {1}".format(bucket.name, replicas))
                     try:
                         rest_conn.create_bucket(bucket=bucket_name,
                                                 ramQuotaMB=int(bucket_size) - 1,
                                                 replicaNumber=replicas,
-                                                authType=bucket.authType if bucket.authType else 'none',
                                                 bucketType=self.bucket_type,
                                                 proxyPort=bucket.port,
                                                 evictionPolicy=self.eviction_policy,
@@ -730,11 +879,13 @@ class EnterpriseBackupRestoreBase(BaseTestCase):
                                                 compressionMode=bucket_compression_mode)
                     except Exception as e:
                         if "unable to create bucket" in str(e):
-                            self.sleep(15, "wait for cluster ready if it was reset")
-                            rest_conn.create_bucket(bucket=bucket_name,
+                            ready = RestHelper(RestConnection(self.backupset.restore_cluster_host)).is_ns_server_running()
+                            if not ready:
+                                self.fail("Couchbase Server failed to start")
+                            else:
+                                rest_conn.create_bucket(bucket=bucket_name,
                                                     ramQuotaMB=int(bucket_size) - 1,
                                                     replicaNumber=replicas,
-                                                    authType=bucket.authType if bucket.authType else 'none',
                                                     bucketType=self.bucket_type,
                                                     proxyPort=bucket.port,
                                                     evictionPolicy=self.eviction_policy,
@@ -753,7 +904,6 @@ class EnterpriseBackupRestoreBase(BaseTestCase):
                     rest_conn.create_bucket(bucket=bucket_name,
                                             ramQuotaMB=int(bucket_size) - 1,
                                             replicaNumber=replicas,
-                                            authType=bucket.authType if bucket.authType else 'none',
                                             bucketType=self.bucket_type,
                                             proxyPort=bucket.port,
                                             evictionPolicy=self.eviction_policy,
@@ -804,19 +954,23 @@ class EnterpriseBackupRestoreBase(BaseTestCase):
                         self.ttl_value = "0"
                         args += " --replace-ttl {0} --replace-ttl-with 0" \
                             .format(self.replace_ttl)
+                    elif isinstance(self.replace_ttl_with, str):
+                        args += " --replace-ttl {0} --replace-ttl-with {1}" \
+                            .format(self.replace_ttl, self.replace_ttl_with)
                     else:
                         ttl_date, _ = shell.execute_command(self.rfc3339_date)
+                        if ttl_date[0] == '':
+                            ttl_date, _ = shell.execute_command("date --date='{0}\
+                                    seconds' --rfc-3339=seconds".format(self.replace_ttl_with))
+                            ttl_date[0] = ttl_date[0].replace(" ","T")
                         self.seconds_with_ttl, _ = shell.execute_command(self.seconds_with_ttl)
                         if self.seconds_with_ttl:
                             self.ttl_value = self.seconds_with_ttl[0]
                         if ttl_date and ttl_date[0]:
                             args += " --replace-ttl {0} --replace-ttl-with {1}" \
                                 .format(self.replace_ttl, ttl_date[0])
-                        elif isinstance(self.replace_ttl_with, str):
-                            args += " --replace-ttl {0} --replace-ttl-with {1}" \
-                                .format(self.replace_ttl, self.replace_ttl_with)
             elif self.replace_ttl == "add-none":
-                args += " --replace-ttl none"
+                args += " "
             elif self.replace_ttl == "empty-flag":
                 args += " --replace-ttl-with {0}".format(self.replace_ttl_with)
             else:
@@ -824,29 +978,41 @@ class EnterpriseBackupRestoreBase(BaseTestCase):
         command = "{3} {2} {0}/cbbackupmgr {1}".format(self.cli_command_location, args,
                                                        password_env, user_env)
         output, error = shell.execute_command_raw(command)
+        self.restore_outputs.append(output)
+        self.restore_errors.append(error)
         shell.log_command_output(output, error)
-        if not self.enable_firewall:
+        if (not self.enable_firewall) and ("community" not in getattr(self, 'cb_version', '')):
             self._verify_bucket_compression_mode(bucket_compression_mode)
 
         eventing_service_in = False
         errs_check = ["Unable to process value", "Error restoring cluster",
-                      "Expected argument for option"]
+                      "Expected argument for option",
+                      "Error restoring cluster: failed to lock archive"]
+        disable_firewall = False
+        if self.enable_firewall:
+            rs_conn = RemoteMachineShellConnection(self.backupset.restore_cluster_host)
+            rs_conn.disable_firewall()
+            rs_conn.disconnect()
+            disable_firewall = True
         rest_rs = RestConnection(self.backupset.restore_cluster_host)
         rs_cluster_services = list(rest_rs.get_nodes_services().values())
         for srv in rs_cluster_services:
             if "eventing" in srv:
                 eventing_service_in = True
                 errs_check.append("User needs one of the following permissions: cluster.eventing")
+        if disable_firewall:
+            RemoteUtilHelper.enable_firewall(self.backupset.restore_cluster_host)
         accepted_errs = False
         for err in errs_check:
             if self._check_output(err, output):
                 accepted_errs = True
                 break
 
-        if accepted_errs:
+        if accepted_errs and not self.restore_consistent_metadata:
             if not self.should_fail:
                 if not self.restore_should_fail and not eventing_service_in:
-                    self.fail("Failed to restore cluster")
+                    if not self.enable_firewall:
+                        self.fail("Failed to restore cluster")
             else:
                 self.log.info("This test is for negative test")
         res = output
@@ -857,9 +1023,12 @@ class EnterpriseBackupRestoreBase(BaseTestCase):
             bk_log_file_name = "backup.log"
             if "6.5" <= RestConnection(self.backupset.backup_host).get_nodes_version():
                 bk_log_file_name = "backup-*.log"
-            command = "cat " + self.backupset.directory + \
-                      "/logs/{0} | grep '".format(bk_log_file_name) + \
-                      error_str + "' -A 10 -B 100"
+
+            command = (
+                f"cat {self.backupset.objstore_staging_directory + '/' if self.objstore_provider else ''}"
+                f"{self.backupset.directory}/logs/{bk_log_file_name} | grep {error_str} -A 10 -B 100"
+            )
+
             output, error = shell.execute_command(command)
             shell.log_command_output(output, error)
         if 'Required Flags:' in res:
@@ -882,8 +1051,8 @@ class EnterpriseBackupRestoreBase(BaseTestCase):
             if expected_error:
                 for line in output:
                     if self.debug_logs:
-                        print(("output from cmd: ", line))
-                        print(("expect error   : ", expected_error))
+                        print("output from cmd: ", line)
+                        print("expect error   : ", expected_error)
                     if line.find(expected_error) != -1:
                         error_found = True
                         break
@@ -901,7 +1070,7 @@ class EnterpriseBackupRestoreBase(BaseTestCase):
             bk_raw_ipv6_dir = self.backupset.directory
             for x in ipv6_raw_format:
                 bk_raw_ipv6_dir = bk_raw_ipv6_dir.replace(x, "\\" + x)
-        bk_dir = self.backupset.directory
+        bk_dir = f"{self.backupset.objstore_staging_directory + '/' if self.objstore_provider else ''}{self.backupset.directory}"
         if ipv6_raw_ip:
             bk_dir = bk_raw_ipv6_dir
         command = "grep 'Restore completed successfully' " + bk_dir + \
@@ -939,6 +1108,9 @@ class EnterpriseBackupRestoreBase(BaseTestCase):
         elif self.replace_ttl == "all" or self.replace_ttl == "expired":
             self._validate_restore_replace_ttl_with(self.ttl_value)
         else:
+            if self.expires:
+                self.log.info("Remove expired items by checking them")
+                self._verify_all_buckets(self.backupset.restore_cluster_host)
             status, msg = self.validation_helper.validate_restore(self.backupset.end,
                                                                   self.vbucket_seqno, current_vseqno,
                                                                   compare_uuid=compare_uuid,
@@ -953,13 +1125,21 @@ class EnterpriseBackupRestoreBase(BaseTestCase):
         remote_client.disconnect()
 
     def backup_list(self):
-        args = "list --archive {0}".format(self.backupset.directory)
+        args = (
+            f"info --archive {self.objstore_provider.schema_prefix() + self.backupset.objstore_bucket + '/' if self.objstore_provider else ''}{self.backupset.directory}"
+            f"{self._common_objstore_arguments()}"
+            f" --all"
+            f" --json"
+        )
+
+        version = RestConnection(self.backupset.backup_host).get_nodes_version()
+
         if self.backupset.backup_list_name:
             args += " --repo {0}".format(self.backupset.backup_list_name)
         if self.backupset.backup_incr_backup:
             args += " --backup {0}".format(self.backupset.backup_incr_backup)
         if self.backupset.bucket_backup:
-            args += " --bucket {0}".format(self.backupset.bucket_backup)
+            args += f" {'--collection-string' if int(version[0]) >= 7 else '--bucket'} {self.backupset.bucket_backup}"
         remote_client = RemoteMachineShellConnection(self.backupset.backup_host)
         command = "{0}/cbbackupmgr {1}".format(self.cli_command_location, args)
         output, error = remote_client.execute_command(command)
@@ -971,6 +1151,53 @@ class EnterpriseBackupRestoreBase(BaseTestCase):
         else:
             return True, output, "Backup list obtained"
 
+    def get_backup_info(self, repo=None, backup=None, collection_string=None, json=False, all_flag=False):
+        """ Get output from cbbackupmgr info
+
+        The parent arguments for each child argument must be provided (e.g. --backup requires --repo to be set).
+
+        Args:
+            repo (str): Repository name.
+            backup (str): Backup name.
+            collection_string (str): The collection_string or bucket name.
+            json (bool): If true passes the --json flag.
+            all_flag (bool): If true passes the --all flag.
+
+        Returns:
+            list: The output lines emitted from 'cbbackupmgr info'.
+
+        """
+        args = (
+            f"info --archive {self.backupset.directory}"
+        )
+
+        version = RestConnection(self.backupset.backup_host).get_nodes_version()
+
+        if repo:
+            args += f" --repo {repo}"
+        if repo and backup:
+            args += f" --backup {backup}"
+        if repo and backup and collection_string:
+            args += f" {'--collection-string' if int(version[0]) >= 7 else '--bucket'} {collection_string}"
+        if json:
+            args += " --json"
+        if all_flag:
+            args += " --all"
+
+        remote_client = RemoteMachineShellConnection(self.backupset.backup_host)
+        command = f"{self.cli_command_location}/cbbackupmgr {args}"
+        output, error = remote_client.execute_command(command)
+
+        if self.debug_logs:
+            remote_client.log_command_output(output, error)
+
+        remote_client.disconnect()
+
+        if error:
+            self.fail("Getting backup info failed.")
+
+        return output
+
     def backup_compact(self):
         args = "compact --archive {0} --repo {1} --backup {2}".format(self.backupset.directory, self.backupset.name,
                                                                       self.backups[self.backupset.backup_to_compact])
@@ -978,14 +1205,19 @@ class EnterpriseBackupRestoreBase(BaseTestCase):
         command = "{0}/cbbackupmgr {1}".format(self.cli_command_location, args)
         output, error = remote_client.execute_command(command)
         remote_client.log_command_output(output, error)
-        if "Compaction succeeded," not in output[0]:
-            return False, output, "Compacting backup failed."
-        else:
-            return True, output, "Compaction of backup success"
+        for line in output:
+            if "Compaction succeeded," in line:
+                return True, output, "Compaction of backup success"
+        return False, output, "Compacting backup failed."
         remote_client.disconnect()
 
-    def backup_remove(self, backup_range=None):
-        args = "remove --archive {0} --repo {1}".format(self.backupset.directory, self.backupset.name)
+    def backup_remove(self, backup_range=None, verify_cluster_stats=True):
+        args = (
+            f"remove --archive {self.objstore_provider.schema_prefix() + self.backupset.objstore_bucket + '/' if self.objstore_provider else ''}{self.backupset.directory}"
+            f" --repo {self.backupset.name}"
+            f"{self._common_objstore_arguments()}"
+        )
+
         if backup_range is not None:
             args += " --backups {0}".format(backup_range)
 
@@ -994,7 +1226,8 @@ class EnterpriseBackupRestoreBase(BaseTestCase):
         output, error = remote_client.execute_command(command)
         remote_client.log_command_output(output, error)
         remote_client.disconnect()
-        self.verify_cluster_stats()
+        if verify_cluster_stats:
+            self.verify_cluster_stats()
         if error:
             return False, error, "Removing backup failed."
         elif "failed" in " ".join(output):
@@ -1062,19 +1295,16 @@ class EnterpriseBackupRestoreBase(BaseTestCase):
     def bk_with_memcached_crash_and_restart(self):
         num_shards = ""
         backup_result = self.cluster.async_backup_cluster(
-            cluster_host=self.backupset.cluster_host,
-            backup_host=self.backupset.backup_host,
-            directory=self.backupset.directory,
-            name=self.backupset.name,
+            backupset=self.backupset,
+            objstore_provider=self.objstore_provider,
             resume=self.backupset.resume,
             purge=self.backupset.purge,
             no_progress_bar=self.no_progress_bar,
             cli_command_location=self.cli_command_location,
             cb_version=self.cb_version,
             num_shards=num_shards)
-        self.sleep(5)
         conn_bk = RemoteMachineShellConnection(self.backupset.cluster_host)
-        conn_bk.pause_memcached(timesleep=8)
+        conn_bk.pause_memcached(timesleep=8, delay=10)
         conn_bk.unpause_memcached()
         conn_bk.disconnect()
         output = backup_result.result(timeout=600)
@@ -1083,13 +1313,17 @@ class EnterpriseBackupRestoreBase(BaseTestCase):
                 self.log.info("\nOutput from backup cluster: {0} ".format(output))
             else:
                 self.fail("No output printout.")
-        self.assertTrue(self._check_output("Backup successfully completed", output),
+        self.assertTrue(self._check_output("Backup completed successfully", output),
                         "Backup failed with memcached crash and restart within 180 seconds")
         self.log.info("Backup succeeded with memcached crash and restart within 180 seconds")
         self.sleep(20)
         conn = RemoteMachineShellConnection(self.backupset.backup_host)
-        command = "ls -tr {0}/{1} | tail -1".format(self.backupset.directory,
-                                                    self.backupset.name)
+
+        command = (
+            f"ls -tr {self.backupset.objstore_staging_directory + '/' if self.objstore_provider else ''}"
+            f"{self.backupset.directory}/{self.backupset.name} | tail -1"
+        )
+
         o, e = conn.execute_command(command)
         if o:
             self.backups.append(o[0])
@@ -1103,35 +1337,51 @@ class EnterpriseBackupRestoreBase(BaseTestCase):
                                             self.number_of_backups_taken,
                                             self.backup_validation_files_location)
         self.validation_helper.store_range_json(self.buckets, self.number_of_backups_taken,
-                                                self.backup_validation_files_location, merge=True)
+                                                self.backup_validation_files_location,
+                                                self.objstore_provider,
+                                                merge=True)
         conn.disconnect()
 
     def bk_with_erlang_crash_and_restart(self):
         num_shards = ""
+        backup_failed = False
         backup_result = self.cluster.async_backup_cluster(
-            cluster_host=self.backupset.cluster_host,
-            backup_host=self.backupset.backup_host,
-            directory=self.backupset.directory,
-            name=self.backupset.name,
+            backupset=self.backupset,
+            objstore_provider=self.objstore_provider,
             resume=self.backupset.resume,
             purge=self.backupset.purge,
             no_progress_bar=self.no_progress_bar,
             cli_command_location=self.cli_command_location,
             cb_version=self.cb_version,
             num_shards=num_shards)
-        self.sleep(10)
         conn = RemoteMachineShellConnection(self.backupset.cluster_host)
-        conn.kill_erlang()
+        conn.kill_erlang(delay=10)
         conn.start_couchbase()
         output = backup_result.result(timeout=700)
-        self.assertTrue(self._check_output("Backup successfully completed", output),
+        if self._check_output("Error backing up cluster", output):
+            backup_failed = True
+        if backup_failed:
+            backup_result = self.cluster.async_backup_cluster(
+                backupset=self.backupset,
+                objstore_provider=self.objstore_provider,
+                resume=True,
+                purge=self.backupset.purge,
+                no_progress_bar=self.no_progress_bar,
+                cli_command_location=self.cli_command_location,
+                cb_version=self.cb_version,
+                num_shards=num_shards)
+            output = backup_result.result(timeout=300)
+        self.assertTrue(self._check_output("Backup completed successfully", output),
                         "Backup failed with erlang crash and restart within 180 seconds")
         self.log.info("Backup succeeded with erlang crash and restart within 180 seconds")
         self.sleep(30)
         conn.disconnect()
         conn = RemoteMachineShellConnection(self.backupset.backup_host)
-        command = "ls -tr {0}/{1} | tail -1".format(self.backupset.directory,
-                                                    self.backupset.name)
+        command = (
+            f"ls -tr {self.backupset.objstore_staging_directory + '/' if self.objstore_provider else ''}"
+            f"{self.backupset.directory}/{self.backupset.name} | tail -1"
+        )
+
         o, e = conn.execute_command(command)
         if o:
             self.backups.append(o[0])
@@ -1145,35 +1395,50 @@ class EnterpriseBackupRestoreBase(BaseTestCase):
                                             self.number_of_backups_taken,
                                             self.backup_validation_files_location)
         self.validation_helper.store_range_json(self.buckets, self.number_of_backups_taken,
-                                                self.backup_validation_files_location)
+                                                self.backup_validation_files_location,
+                                                self.objstore_provider)
         conn.disconnect()
 
     def bk_with_cb_server_stop_and_restart(self):
         num_shards = ""
+        backup_failed = False
         backup_result = self.cluster.async_backup_cluster(
-            cluster_host=self.backupset.cluster_host,
-            backup_host=self.backupset.backup_host,
-            directory=self.backupset.directory,
-            name=self.backupset.name,
+            backupset=self.backupset,
+            objstore_provider=self.objstore_provider,
             resume=self.backupset.resume,
             purge=self.backupset.purge,
             no_progress_bar=self.no_progress_bar,
             cli_command_location=self.cli_command_location,
             cb_version=self.cb_version,
             num_shards=num_shards)
-        self.sleep(10)
         conn = RemoteMachineShellConnection(self.backupset.cluster_host)
         conn.stop_couchbase()
         conn.start_couchbase()
-        output = backup_result.result(timeout=700)
-        self.assertTrue(self._check_output("Backup successfully completed", output),
-                        "Backup failed with couchbase stop and start within 180 seconds")
-        self.log.info("Backup succeeded with couchbase stop and start within 180 seconds")
-        self.sleep(30)
+        output = backup_result.result(timeout=500)
+        if self._check_output("Error backing up cluster", output):
+            backup_failed = True
         conn.disconnect()
+        self.sleep(30, "Waiting for couchbase to come back up...")
+        if backup_failed:
+            backup_result = self.cluster.async_backup_cluster(
+                backupset=self.backupset,
+                objstore_provider=self.objstore_provider,
+                resume=True,
+                purge=self.backupset.purge,
+                no_progress_bar=self.no_progress_bar,
+                cli_command_location=self.cli_command_location,
+                cb_version=self.cb_version,
+                num_shards=num_shards)
+            output = backup_result.result(timeout=300)
+        self.assertTrue(self._check_output("Backup completed successfully", output),
+                       "Backup failed with couchbase stop and start within 180 seconds")
+
         conn = RemoteMachineShellConnection(self.backupset.backup_host)
-        command = "ls -tr {0}/{1} | tail -1".format(self.backupset.directory,
-                                                    self.backupset.name)
+        command = (
+            f"ls -tr {self.backupset.objstore_staging_directory + '/' if self.objstore_provider else ''}"
+            f"{self.backupset.directory}/{self.backupset.name} | tail -1"
+        )
+
         o, e = conn.execute_command(command)
         if o:
             self.backups.append(o[0])
@@ -1187,50 +1452,61 @@ class EnterpriseBackupRestoreBase(BaseTestCase):
                                             self.number_of_backups_taken,
                                             self.backup_validation_files_location)
         self.validation_helper.store_range_json(self.buckets, self.number_of_backups_taken,
-                                                self.backup_validation_files_location)
+                                                self.backup_validation_files_location,
+                                                self.objstore_provider)
         conn.disconnect()
 
-    def bk_with_stop_and_resume(self):
+    def bk_with_stop_and_resume(self, iterations=1, remove_staging_directory=False):
         old_backup_name = ""
         new_backup_name = ""
         num_shards = ""
         conn = RemoteMachineShellConnection(self.backupset.cluster_host)
         started_couchbase = False
         try:
-            backup_result = self.cluster.async_backup_cluster(
-                cluster_host=self.backupset.cluster_host,
-                backup_host=self.backupset.backup_host,
-                directory=self.backupset.directory,
-                name=self.backupset.name,
-                resume=False,
-                purge=self.backupset.purge,
-                no_progress_bar=self.no_progress_bar,
-                cli_command_location=self.cli_command_location,
-                cb_version=self.cb_version,
-                num_shards=num_shards)
-            self.sleep(3)
-            conn.kill_erlang(self.os_name)
-            output = backup_result.result(timeout=600)
-            self.log.info(str(output))
-            status, output, message = self.backup_list()
-            if not status:
-                self.fail(message)
-            for line in output:
-                if "enterprise" in line:
-                    continue
-                if re.search(r"\d{4}-\d{2}-\d{2}T\d{2}_\d{2}_\d{2}.\d+-\d{2}_\d{2}", line):
-                    old_backup_name = re.search(r"\d{4}-\d{2}-\d{2}T\d{2}_\d{2}"
-                                                r"_\d{2}.\d+-\d{2}_\d{2}", line).group()
-                    self.log.info("Backup name before resume: " + old_backup_name)
-            conn.start_couchbase()
-            ready = RestHelper(RestConnection(self.backupset.cluster_host)).is_ns_server_running()
-            if not ready:
-                self.fail("Server failed to start")
+            for _ in range(iterations):
+                backup_result = self.cluster.async_backup_cluster(
+                    backupset=self.backupset,
+                    objstore_provider=self.objstore_provider,
+                    resume=False,
+                    purge=self.backupset.purge,
+                    no_progress_bar=self.no_progress_bar,
+                    cli_command_location=self.cli_command_location,
+                    cb_version=self.cb_version,
+                    num_shards=num_shards)
+                self.sleep(5)
+                conn.kill_erlang(self.os_name)
+                output = backup_result.result(timeout=600)
+                self.log.info(str(output))
+                status, output, message = self.backup_list()
+                if not status:
+                    self.fail(message)
+                for line in output:
+                    if "enterprise" in line:
+                        continue
+                    if re.search(r"\d{4}-\d{2}-\d{2}T\d{2}_\d{2}_\d{2}.\d+-\d{2}_\d{2}", line):
+                        old_backup_name = re.search(r"\d{4}-\d{2}-\d{2}T\d{2}_\d{2}"
+                                                    r"_\d{2}.\d+-\d{2}_\d{2}", line).group()
+                        self.log.info("Backup name before resume: " + old_backup_name)
+                conn.start_couchbase()
+                ready = RestHelper(RestConnection(self.backupset.cluster_host)).is_ns_server_running()
+                if not ready:
+                    self.fail("Server failed to start")
+                else:
+                    started_couchbase = True
+            if self.objstore_provider and remove_staging_directory:
+                remote_client = RemoteMachineShellConnection(self.backupset.backup_host)
+                self.objstore_provider._remove_staging_directory(remote_client.extract_remote_info().type.lower(), remote_client)
+                output, _ = self.backup_cluster()
+                self.assertNotEqual(len(output), 0, "Expected some useful information to have been printed to stdout")
+                self.assertIn("it looks like the staging directory was removed you must re-run with '--purge' to ensure previous in-progress uploads are purged",
+                              output[0],
+                              "Expected an informative error about why backup could not be resumed")
+                # We don't need to continue any further, we've validated all the output that we need to
+                return
             else:
-                started_couchbase = True
-            output, error = self.backup_cluster()
-            if error or not self._check_output("Backup successfully completed", output):
-                self.fail("Taking cluster backup failed.")
+                output, error = self.backup_cluster()
+                if error or not self._check_output("Backup completed successfully", output):
+                    self.fail("Taking cluster backup failed.")
             status, output, message = self.backup_list()
             if not status:
                 self.fail(message)
@@ -1241,6 +1517,14 @@ class EnterpriseBackupRestoreBase(BaseTestCase):
                     new_backup_name = re.search(r"\d{4}-\d{2}-\d{2}T\d{2}_\d{2}"
                                                 r"_\d{2}.\d+-\d{2}_\d{2}", line).group()
                     self.log.info("Backup name after resume: " + new_backup_name)
+
+            # Once the backup has been resumed to completion we shouldn't see any orphaned multipart uploads
+            if self.objstore_provider:
+                self.assertEqual(
+                    self.objstore_provider.num_multipart_uploads(), 0,
+                    "Expected all multipart uploads to have been purged (all newly created ones should have also been completed)"
+                )
+
             self.assertEqual(old_backup_name, new_backup_name,
                              "Old backup name and new backup name are not same when resume is used")
             self.log.info("Old backup name and new backup name are same when resume is used")
@@ -1254,7 +1538,29 @@ class EnterpriseBackupRestoreBase(BaseTestCase):
             if not ready:
                 self.fail("Server failed to start")
 
-    def backup_merge(self):
+    def _check_output_in_backup_logs(self, words, at_start = False, lines_before = 0, lines_after = 0):
+        """ Checks if a word is present in the backup logs.
+
+        Args:
+            words: A word or list words to find in the backup logs.
+            at_start: Check for the word at the start of a line only.
+            lines_before: The number of lines to display before the match.
+            lines_after: The number of lines to display after the match.
+
+        Returns:
+            A tuple (True if found, the matches output, remote shell error)
+        """
+        remote_client = RemoteMachineShellConnection(self.backupset.backup_host)
+        words = "|".join(words) if isinstance(words, list) else words
+        caret = '^' if at_start else ''
+
+        output, error = remote_client.execute_command(
+                    f"cat {self.backupset.directory}/logs/backup-*.log | grep '{caret}{words}' -B {lines_before} -A {lines_after}"
+        )
+
+        return self._check_output(words, output), output, error
+
+    def backup_merge(self, check_for_panic = False):
         self.log.info("backups before merge: " + str(self.backups))
         self.log.info("number_of_backups_taken before merge: " \
                       + str(self.number_of_backups_taken))
@@ -1280,18 +1586,28 @@ class EnterpriseBackupRestoreBase(BaseTestCase):
 
         remote_client = RemoteMachineShellConnection(self.backupset.backup_host)
         command = "{0}/cbbackupmgr {1}".format(self.cli_command_location, args)
-        output, error = remote_client.execute_command(command)
+        output, error, exit_code = remote_client.execute_command(command,
+                get_exit_code=True)
         remote_client.log_command_output(output, error)
-        if error:
+        if error or exit_code:
             return False, error, "Merging backup failed"
-        elif output and not self._check_output("Merge completed successfully", output):
-            return False, output, "Merging backup failed"
         elif not output:
             self.log.info("process cbbackupmge may be killed")
             return False, [], "cbbackupmgr may be killed"
+        elif check_for_panic:
+            found_panic, output, error = \
+                    self._check_output_in_backup_logs("panic", at_start = True, lines_after = 12)
+
+            if found_panic:
+                self.log.error("Found word 'panic' in backup logs")
+                return False, output, "Panic found in backup logs:\n" + "\n".join(output)
+
         del self.backups[self.backupset.start - 1:self.backupset.end]
-        command = "ls -tr {0}/{1} | tail -1".format(self.backupset.directory,
-                                                    self.backupset.name)
+        command = (
+            f"ls -tr {self.backupset.objstore_staging_directory + '/' if self.objstore_provider else ''}"
+            f"{self.backupset.directory}/{self.backupset.name} | tail -1"
+        )
+
         o, e = remote_client.execute_command(command)
         if o:
             self.backups.insert(self.backupset.start - 1, o[0])
@@ -1324,37 +1640,56 @@ class EnterpriseBackupRestoreBase(BaseTestCase):
             self.validation_helper.store_latest(self.cluster_to_backup, self.buckets, self.number_of_backups_taken,
                                                 self.backup_validation_files_location)
             self.validation_helper.store_range_json(self.buckets, self.number_of_backups_taken,
-                                                    self.backup_validation_files_location, merge=True)
+                                                    self.backup_validation_files_location,
+                                                    self.objstore_provider,
+                                                    merge=True)
 
             self.validation_helper.validate_merge(self.backup_validation_files_location)
 
     def validate_backup_data(self, server_host, server_bucket, master_key,
                              perNode, getReplica, mode, items, key_check,
-                             validate_keys=False,
-                             regex_pattern=None):
-        """
-            Compare data in backup file with data in bucket
+                             validate_keys=False, regex_pattern=None,
+                             swap=False, backup_name=None, filter_keys=None,
+                             skip_stats_check=False):
+        """Compare data in cluster with data in backup file.
+
+           This function checks if key:value pairs in the cluster are present in the backup file i.e.
+           it checks if the documents in the backup are a subset of the documents on the cluster.
+
+           params:
+               server_host: The server holding cbbackupmgr backup files.
+               server_bucket (list): The cluster to retrieve documents from.
+               master_key (str): A key prefix e.g. "ent-backup".
+               perNode (bool): If set we oraganize collected data per node else we take a union. (Always set this to False)
+               mode (str): e.g. "memory"
+               backup_name (str): If None retrieves a backup from the filesystem (or cloud) otherwise uses the backup_name provided.
+               skip_stats_check (bool): Skip fetching cluster stats
         """
         data_matched = True
         data_collector = DataCollector()
-        self.sleep(5, "Wait for all shards are written")
-        bk_file_data, _ = data_collector.get_kv_dump_from_backup_file(server_host,
-                                                                      self.cli_command_location, self.cmd_ext,
-                                                                      self.backupset.directory, master_key,
-                                                                      self.buckets)
+        bk_file_data, _ = data_collector.get_kv_dump_from_backup_file(server_host, self.cli_command_location,
+                                                                      self.cmd_ext, master_key, self.buckets,
+                                                                      objstore_provider=self.objstore_provider,
+                                                                      backupset=self.backupset, backup_name=backup_name)
         restore_file_data = bk_file_data
         regex_backup_data = {}
         if regex_pattern is not None:
-            pattern = re.compile("%s" % regex_pattern)
+            search_pattern = regex_pattern
+            if " " in regex_pattern:
+                search_pattern = search_pattern.replace(" ", "")
+            pattern = re.compile(search_pattern)
             for bucket in self.buckets:
                 key_in_file_match_regex = 0
                 regex_backup_data[bucket.name] = {}
                 self.log.info("Extract keys with regex pattern '%s' either in key or body"
                               % regex_pattern)
+                max_display = 10
                 for key in restore_file_data[bucket.name]:
                     if self.debug_logs:
-                        print(("key in backup file of bucket %s:  %s" \
-                              % (bucket.name, key)))
+                        if max_display > 0:
+                            print(("key in backup file of bucket %s:  %s" \
+                                  % (bucket.name, key)))
+                            max_display -= 1
                     if validate_keys:
                         if pattern.search(key):
                             regex_backup_data[bucket.name][key] = \
@@ -1362,19 +1697,25 @@ class EnterpriseBackupRestoreBase(BaseTestCase):
                             key_in_file_match_regex += 1
                     else:
                         if self.debug_logs:
-                            print(("value of key in backup file  ", \
-                                  restore_file_data[bucket.name][key]))
-                        if pattern.search(restore_file_data[bucket.name][key]["Value"]):
+                            if max_display > 0:
+                                print(("value of key in backup file  ", \
+                                      restore_file_data[bucket.name][key]))
+                                max_display -= 1
+                        if " " in restore_file_data[bucket.name][key]["Value"] and " " in regex_pattern:
+                            pattern = re.compile(regex_pattern)
+                        if pattern.search(str(restore_file_data[bucket.name][key]["Value"])):
                             regex_backup_data[bucket.name][key] = \
                                 restore_file_data[bucket.name][key]
                             key_in_file_match_regex += 1
                 if self.debug_logs:
-                    print(("\nKeys and value in backup file of bucket {0} \
-                           that matches pattern '{1}'" \
-                          .format(bucket.name, regex_pattern)))
-                    for x in regex_backup_data[bucket.name]:
-                        print(("key: ", x))
-                        print(("value: ", regex_backup_data[bucket.name][x]["Value"]))
+                    if max_display > 0:
+                        print(("\nKeys and value in backup file of bucket {0} \
+                               that matches pattern '{1}'" \
+                              .format(bucket.name, regex_pattern)))
+                        for x in regex_backup_data[bucket.name]:
+                            print(("key: ", x))
+                            print(("value: ", regex_backup_data[bucket.name][x]["Value"]))
+                        max_display -= 1
                 self.log.info("Total keys matched in bk file of bucket {0} is {1}"
                               .format(bucket.name, key_in_file_match_regex))
                 restore_file_data = regex_backup_data
@@ -1403,22 +1744,30 @@ class EnterpriseBackupRestoreBase(BaseTestCase):
                 buckets_data[bucket.name][key] = value
             self.log.info("*** Compare data in bucket and in backup file of bucket {0} ***"
                           .format(bucket.name))
-            failed_persisted_bucket = []
-            ready = RebalanceHelper.wait_for_stats_on_all(self.backupset.cluster_host,
-                                                          bucket.name, 'ep_queue_size',
-                                                          0, timeout_in_seconds=120)
-            if not ready:
-                failed_persisted_bucket.append(bucket.name)
-            if failed_persisted_bucket:
-                self.fail("Buckets {0} did not persisted.".format(failed_persisted_bucket))
+            if not skip_stats_check:
+                failed_persisted_bucket = []
+                ready = RebalanceHelper.wait_for_stats_on_all(self.backupset.cluster_host,
+                                                              bucket.name, 'ep_queue_size',
+                                                              0, timeout_in_seconds=120)
+                if not ready:
+                    failed_persisted_bucket.append(bucket.name)
+                if failed_persisted_bucket:
+                    self.fail("Buckets {0} did not persisted.".format(failed_persisted_bucket))
             count = 0
             key_count = 0
+            version = RestConnection(self.backupset.backup_host).get_nodes_version()
+
+            if filter_keys:
+                buckets_data[bucket.name] = {key: buckets_data[bucket.name][key] for key in buckets_data[bucket.name].keys() if key in filter_keys}
+
             for key in buckets_data[bucket.name]:
                 if restore_file_data[bucket.name]:
                     try:
                         if restore_file_data[bucket.name][key]:
-                            if buckets_data[bucket.name][key] \
-                                    != restore_file_data[bucket.name][key]["Value"]:
+                            bucket_data_value = buckets_data[bucket.name][key]
+                            if version[:3] <= "6.6":
+                                bucket_data_value = str(bucket_data_value.replace(" ", ""))
+                            if bucket_data_value != restore_file_data[bucket.name][key]["Value"]:
                                 if count < 20:
                                     self.log.error("Data does not match at key {0}.\
                                                 bucket: {1} != {2} file" \
@@ -1451,8 +1800,11 @@ class EnterpriseBackupRestoreBase(BaseTestCase):
                 print(("Total items to be restored with regex pattern '{0}' is {1} " \
                       .format(regex_pattern, key_count)))
             print(("Total items in bucket should be:   ", key_count))
-            rest = RestConnection(server_bucket[0])
-            actual_keys = rest.get_active_key_count(bucket.name)
+            if filter_keys:
+                actual_keys = len(buckets_data[bucket.name].keys())
+            else:
+                rest = RestConnection(server_bucket[0])
+                actual_keys = rest.get_active_key_count(bucket.name)
             print(("Total items actual in bucket:      ", actual_keys))
             if actual_keys != key_count:
                 self.fail("Total keys matched: %s != Total keys in bucket %s: %s" \
@@ -1658,14 +2010,18 @@ class EnterpriseBackupRestoreBase(BaseTestCase):
         command = "{0}/{1}".format(self.cli_command_location, cmd)
         output, error = shell.execute_command(command)
         shell.log_command_output(output, error)
-
         for bucket in buckets:
             index_found = 0
             if len(output) > 1:
                 for name in self.gsi_names:
                     mesg = "GSI index {0} created in restore cluster as expected".format(name)
+                    index_name_path =  "Index:{0}/{1}".format(bucket.name, name)
+                    version = RestConnection(
+                              self.backupset.restore_cluster_host).get_nodes_version()
+                    if version[:1] >= "7":
+                        index_name_path =  "Index:{0}/_{0}/_{0}/{1}".format(bucket.name, name)
                     for x in output:
-                        if "Index:{0}/{1}".format(bucket.name, name) in x:
+                        if index_name_path in x:
                             index_found += 1
                             self.log.info(mesg)
             if index_found < len(self.gsi_names):
@@ -1673,8 +2029,17 @@ class EnterpriseBackupRestoreBase(BaseTestCase):
         shell.disconnect()
 
     def _delete_repo(self):
+        # We should remove all the remote objects as well as the files in the staging directory
+        if self.objstore_provider:
+            self.objstore_provider.delete_objects(f"{self.backupset.directory}/{self.backupset.name}")
+
         shell = RemoteMachineShellConnection(self.backupset.backup_host)
-        shell.execute_command("rm -rf {}/{}".format(self.backupset.directory, self.backupset.name))
+        command = (
+            f"rm -rf {self.backupset.objstore_staging_directory + '/' if self.objstore_provider else ''}"
+            f"{self.backupset.directory}/{self.backupset.name}"
+        )
+
+        shell.execute_command(command)
         shell.disconnect()
 
     def _check_output(self, word_check, output):
@@ -1683,13 +2048,13 @@ class EnterpriseBackupRestoreBase(BaseTestCase):
             if isinstance(word_check, list):
                 for ele in word_check:
                     for x in output:
-                        if ele.lower() in x.lower():
+                        if ele.lower() in str(x.lower()):
                             self.log.info("Found '{0} in CLI output".format(ele))
                             found = True
                             break
             elif isinstance(word_check, str):
                 for x in output:
-                    if word_check.lower() in x.lower():
+                    if word_check.lower() in str(x.lower()):
                         self.log.info("Found '{0}' in CLI output".format(word_check))
                         found = True
                         break
@@ -1697,7 +2062,9 @@ class EnterpriseBackupRestoreBase(BaseTestCase):
                 self.log.error("invalid {0}".format(word_check))
         return found
 
-    def _reset_storage_mode(self, rest, storageMode):
+    def _reset_storage_mode(self, rest, storageMode, reset_node=True):
+        if not storageMode:
+            storageMode = "memory_optimized"
         nodes_in_cluster = rest.get_nodes()
         for node in nodes_in_cluster:
             matched_server = None
@@ -1705,21 +2072,28 @@ class EnterpriseBackupRestoreBase(BaseTestCase):
                 if node.hostname[:-5] == server.ip:
                     matched_server = server
                     break
-
-            RestConnection(node).force_eject_node()
-            ready = RestHelper(rest).is_ns_server_running()
-            if ready:
-                if server is not None:
-                    shell = RemoteMachineShellConnection(server)
-                    shell.enable_diag_eval_on_non_local_hosts()
-                    shell.disconnect()
-            else:
-                self.fail("NS server is not ready after reset node")
+            shell = RemoteMachineShellConnection(server)
+            shell.enable_diag_eval_on_non_local_hosts()
+            shell.disconnect()
+            if reset_node:
+                RestConnection(node).force_eject_node()
+                ready = RestHelper(rest).is_ns_server_running()
+                if ready:
+                    if server is not None:
+                        shell = RemoteMachineShellConnection(server)
+                        shell.enable_diag_eval_on_non_local_hosts()
+                        shell.disconnect()
+                else:
+                    self.fail("NS server is not ready after reset node")
         rest.set_indexer_storage_mode(username='Administrator',
                                       password='password',
                                       storageMode=storageMode)
         self.log.info("Done reset node")
-        kv_quota = rest.init_node()
+        sv_in_rs = self.backupset.restore_cluster_host.services
+        if self.backupset.restore_cluster_host.services and \
+            "," in self.backupset.restore_cluster_host.services[0]:
+            sv_in_rs = self.backupset.restore_cluster_host.services.split(",")
+        kv_quota = rest.init_node(sv_in_rs)
         return kv_quota
 
     def _reset_restore_cluster_with_bk_services(self, bk_services):
@@ -1746,7 +2120,7 @@ class EnterpriseBackupRestoreBase(BaseTestCase):
                 break
         rest = RestConnection(self.backupset.restore_cluster_host)
         kv_quota = rest.init_node()
-        self.log.info("Done reset node")
+        self.log.info("Done reset restore node")
         if len(self.input.clusters[1]) > 1:
             num_servers = len(self.backupset.restore_cluster) - 1
             self.cluster.rebalance(
@@ -1754,6 +2128,16 @@ class EnterpriseBackupRestoreBase(BaseTestCase):
                 self.backupset.restore_cluster[1:num_servers],
                 [],
                 services=self.services)
+        count = 0
+        while count < 15:
+            reb_status = rest._rebalance_status_and_progress()
+            if reb_status != "none":
+                self.sleep(2, "wait rebalance to complete")
+                count += 1
+            else:
+                break
+            if count == 15:
+                self.fail("Status still shows running after rebalance complete 30 seconds")
         return kv_quota
 
     def _collect_logs(self):
@@ -1764,7 +2148,11 @@ class EnterpriseBackupRestoreBase(BaseTestCase):
         shell = RemoteMachineShellConnection(self.backupset.backup_host)
         info = shell.extract_remote_info().type.lower()
 
-        args = " collect-logs -a {0}".format(self.backupset.directory)
+        args = (
+            f"collect-logs --archive {self.objstore_provider.schema_prefix() + self.backupset.objstore_bucket + '/' if self.objstore_provider else ''}{self.backupset.directory}"
+            f"{self._common_objstore_arguments()}"
+        )
+
         if self.backupset.ex_logs_path:
             if info == 'windows':
                 if "tmp" in self.backupset.ex_logs_path:
@@ -2094,8 +2482,9 @@ class EnterpriseBackupRestoreBase(BaseTestCase):
         data_collector = DataCollector()
         bk_file_data, _ = data_collector.get_kv_dump_from_backup_file(self.backupset.backup_host,
                                                                       self.cli_command_location, self.cmd_ext,
-                                                                      self.backupset.directory, "ent-backup",
-                                                                      self.buckets)
+                                                                      "ent-backup", self.buckets,
+                                                                      objstore_provider= self.objstore_provider,
+                                                                      backupset=self.backupset)
         shell = RemoteMachineShellConnection(self.backupset.backup_host)
         rest = RestConnection(self.backupset.restore_cluster_host)
         restore_buckets_items = rest.get_buckets_itemCount()
@@ -2152,21 +2541,31 @@ class EnterpriseBackupRestoreBase(BaseTestCase):
                 BucketOperationHelper.verify_data(self.backupset.restore_cluster_host,
                                                   list(bk_file_data[bucket.name].keys()),
                                                   False, False, self, bucket=bucket.name)
-                self.sleep(10, "wait for bucket update new stats")
+                k = 0
+                bucket_ready = RestHelper(rest).vbucket_map_ready(bucket.name)
+                while not bucket_ready and k < 10:
+                    if k == 10:
+                        self.fail("Bucket {0} is not ready after 10 seconds".format(bucket.name))
+                    bucket_ready = RestHelper(rest).vbucket_map_ready(bucket.name)
+                    self.sleep(1, "wait for bucket update new stats")
+                    k += 1
+
                 restore_buckets_items = rest.get_buckets_itemCount()
                 if int(restore_buckets_items[bucket.name]) > 0:
                     if self.replace_ttl == "expired" and self.bk_with_ttl is not None:
                         if sleep_time < 600:
-                            self.fail("Key did not expire after wait more than 10 seconds of ttl")
+                            self.log.info("{0} items still in bucket".format(restore_buckets_items))
+                            self.sleep(60, "wait for items to expire")
+                            restore_buckets_items = rest.get_buckets_itemCount()
+                            self.log.info("{0} items still in bucket".format(restore_buckets_items))
+                            if int(restore_buckets_items[bucket.name]) > 0:
+                                self.fail("Key did not expire after wait more than 70 seconds of ttl")
         shell.disconnect()
 
     def _verify_bucket_compression_mode(self, restore_bucket_compression_mode):
-        if self.enable_firewall:
-            if self.should_fail:
-                self.log.info("No need to verify.  This is negative test")
-                return
-            else:
-                self.sleep(10)
+        if self.enable_firewall and self.should_fail:
+            self.log.info("No need to verify.  This is negative test")
+            return
         rest = RestConnection(self.backupset.restore_cluster_host)
         cb_version = rest.get_nodes_version()
         if 5.5 > float(cb_version[:3]):
@@ -2185,7 +2584,7 @@ class EnterpriseBackupRestoreBase(BaseTestCase):
         json_generator = JsonGenerator()
         return json_generator.generate_docs_simple(start=start, docs_per_day=self.docs_per_day)
 
-    def create_save_function_body_test(self, appname, appcode, description="Sample Description",
+    def create_save_function_body(self, appname, appcode, description="Sample Description",
                                        checkpoint_interval=10000, cleanup_timers=False,
                                        dcp_stream_boundary="everything", deployment_status=True,
                                        skip_timer_threshold=86400,
@@ -2196,7 +2595,7 @@ class EnterpriseBackupRestoreBase(BaseTestCase):
                                        ):
         body = {}
         body['appname'] = appname
-        script_dir = os.path.dirname(__file__)
+        script_dir = "pytests/eventing"
         abs_file_path = os.path.join(script_dir, appcode)
         fh = open(abs_file_path, "r")
         body['appcode'] = fh.read()
@@ -2232,6 +2631,46 @@ class EnterpriseBackupRestoreBase(BaseTestCase):
         body['settings']['deadline_timeout'] = deadline_timeout
         return body
 
+    def deploy_function(self, body, deployment_fail=False, wait_for_bootstrap=True,pause_resume=False,pause_resume_number=1,
+                        deployment_status=True,processing_status=True):
+        body['settings']['deployment_status'] = deployment_status
+        body['settings']['processing_status'] = processing_status
+        if self.print_eventing_handler_code_in_logs:
+            self.log.info("Deploying the following handler code : {0} with \nbindings: {1} and \nsettings: {2}".format(body['appname'], body['depcfg'] , body['settings']))
+            self.log.info("\n{0}".format(body['appcode']))
+        rest = RestConnection(self.backupset.cluster_host)
+        content1 = rest.create_function(body['appname'], body)
+        self.log.info("deploy Application : {0}".format(content1))
+        if deployment_fail:
+            res = json.loads(content1)
+            if not res["compile_success"]:
+                return
+            else:
+                raise Exception("Deployment is expected to be failed but no message of failure")
+        if wait_for_bootstrap:
+            # wait for the function to come out of bootstrap state
+            self.bkrs_wait_for_handler_state(body['appname'], "deployed", rest)
+        if pause_resume and pause_resume_number > 0:
+            self.pause_resume_n(body, pause_resume_number, rest)
+
+    def pause_resume_n(self, body, num , rest):
+        for i in range(num):
+            self.bkrs_pause_function(body, rest)
+            self.sleep(30)
+            self.bkrs_resume_function(body, rest)
+
+    def bkrs_pause_function(self, body, rest, wait_for_pause=True):
+        body['settings']['deployment_status'] = True
+        body['settings']['processing_status'] = False
+        self.refresh_rest_server()
+        # save the function so that it is visible in UI
+        #content = self.rest.save_function(body['appname'], body)
+        # undeploy the function
+        content1 = rest.set_settings_for_function(body['appname'], body['settings'])
+        self.log.info("Pause Application : {0}".format(body['appname']))
+        if wait_for_pause:
+            self.bkrs_wait_for_handler_state(body['appname'], "paused", rest)
+
     def bkrs_resume_function(self, body, rest, wait_for_resume=True):
         body['settings']['deployment_status'] = True
         body['settings']['processing_status'] = True
@@ -2244,7 +2683,7 @@ class EnterpriseBackupRestoreBase(BaseTestCase):
         if wait_for_resume:
             self.bkrs_wait_for_handler_state(body['appname'], "deployed", rest)
 
-    def bkrs_wait_for_handler_state(self, name, status, rest, iterations=20):
+    def bkrs_wait_for_handler_state(self, name, status, rest, iterations=20, server=None):
         self.sleep(20, message="Waiting for {} to {}...".format(name, status))
         result = rest.get_composite_eventing_status()
         count = 0
@@ -2256,18 +2695,26 @@ class EnterpriseBackupRestoreBase(BaseTestCase):
                 if result['apps'][i]['name'] == name:
                     composite_status = result['apps'][i]['composite_status']
             count += 1
+            """ ******************* remove these codes below when ticket MB-47236 is fixed. """
+            if count == 5 and "undeployed" in status:
+                if server is not None:
+                    print("\nserver: ", server)
+                    BucketOperationHelper.delete_all_buckets_or_assert([server], self)
+                else:
+                    raise Exception('Need to pass server to delete buckets')
+            """ *******************  end remove here """
         if count == iterations:
             raise Exception('Eventing took lot of time for handler {} to {}'.format(name, status))
 
-    def bkrs_undeploy_and_delete_function(self, body, rest):
-        self.bkrs_undeploy_function(body, rest)
+    def bkrs_undeploy_and_delete_function(self, body, rest, server=None):
+        self.bkrs_undeploy_function(body, rest, server)
         self.sleep(5)
         self.bkrs_delete_function(body, rest)
 
-    def bkrs_undeploy_function(self, body, rest):
+    def bkrs_undeploy_function(self, body, rest, server):
         content = rest.undeploy_function(body['appname'])
         self.log.info("Undeploy Application : {0}".format(body['appname']))
-        self.bkrs_wait_for_handler_state(body['appname'], "undeployed", rest)
+        self.bkrs_wait_for_handler_state(body['appname'], "undeployed", rest, server=server)
         return content
 
     def bkrs_delete_function(self, body, rest):
@@ -2275,8 +2722,8 @@ class EnterpriseBackupRestoreBase(BaseTestCase):
         self.log.info("Delete Application : {0}".format(body['appname']))
         return content1
 
-    def _verify_backup_events_definition(self, bk_fxn):
-        backup_path = self.backupset.directory + "/backup/{0}/".format(self.backups[0])
+    def _verify_backup_events_definition(self, bk_fxn, body, backup_index=0):
+        backup_path = self.backupset.directory + "/backup/{0}/".format(self.backups[backup_index])
         events_file_name = "events.json"
         bk_file_events_dir = "/tmp/backup_events{0}/".format(self.master.ip)
         bk_file_events_path = bk_file_events_dir + events_file_name
@@ -2292,7 +2739,7 @@ class EnterpriseBackupRestoreBase(BaseTestCase):
         local_bk_def = open(bk_file_events_path)
         bk_file_fxn = json.loads(local_bk_def.read())
         for k, v in list(bk_file_fxn[0]["settings"].items()):
-            if v != bk_fxn[0]["settings"][k]:
+            if k in body['settings'] and v != bk_fxn[0]["settings"][k]:
                 self.log.info("key {0} has value not match".format(k))
                 self.log.info("{0} : {1}".format(v, bk_fxn[0]["settings"][k]))
         self.log.info("remove tmp file in slave")
@@ -2307,8 +2754,13 @@ class EnterpriseBackupRestoreBase(BaseTestCase):
         bk_file_events_path = bk_file_events_dir + events_file_name
         rest = RestConnection(self.backupset.restore_cluster_host)
         rs_fxn = rest.get_all_functions()
-
-        if self.ordered(rs_fxn) != self.ordered(bk_fxn):
+        rs_fxn_dict = json.loads(rs_fxn)[0]
+        bk_fxn_dict = json.loads(bk_fxn)[0]
+        not_matching_list = ['version', 'handleruuid', 'function_instance_id']
+        for i in not_matching_list:
+            rs_fxn_dict.pop(i)
+            bk_fxn_dict.pop(i)
+        if self.ordered(rs_fxn_dict) != self.ordered(bk_fxn_dict):
             self.fail("Events definition of backup and restore cluster are different")
 
     def ordered(self, obj):
@@ -2427,6 +2879,19 @@ class EnterpriseBackupRestoreBase(BaseTestCase):
                     vbuckets_per_shard[bucket.name][i] = int(output[0])
         shell.disconnect()
 
+    def add_server_with_custom_services(self, server, services):
+        """ Add a server to the cluster_host and provision it with custom services
+        """
+        # Credentials to the server
+        username = server.rest_username
+        password = server.rest_password
+
+        # Add server provisioning it with `services`
+        RestConnection(self.backupset.cluster_host).add_node(username, password, server.ip, services=services)
+
+        # Rebalance
+        self.cluster.rebalance([self.backupset.cluster_host], [], [])
+
     def _create_restore_cluster(self, node_services=["kv"]):
         rest_rs = RestConnection(self.backupset.restore_cluster_host)
         rs_bucket = rest_rs.get_buckets()
@@ -2436,7 +2901,12 @@ class EnterpriseBackupRestoreBase(BaseTestCase):
                                                master=self.backupset.restore_cluster_host)
 
         rest_bk = RestConnection(self.backupset.cluster_host)
-        bk_storage_mode = rest_bk.get_index_settings()["indexer.settings.storage_mode"]
+        try:
+            bk_storage_mode = rest_bk.get_index_settings()["indexer.settings.storage_mode"]
+        except Exception as e:
+            if e:
+                print("Exception error: ", str(e))
+                raise("Need index service in node {0}".format(self.backupset.cluster_host.ip))
         eventing_service_in = False
         bk_cluster_services = list(rest_bk.get_nodes_services().values())
         for srv in bk_cluster_services:
@@ -2458,8 +2928,11 @@ class EnterpriseBackupRestoreBase(BaseTestCase):
             shell = RemoteMachineShellConnection(self.backupset.restore_cluster_host)
             shell.enable_diag_eval_on_non_local_hosts()
             shell.disconnect()
-        kv_quota = rest_rs.init_node(self.backupset.restore_cluster_host.services)
-        self._reset_storage_mode(rest_rs, bk_storage_mode)
+        sv_in_rs = self.backupset.restore_cluster_host.services
+        if self.backupset.restore_cluster_host.services and \
+            "," in self.backupset.restore_cluster_host.services[0]:
+            sv_in_rs = self.backupset.restore_cluster_host.services[0].split(",")
+        kv_quota = rest_rs.init_node(sv_in_rs)
         if len(bk_cluster_services) > 1:
             bk_cluster_services.remove(bk_services)
         if len(self.input.clusters[0]) > 1:
@@ -2470,8 +2943,22 @@ class EnterpriseBackupRestoreBase(BaseTestCase):
                              self.input.clusters[0][1].ip, services=bk_cluster_services[0])
             rebalance = self.cluster.async_rebalance(self.cluster_to_restore, [], [])
             rebalance.result()
+            count = 0
+            while count < 15:
+                reb_st, _ = rest_rs._rebalance_status_and_progress()
+                if reb_st != "none":
+                    self.sleep(2, "wait rebalance to complete")
+                    count += 1
+                else:
+                    break
+                if count == 15:
+                    self.fail("Status still shows running after rebalance complete 30 seconds")
         else:
             self.log.info("No availabe node to create cluster.")
+        self._reset_storage_mode(rest_rs, bk_storage_mode, False)
+
+    def _common_objstore_arguments(self):
+        return self.backupset.common_objstore_arguments(self.objstore_provider)
 
 
 class Backupset:
@@ -2537,7 +3024,49 @@ class Backupset:
         self.log_to_stdout = False
         self.auto_select_threads = False
         self.date_range = ''
+        self.bkrs_client_version = None
+        self.current_bkrs_client_version = None
+        self.bkrs_client_upgrade = False
+        self.bwc_version = None
+        self.full_backup = False
+        self.disable_ft_alias = False
+        self.disable_analytics = False
+        self.auto_create_buckets = False
 
+        # Common configuration which is to be shared accross cloud providers
+        self.objstore_access_key_id = ""
+        self.objstore_bucket = ""
+        self.objstore_cacert = ""
+        self.objstore_endpoint = ""
+        self.objstore_no_ssl_verify = False
+        self.objstore_region = ""
+        self.objstore_secret_access_key = ""
+        self.objstore_staging_directory = ""
+
+        # S3 specific configuration
+        self.s3_force_path_style = False
+
+        # Backup Service specific configuration
+        self.backup_service = False
+        self.objstore_alternative_staging_directory = ""
+
+    def common_objstore_arguments(self, objstore_provider):
+        """ Returns a string consisting of the common objstore command line params and args.
+
+        Args:
+            objstore_provider (Provider): If None returns an empty string.
+
+        """
+        return (
+            f"{' --obj-access-key-id ' + self.objstore_access_key_id if objstore_provider and self.objstore_access_key_id else ''}"
+            f"{' --obj-cacert ' + self.objstore_cacert if objstore_provider and self.objstore_cacert else ''}"
+            f"{' --obj-endpoint ' + self.objstore_endpoint if objstore_provider and self.objstore_endpoint else ''}"
+            f"{' --obj-no-ssl-verify' if objstore_provider and self.objstore_no_ssl_verify else ''}"
+            f"{' --obj-region ' + self.objstore_region if objstore_provider and self.objstore_region else ''}"
+            f"{' --obj-secret-access-key ' + self.objstore_secret_access_key if objstore_provider and self.objstore_secret_access_key else ''}"
+            f"{' --obj-staging-dir ' + self.objstore_staging_directory if objstore_provider else ''}"
+            f"{' --s3-force-path-style' if objstore_provider and objstore_provider.schema_prefix() == 's3://' else ''}"
+        )
 
 class EnterpriseBackupMergeBase(EnterpriseBackupRestoreBase):
     def setUp(self):
@@ -2607,7 +3136,7 @@ class EnterpriseBackupMergeBase(EnterpriseBackupRestoreBase):
             RbacBase().remove_user_role(role_del, RestConnection(cluster_host))
         except Exception as ex:
             self.log.info(str(ex))
-            self.assertTrue(str(ex) == '"User was not found."', str(ex))
+            self.assertIn("User was not found", str(ex), str(ex))
 
         testuser = [{'id': bucket.name, 'name': bucket.name, 'password': 'password'}]
         RbacBase().create_user_source(testuser, 'builtin', cluster_host)
@@ -2701,13 +3230,13 @@ class EnterpriseBackupMergeBase(EnterpriseBackupRestoreBase):
             if isinstance(word_check, list):
                 for ele in word_check:
                     for x in output:
-                        if ele.lower() in x.lower():
+                        if ele.lower() in str(x.lower()):
                             self.log.info("Found '{0}' in CLI output".format(ele))
                             found = True
                             break
             elif isinstance(word_check, str):
                 for x in output:
-                    if word_check.lower() in x.lower():
+                    if word_check.lower() in str(x.lower()):
                         self.log.info("Found '{0}' in CLI output".format(word_check))
                         found = True
                         break
@@ -2750,9 +3279,16 @@ class EnterpriseBackupMergeBase(EnterpriseBackupRestoreBase):
         self.assertTrue(self._check_output("Merge completed successfully", output),
                         "Merge failed with memcached crash and restart within 180 seconds")
         self.log.info("Merge succeeded with memcached crash and restart within 180 seconds")
-        self.sleep(30)
+        ready = RestHelper(RestConnection(self.backupset.cluster_host)).is_ns_server_running()
+        if not ready:
+            self.fail("Memcached failed to restart")
+
         del self.backups[self.backupset.start - 1:self.backupset.end]
-        command = "ls -tr {0}/{1} | tail -1".format(self.backupset.directory, self.backupset.name)
+        command = (
+            f"ls -tr {self.backupset.objstore_staging_directory + '/' if self.objstore_provider else ''}"
+            f"{self.backupset.directory}/{self.backupset.name} | tail -1"
+        )
+
         o, e = conn.execute_command(command)
         if o:
             self.backups.insert(self.backupset.start - 1, o[0])
@@ -2766,7 +3302,8 @@ class EnterpriseBackupMergeBase(EnterpriseBackupRestoreBase):
             self.validation_helper.store_latest(self.cluster_to_backup, self.buckets, self.number_of_backups_taken,
                                                 self.backup_validation_files_location)
             self.validation_helper.store_range_json(self.buckets, self.number_of_backups_taken,
-                                                    self.backup_validation_files_location)
+                                                    self.backup_validation_files_location,
+                                                    self.objstore_provider)
             self.validation_helper.validate_merge(self.backup_validation_files_location)
         conn.disconnect()
 
@@ -2787,7 +3324,10 @@ class EnterpriseBackupMergeBase(EnterpriseBackupRestoreBase):
         self.assertTrue(self._check_output("Merge completed successfully", output),
                         "Merge failed with erlang crash and restart within 180 seconds")
         self.log.info("Merge succeeded with erlang crash and restart within 180 seconds")
-        self.sleep(30)
+        ready = RestHelper(RestConnection(self.backupset.cluster_host)).is_ns_server_running()
+        if not ready:
+            self.fail("Erlang failed to restart")
+
         del self.backups[self.backupset.start - 1:self.backupset.end]
         command = "ls -tr {0}/{1} | tail -1".format(self.backupset.directory, self.backupset.name)
         o, e = conn.execute_command(command)
@@ -2803,7 +3343,8 @@ class EnterpriseBackupMergeBase(EnterpriseBackupRestoreBase):
             self.validation_helper.store_latest(self.cluster_to_backup, self.buckets, self.number_of_backups_taken,
                                                 self.backup_validation_files_location)
             self.validation_helper.store_range_json(self.buckets, self.number_of_backups_taken,
-                                                    self.backup_validation_files_location)
+                                                    self.backup_validation_files_location,
+                                                    self.objstore_provider)
             self.validation_helper.validate_merge(self.backup_validation_files_location)
         conn.disconnect()
 
@@ -2824,9 +3365,16 @@ class EnterpriseBackupMergeBase(EnterpriseBackupRestoreBase):
         self.assertTrue(self._check_output("Merge completed successfully", output),
                         "Merge failed with couchbase stop and start within 180 seconds")
         self.log.info("Merge succeeded with couchbase stop and start within 180 seconds")
-        self.sleep(30)
+        ready = RestHelper(RestConnection(self.backupset.cluster_host)).is_ns_server_running()
+        if not ready:
+            self.fail("cb server failed to restart")
+
         del self.backups[self.backupset.start - 1:self.backupset.end]
-        command = "ls -tr {0}/{1} | tail -1".format(self.backupset.directory, self.backupset.name)
+        command = (
+            f"ls -tr {self.backupset.objstore_staging_directory + '/' if self.objstore_provider else ''}"
+            f"{self.backupset.directory}/{self.backupset.name} | tail -1"
+        )
+
         o, e = conn.execute_command(command)
         if o:
             self.backups.insert(self.backupset.start - 1, o[0])
@@ -2840,7 +3388,8 @@ class EnterpriseBackupMergeBase(EnterpriseBackupRestoreBase):
             self.validation_helper.store_latest(self.cluster_to_backup, self.buckets, self.number_of_backups_taken,
                                                 self.backup_validation_files_location)
             self.validation_helper.store_range_json(self.buckets, self.number_of_backups_taken,
-                                                    self.backup_validation_files_location)
+                                                    self.backup_validation_files_location,
+                                                    self.objstore_provider)
             self.validation_helper.validate_merge(self.backup_validation_files_location)
         conn.disconnect()
 
@@ -2874,7 +3423,10 @@ class EnterpriseBackupMergeBase(EnterpriseBackupRestoreBase):
         serv_out = serv_out[serv_out.__len__() - self.nodes_out:]
         cluster_healthy = RestHelper(rest).is_cluster_healthy()
         if not cluster_healthy:
-            self.sleep(15, "wait for cluster ready")
+            ready = RestHelper(rest).is_ns_server_running()
+            if not ready:
+                self.fail("cluster is not ready")
+
         rebalance = self.cluster.async_rebalance(self.cluster_to_backup,
                                                  serv_in, serv_out)
         return rebalance
@@ -3097,7 +3649,7 @@ class EnterpriseBackupMergeBase(EnterpriseBackupRestoreBase):
             bucket_tasks.append(
                 self.cluster.async_create_standard_bucket(name=name, port=port,
                                                           bucket_params=bucket_params))
-            bucket = CBBucket(name=name, authType=None, saslPassword=None,
+            bucket = CBBucket(name=name,
                               num_replicas=self.num_replicas,
                               bucket_size=self.bucket_size,
                               port=port, master_id=server_id,
@@ -3148,7 +3700,7 @@ class EnterpriseBackupMergeBase(EnterpriseBackupRestoreBase):
             bucket_tasks.append(
                 self.cluster.async_create_standard_bucket(name=name, port=port,
                                                           bucket_params=bucket_params))
-            bucket = Bucket(name=name, authType=None, saslPassword=None,
+            bucket = Bucket(name=name,
                             num_replicas=self.num_replicas,
                             bucket_size=self.bucket_size,
                             port=port, master_id=server_id,
@@ -3328,7 +3880,9 @@ class EnterpriseBackupMergeBase(EnterpriseBackupRestoreBase):
             shell.stop_couchbase()
             shell.start_couchbase()
 
-            self.sleep(60)
+            ready = RestHelper(rest).is_ns_server_running()
+            if not ready:
+                self.fail("CB server failed to start")
             shell.disconnect()
 
     def create_indexes(self):
@@ -3337,35 +3891,48 @@ class EnterpriseBackupMergeBase(EnterpriseBackupRestoreBase):
                           self.servers[1].ip, services=['index', 'fts'])
         rebalance = self.cluster.async_rebalance(self.cluster_to_backup, [], [])
         rebalance.result()
+        storage_mode = "plasma"
+        cluster_storage_mode = rest_src.get_index_storage_mode()
+        self.log.info("Cluster storage mode: {0}".format(cluster_storage_mode))
+        if storage_mode != cluster_storage_mode:
+            storage_mode = cluster_storage_mode
 
-        cmd = "cbindex -type create -bucket default -using plasma -index " \
+        cmd = "cbindex -type create -bucket default -using {2} -index " \
               "age_idx -fields=age -auth {0}:{1}".format(self.servers[0].rest_username,
-                                                         self.servers[0].rest_password, )
+                                                         self.servers[0].rest_password,
+                                                         storage_mode)
         remote_client = RemoteMachineShellConnection(
             self.backupset.cluster_host)
         command = "{0}/{1}".format(self.cli_command_location, cmd)
         output, error = remote_client.execute_command(command)
         remote_client.log_command_output(output, error)
-        if "Index created" not in output[-1]:
-            err_msg = "cannot proceed due to rebalance in progress"
+        cluster_version = RestConnection(self.backupset.cluster_host).get_nodes_version()
+        if not self._check_output("Index created", output):
+            if cluster_version[:3] >= "7.0":
+                err_msg = "cannot proceed due to rebalance in progress"
+            else:
+                err_msg = ['Fail to create index due to rebalancing',
+                           'Indexer Cannot Process Create Index - Rebalance In Progress']
+
             if self._check_output(err_msg, output) or \
                     self._check_output(err_msg, error):
                 self.sleep(15, "wait for rebalance complete")
                 output, error = remote_client.execute_command(command)
-                if "Index created" not in output[-1]:
-                    self.fail("GSI index cannot be created")
-        else:
-            self.fail("GSI index cannot be created")
-        cmd = "cbindex -type create -bucket default -using plasma -index " \
+                if not self._check_output("Index created", output):
+                    self.fail("GSI index cannot be created after rebalance")
+            else:
+                self.fail("GSI index cannot be created")
+        cmd = "cbindex -type create -bucket default -using {2} -index " \
               "name_idx -fields=name -auth {0}:{1}".format(self.servers[0].rest_username,
-                                                           self.servers[0].rest_password, )
+                                                           self.servers[0].rest_password,
+                                                           storage_mode)
         remote_client.disconnect()
         remote_client = RemoteMachineShellConnection(
             self.backupset.cluster_host)
         command = "{0}/{1}".format(self.cli_command_location, cmd)
         output, error = remote_client.execute_command(command)
         remote_client.log_command_output(output, error)
-        if "Index created" not in output[-1]:
+        if not self._check_output("Index created", output):
             self.fail("GSI index cannot be created")
 
         index_definition = INDEX_DEFINITION
@@ -3400,10 +3967,8 @@ class EnterpriseBackupMergeBase(EnterpriseBackupRestoreBase):
                         self.eviction_policy = "noEviction"
                     rest_src.create_bucket(bucket=bucket_name,
                                            ramQuotaMB=bucket_size,
-                                           authType=bucket.authType if bucket.authType else 'none',
                                            bucketType=self.bucket_type,
                                            proxyPort=bucket.port,
-                                           saslPassword=bucket.saslPassword,
                                            evictionPolicy=self.eviction_policy,
                                            lww=self.lww_new)
                     bucket_ready = rest_helper.vbucket_map_ready(bucket_name)
@@ -3412,16 +3977,17 @@ class EnterpriseBackupMergeBase(EnterpriseBackupRestoreBase):
                                   % bucket_name)
 
             if self.overwrite_indexes:
-                err_msg = "cannot create index because an index with the same name already exist"
-                cmd = "cbindex -type create -bucket default -using plasma -index " \
+                err_msg = "cannot create index because an index with the same name already exists"
+                cmd = "cbindex -type create -bucket default -using {2} -index " \
                       "age_idx1 -fields=age -auth {0}:{1}".format(self.servers[0].rest_username,
-                                                                  self.servers[0].rest_password, )
+                                                                  self.servers[0].rest_password,
+                                                                  storage_mode)
                 remote_client = RemoteMachineShellConnection(
                     self.backupset.restore_cluster_host)
                 command = "{0}/{1}".format(self.cli_command_location, cmd)
                 output, error = remote_client.execute_command(command)
                 remote_client.log_command_output(output, error)
-                if error or "Index created" not in output[-1]:
+                if error or not self._check_output("Index created", output):
                     self.fail("GSI index cannot be created")
 
                 index_definition = INDEX_DEFINITION
@@ -3431,9 +3997,11 @@ class EnterpriseBackupMergeBase(EnterpriseBackupRestoreBase):
                     self.log.info("Create fts index")
                     rest_fts.create_fts_index(index_name, index_definition)
                 except Exception as ex:
+                    if ex:
+                        print("\nException error: ", str(ex))
                     if err_msg not in str(ex):
                         self.log.error("It should not create same name index")
-                    self.fail(ex)
+                        self.fail(ex)
         remote_client.disconnect()
 
     def update_indexes(self):

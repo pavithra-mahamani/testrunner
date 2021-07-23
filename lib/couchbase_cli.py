@@ -176,48 +176,44 @@ class CouchbaseCLI:
 
     def create_scope(self, bucket="default", scope="scope0"):
         remote_client = RemoteMachineShellConnection(self.server)
-        options = " --bucket " + str(bucket)
-        options += "--create-scope" + str(scope)
+        options = f" --bucket {str(bucket)} --create-scope {str(scope)}"
         stdout, stderr = remote_client.execute_couchbase_cli("collection-manage", self.hostname,
                                                              options)
         remote_client.disconnect()
-        return self._was_success(stdout, "Scope {} created in bucket {}".format(scope, bucket))
+        return stdout, stderr, self._was_success(stdout)
 
     def create_collection(self, bucket="default", scope="scope0", collection="mycollection0"):
         remote_client = RemoteMachineShellConnection(self.server)
-        options = " --bucket " + str(bucket)
-        options += "--create-collection" + str(scope) + '.' + str(collection)
+        options = f" --bucket {str(bucket)} --create-collection {str(scope)}.{str(collection)}"
         stdout, stderr = remote_client.execute_couchbase_cli("collection-manage", self.hostname,
                                                              options)
         remote_client.disconnect()
-        return self._was_success(stdout, "Scope {} created in bucket {}".format(scope, bucket))
+        return stdout, stderr, self._was_success(stdout)
 
     def delete_collection(self, bucket="default", scope='_default', collection='_default'):
         remote_client = RemoteMachineShellConnection(self.server)
-        options = " --bucket " + str(bucket)
-        options += "--drop-collection" + str(scope) + '.' + str(collection)
+        options = f" --bucket {str(bucket)} --drop-collection {str(scope)}.{str(collection)}"
         stdout, stderr = remote_client.execute_couchbase_cli("collection-manage", self.hostname,
                                                              options)
         remote_client.disconnect()
-        return self._was_success(stdout, "Collection {} dropped in bucket {}".format(scope, bucket))
+        return stdout, stderr, self._was_success(stdout)
 
-    def delete_scope(self, scope, bucket="default"):  # scope should be passed as default scope can not be deleted
+    # Custom scope should be passed as default scope can not be deleted
+    def delete_scope(self, scope, bucket="default"):
         remote_client = RemoteMachineShellConnection(self.server)
-        options = " --bucket " + str(bucket)
-        options += "--drop-scope" + str(scope)
+        options = f" --bucket {str(bucket)} --drop-scope {str(scope)}"
         stdout, stderr = remote_client.execute_couchbase_cli("collection-manage", self.hostname,
                                                              options)
         remote_client.disconnect()
-        return self._was_success(stdout, "Scope {} deleted in bucket {}".format(scope, bucket))
+        return stdout, stderr, self._was_success(stdout)
 
     def get_bucket_scopes(self, bucket):
         remote_client = RemoteMachineShellConnection(self.server)
-        options = " --bucket " + str(bucket)
-        options += " --list-scopes"
+        options = f" --bucket {str(bucket)} --list-scopes"
         stdout, stderr = remote_client.execute_couchbase_cli("collection-manage", self.hostname,
                                                              options)
         remote_client.disconnect()
-        return stdout
+        return stdout, stderr, self._was_success(stdout)
 
     def get_bucket_collections(self, bucket):
         remote_client = RemoteMachineShellConnection(self.server)
@@ -226,7 +222,7 @@ class CouchbaseCLI:
         stdout, stderr = remote_client.execute_couchbase_cli("collection-manage", self.hostname,
                                                              options)
         remote_client.disconnect()
-        return stdout
+        return stdout, stderr, self._was_success(stdout)
 
     def get_scope_collections(self, bucket, scope):
         remote_client = RemoteMachineShellConnection(self.server)
@@ -235,13 +231,13 @@ class CouchbaseCLI:
         stdout, stderr = remote_client.execute_couchbase_cli("collection-manage", self.hostname,
                                                              options)
         remote_client.disconnect()
-        return stdout
+        return stdout, stderr, self._was_success(stdout)
 
     #Temporarily need to enable DP mode for collections
     def enable_dp(self):
         remote_client = RemoteMachineShellConnection(self.server)
         stdout, stderr = remote_client.execute_couchbase_cli("enable-developer-preview", self.hostname,
-                                                     "--enable", additional_input="yes")
+                                                             "--enable", _stdin="y")
         remote_client.disconnect()
         return stdout, stderr, self._was_success(stdout, "Developer mode enabled")
 
@@ -250,7 +246,7 @@ class CouchbaseCLI:
         if failover_servers:
             options += " --server-failover " + str(failover_servers)
         if force:
-            options += " --force"
+            options += " --hard "
 
         remote_client = RemoteMachineShellConnection(self.server)
         stdout, stderr = remote_client.couchbase_cli("failover", self.hostname,
@@ -678,19 +674,22 @@ class CouchbaseCLI:
                 return False
         return True
 
-    def _was_success(self, stdout, message):
+    def _was_success(self, stdout, message=None):
         """Inspects each line of the command output and checks to see if
         the command succeeded
-
         Options:
         stdout - A list of output lines from stdout
         message - The success message
-
         Returns a boolean indicating whether or not the success message was
         found in the output
         """
-
         for line in stdout:
-            if line == "SUCCESS: " + message:
-                return True
+            if message:
+                if line == "SUCCESS: " + message:
+                    return True
+            else:
+                if line.startswith("SUCCESS:"):
+                    return True
+        if stdout:
+            return True
         return False

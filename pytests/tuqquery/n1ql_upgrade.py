@@ -1,6 +1,7 @@
 import threading
 from .tuq import QueryTests
 from upgrade.newupgradebasetest import NewUpgradeBaseTest
+from .flex_index_phase1 import FlexIndexTests
 from remote.remote_util import RemoteMachineShellConnection
 from membase.api.rest_client import RestConnection
 from couchbase.cluster import Cluster
@@ -27,9 +28,11 @@ class QueriesUpgradeTests(QueryTests, NewUpgradeBaseTest):
         self.load(self.gens_load, flag=self.item_flag)
         self.bucket_doc_map = {"default": 2016, "standard_bucket0": 2016}
         self.bucket_status_map = {"default": "healthy", "standard_bucket0": "healthy"}
+        self.custom_map = self.input.param("custom_map", False)
+        self.fts_index_type = self.input.param("fts_index_type", None)
 
         # feature specific setup
-        if self.feature == "ansi-joins":
+        if self.feature == "ansi-joins" or self.feature == "n1ql":
             self.rest.load_sample("travel-sample")
             self.bucket_doc_map["travel-sample"] = 31591
             self.bucket_status_map["travel-sample"] = "healthy"
@@ -48,10 +51,8 @@ class QueriesUpgradeTests(QueryTests, NewUpgradeBaseTest):
             self.user_xattr_data = []
             self.meta_ids = []
         if self.feature == "curl-whitelist":
-            self.google_error_msg = "Errorevaluatingprojection.-cause:URLendpointisntwhitelisted" \
-                                    "https://maps.googleapis.com/maps/api/geocode/json."
-            self.jira_error_msg ="Errorevaluatingprojection.-cause:URLendpointisntwhitelistedhttps://jira.atlassian." \
-                                 "com/rest/api/latest/issue/JRA-9.PleasemakesuretowhitelisttheURLontheUI."
+            self.google_error_msg = "Errorevaluatingprojection.-cause:Theendpointhttps://maps.googleapis.com/maps/api/geocode/jsonisnotpermitted"
+            self.jira_error_msg = "Errorevaluatingprojection.-cause:Theendpointhttps://jira.atlassian.com/rest/api/latest/issue/JRA-9isnotpermitted.Listallowedendpointsintheconfiguration."
             self.cbqpath = '%scbq' % self.path + " -e %s:%s -q -u %s -p %s" \
                                                  % (self.master.ip, self.n1ql_port, self.rest.username, self.rest.password)
         if self.feature == "auditing":
@@ -70,8 +71,10 @@ class QueriesUpgradeTests(QueryTests, NewUpgradeBaseTest):
 
     def tearDown(self):
         self.log.info("==============  QueriesUpgradeTests tearDown has started ==============")
+        if not hasattr(self, 'rest'):
+            self.rest = RestConnection(self.master)
         self.upgrade_servers = self.servers
-        if hasattr(self, 'upgrade_versions'):
+        if hasattr(self, 'upgrade_versions') and self.initial_version is '6.5.1-6296':
             self.log.info("checking upgrade version")
             upgrade_major = self.upgrade_versions[0][0]
             self.log.info("upgrade major version: " + str(upgrade_major))
@@ -114,12 +117,12 @@ class QueriesUpgradeTests(QueryTests, NewUpgradeBaseTest):
         self.log_config_info()
         self.wait_for_all_indexes_online()
         self.ensure_primary_indexes_exist()
-        self.wait_for_all_indexes_online()
+        self.wait_for_all_indexes_online(build_deferred=True)
 
         self.log.info("UPGRADE_VERSIONS = " + str(self.upgrade_versions))
         # run pre upgrade test
         self.log.info("running pre upgrade test")
-        self.run_upgrade_test_for_feature(self.feature, "pre-upgrade")
+        self.run_upgrade_test_for_feature(self.feature, "pre-upgrade", self.upgrade_type)
         self.log.info("completed pre upgrade test")
 
         # take 1 server to upgrade to test mixed mode scenarios
@@ -166,8 +169,9 @@ class QueriesUpgradeTests(QueryTests, NewUpgradeBaseTest):
         self.log_config_info()
 
         # run mixed mode test
+        self.ensure_primary_indexes_exist()
         self.log.info("running mixed mode test")
-        self.run_upgrade_test_for_feature(self.feature, "mixed-mode")
+        self.run_upgrade_test_for_feature(self.feature, "mixed-mode", self.upgrade_type)
         self.log.info("completed mixed mode test")
 
         # upgrade remaining servers
@@ -201,7 +205,7 @@ class QueriesUpgradeTests(QueryTests, NewUpgradeBaseTest):
         # run post upgrade test
         self.ensure_primary_indexes_exist()
         self.log.info("running post upgrade test")
-        self.run_upgrade_test_for_feature(self.feature, "post-upgrade")
+        self.run_upgrade_test_for_feature(self.feature, "post-upgrade", self.upgrade_type)
         self.log.info("completed post upgrade test")
 
     def stop_cb_servers(self, server_list):
@@ -231,7 +235,7 @@ class QueriesUpgradeTests(QueryTests, NewUpgradeBaseTest):
                 th.join()
             rebalance = self.cluster.async_rebalance(participating_servers,
                                                      [server], [],
-                                                     services=['kv,n1ql,index'])
+                                                     services=['kv,n1ql,index,fts'])
             rebalance.result()
 
     def online_upgrade_with_failover(self, upgrade_servers):
@@ -274,9 +278,11 @@ class QueriesUpgradeTests(QueryTests, NewUpgradeBaseTest):
             rebalance.result()
             out_server = server
 
-    def run_upgrade_test_for_feature(self, feature, phase):
+    def run_upgrade_test_for_feature(self, feature, phase, upgrade_type):
         if feature == "ansi-joins":
             self.run_ansi_join_upgrade_test(phase)
+        elif feature == "n1ql":
+            self.run_n1ql_upgrade_test(phase, upgrade_type)
         elif feature == "xattrs":
             self.run_xattrs_upgrade_test(phase)
         elif feature == "auditing":
@@ -285,6 +291,8 @@ class QueriesUpgradeTests(QueryTests, NewUpgradeBaseTest):
             self.run_backfill_upgrade_test(phase)
         elif feature == "curl-whitelist":
             self.run_curl_whitelist_upgrade_test(phase)
+        elif feature == "flex-index":
+            self.run_flex_index_upgrade_test(phase)
         else:
             self.fail("FAIL: feature {0} not found".format(feature))
 
@@ -297,6 +305,88 @@ class QueriesUpgradeTests(QueryTests, NewUpgradeBaseTest):
             self.run_test_basic_join()
         else:
             self.fail("FAIL: (ansi-join) invalid phase: {0}".format(phase))
+
+    def run_n1ql_upgrade_test(self, phase, upgrade_type):
+        if phase == "pre-upgrade":
+            self.log.info("running pre-upgrade test for N1QL")
+            if upgrade_type != "OFFLINE":
+                with self.subTest("PRE PREPARE TEST"):
+                    self.run_test_prepare(phase=phase)
+        elif phase == "mixed-mode":
+            self.log.info("running mixed-mode test for N1QL")
+            with self.subTest("MIXED FILTER TEST"):
+                self.run_test_filter()
+            with self.subTest("MIXED WINDOW CLAUSE TEST"):
+                self.run_test_window()
+            with self.subTest("MIXED UDF INLINE TEST"):
+                self.run_test_udf_inline()
+            with self.subTest("MIXED UDF JAVASCRIPT TEST"):
+                self.run_test_udf_javascript()
+            with self.subTest("MIXED ADVISOR STATEMENT TEST"):
+                self.run_test_advisor_statement()
+            with self.subTest("MIXED ADVISOR SESSION TEST"):
+                self.run_test_advisor_session()
+            #with self.subTest("MIXED UPDATE STATISTICS TEST"):
+            #    self.run_test_update_stats()
+            #with self.subTest("MIXED CBO TEST"):
+            #    self.run_test_cbo()
+            #with self.subTest("MIXED COLLECTION TEST"):
+            #    self.run_test_collection(phase=phase)
+            if upgrade_type != "offline":
+                with self.subTest("MIXED PREPARE TEST"):
+                    self.run_test_prepare(phase=phase)
+            with self.subTest("MIXED SYSTEM TABLE TEST"):
+                self.run_test_system_tables()
+        elif phase == "post-upgrade":
+            with self.subTest("POST FILTER TEST"):
+                self.run_test_filter()
+            with self.subTest("POST WINDOW CLAUSE TEST"):
+                self.run_test_window()
+            with self.subTest("POST UDF INLINE TEST"):
+                self.run_test_udf_inline()
+            with self.subTest("POST UDF JAVASCRIPT TEST"):
+                self.run_test_udf_javascript()
+            with self.subTest("POST ADVISOR STATEMENT TEST"):
+                self.run_test_advisor_statement()
+            with self.subTest("POST ADVISOR SESSION TEST"):
+                self.run_test_advisor_session()
+            with self.subTest("POST UPDATE STATISTICS TEST"):
+                self.run_test_update_stats()
+            with self.subTest("POST CBO TEST"):
+                self.run_test_cbo()
+            with self.subTest("POST COLLECTION TEST"):
+                self.run_test_collection(phase=phase)
+            with self.subTest("POST TRANSACTION TEST"):
+                self.run_test_transaction()
+            if upgrade_type != "offline":
+                with self.subTest("POST PREPARE TEST"):
+                    self.run_test_prepare(phase=phase)
+            with self.subTest("POST SYSTEM TABLE TEST"):
+                self.run_test_system_tables()
+        else:
+            self.fail("FAIL: (N1QL) invalid phase: {0}".format(phase))
+
+    def run_flex_index_upgrade_test(self, phase):
+        ft_object = FlexIndexTests()
+        ft_object.init_flex_object(self)
+        flex_query_list = ["select meta().id from default {0} where name = 'employee-6'"]
+        if phase == "pre-upgrade":
+            self.log.info("running pre-upgrade test for flex index")
+            self.create_fts_index(
+                name="default_index", source_name="default", doc_count=2016, index_storage_type=self.fts_index_type)
+        elif phase == "mixed-mode":
+            self.log.info("running mixed-mode test for flex index")
+        elif phase == "post-upgrade":
+            self.log.info("running post-upgrade test for flex index")
+            failed_to_run_query, not_found_index_in_response, result_mismatch = ft_object.run_query_and_validate(flex_query_list)
+            if failed_to_run_query or not_found_index_in_response or result_mismatch:
+                self.fail("Found queries not runnable: {0} or required index not found in the query resonse: {1} "
+                          "or flex query and gsi query results not matching: {2}"
+                          .format(failed_to_run_query, not_found_index_in_response, result_mismatch))
+            else:
+                self.log.info("All queries passed")
+        else:
+            self.fail("FAIL: (flex index) invalid phase: {0}".format(phase))
 
     def run_xattrs_upgrade_test(self, phase):
         if phase == "pre-upgrade":
@@ -373,6 +463,255 @@ class QueriesUpgradeTests(QueryTests, NewUpgradeBaseTest):
         queries_to_run.append((query, 288)) # 288 for doc-per-day=1
         self.run_common_body(index_list=idx_list, queries_to_run=queries_to_run)
 
+    def run_test_filter(self):
+        filter_query = "SELECT COUNT(*) FILTER (WHERE city = 'Paris') as count_paris FROM `travel-sample` WHERE type = 'airport'"
+        case_query = "SELECT COUNT(CASE WHEN city = 'Paris' THEN 1 ELSE NULL END) as count_paris FROM `travel-sample` WHERE type = 'airport'"
+        filter_results = self.run_cbq_query(filter_query)
+        case_results = self.run_cbq_query(case_query)
+        self.assertEqual(filter_results['results'], case_results['results'])
+
+    def run_test_window(self):
+        window_clause_query = "SELECT d.id, d.destinationairport, \
+            AVG(d.distance) OVER ( window1 ) AS `rank` \
+            FROM `travel-sample` AS d WHERE d.type='route' \
+            WINDOW window1 AS (PARTITION BY d.destinationairport) \
+            ORDER BY 1 \
+            LIMIT 5"
+        window_query = "SELECT d.id, d.destinationairport, \
+            AVG(d.distance) OVER ( PARTITION BY d.destinationairport ) AS `rank` \
+            FROM `travel-sample` AS d WHERE d.type='route' \
+            ORDER BY 1 \
+            LIMIT 5"
+        window_clause_query_results = self.run_cbq_query(window_clause_query)
+        window_query_results = self.run_cbq_query(window_query)
+        self.assertEqual(window_clause_query_results['results'], window_query_results['results'])
+
+    def run_test_update_stats(self):
+        histogram_expected = [
+            {"bucket": "travel-sample", "collection": "_default", "histogramKey": "city", "scope": "_default"},
+            {"bucket": "travel-sample", "collection": "_default", "histogramKey": "country", "scope": "_default"}]
+        update_stats = "UPDATE STATISTICS FOR `travel-sample`(city, country) WITH {'update_statistics_timeout':180}"
+        try:
+            self.run_cbq_query(query=update_stats)
+            histogram = self.run_cbq_query(query="select `bucket`, `scope`, `collection`, `histogramKey` from `N1QL_SYSTEM_BUCKET`.`N1QL_SYSTEM_SCOPE`.`N1QL_CBO_STATS` data WHERE type = 'histogram'")
+            self.assertEqual(histogram['results'],histogram_expected)
+        except Exception as e:
+            self.log.error(f"Update statistics failed: {e}")
+            self.fail()
+        finally:
+            self.run_cbq_query(query="UPDATE STATISTICS FOR `travel-sample` DELETE ALL")
+
+    def run_test_neg_update_stats(self):
+        pass
+
+    def run_test_udf_javascript(self):
+        functions = 'function adder(a, b, c) { for (i=0; i< b; i++){a = a + c;} return a; }'
+        function_names = ["adder"]
+        self.log.info("Create math library")
+        self.create_library("math", functions, function_names)
+        try:
+            self.run_cbq_query(query='CREATE FUNCTION func1(a,b,c) LANGUAGE JAVASCRIPT AS "adder" AT "math"')
+            results = self.run_cbq_query(query="EXECUTE FUNCTION func1(1,3,5)")
+            self.assertEqual(results['results'], [16])
+        finally:
+            try:
+                self.log.info("Delete math library")
+                self.delete_library("math")
+                self.run_cbq_query("DROP FUNCTION func1")
+            except Exception as e:
+                self.log.error(str(e))
+
+    def run_test_udf_inline(self):
+        try:
+            self.run_cbq_query("CREATE OR REPLACE FUNCTION func1(a,b,c) { (SELECT RAW SUM((a+b+c-40))) }")
+            results = self.run_cbq_query("EXECUTE FUNCTION func1(10,20,30)")
+            self.assertEqual(results['results'], [[20]])
+            results = self.run_cbq_query("SELECT func1(10,20,30)")
+            self.assertEqual(results['results'], [{'$1': [20]}])
+        except Exception as e:
+            self.log.error(str(e))
+            self.fail()
+        finally:
+            try:
+                self.run_cbq_query("DROP FUNCTION func1")
+            except Exception as e:
+                self.log.error(str(e))
+
+    def run_test_collection(self, phase):
+        scope = phase
+        lyon_airport = ['Bron', 'Lyon Part-Dieu Railway', 'Saint Exupery']
+        lyon_airport = ['Lyon Part-Dieu Railway', 'Saint Exupery']
+        select_collection = 'select count(*) from `travel-sample`.`_default`.`_default` where type = "airport"'
+        create_scope = f'CREATE SCOPE `travel-sample`.`{scope}`'
+        create_collection = f'CREATE COLLECTION `travel-sample`.`{scope}`.airport'
+        insert_query = f'INSERT INTO `travel-sample`.`{scope}`.airport(KEY _k, VALUE _v) SELECT META().id _k, _v FROM `travel-sample` _v WHERE type = "airport"'
+        update_query = f'UPDATE `travel-sample`.`{scope}`.airport SET city = "lyon" WHERE city = "Lyon"'
+        delete_query = f'DELETE FROM `travel-sample`.`{scope}`.airport WHERE airportname = "Bron"'
+        select_collection_new = f'SELECT array_agg(airportname) from `travel-sample`.`{scope}`.airport WHERE city = "lyon"'
+        select_context = 'SELECT array_agg(airportname) FROM airport WHERE city = "lyon"'
+        # TODO advise_query = 'SELECT ADVISOR([""])'
+        drop_scope = f'DROP SCOPE `travel-sample`.`{scope}`'
+        drop_collection = f'DROP COLLECTION `travel-sample`.`{scope}`.airport'
+        prepare_query = f'PREPARE `lyon_airport_{scope}` AS SELECT array_agg(airportname) FROM `travel-sample`.`{scope}`.airport WHERE city = "lyon"'
+        execute_query = f'EXECUTE `lyon_airport_{scope}`'
+        create_index = f'CREATE PRIMARY INDEX ON `travel-sample`.`{scope}`.`airport`'
+        try:
+            results = self.run_cbq_query(query=select_collection)
+            self.assertEqual(results['results'], [{"$1": 1968}])
+
+            results = self.run_cbq_query(query=create_scope)
+            results = self.run_cbq_query(query=create_collection)
+            results = self.run_cbq_query(query=f'SELECT `path` FROM system:keyspaces WHERE `scope` = "{scope}"')
+            self.assertEqual(results['results'][0]['path'], f"default:travel-sample.{scope}.airport")
+
+            results = self.run_cbq_query(query=insert_query)
+            self.assertEqual(results['metrics']['mutationCount'], 1968)
+
+            results = self.run_cbq_query(query=create_index)
+
+            results = self.run_cbq_query(query=update_query)
+            self.assertEqual(results['metrics']['mutationCount'], 3)
+
+            results = self.run_cbq_query(query=delete_query)
+            self.assertEqual(results['metrics']['mutationCount'], 1)
+
+            results = self.run_cbq_query(query=select_collection_new)
+            self.assertEqual(results['results'][0]['$1'], lyon_airport)
+
+            results = self.run_cbq_query(query=select_context, query_context=f'travel-sample.{scope}')
+            self.assertEqual(results['results'][0]['$1'], lyon_airport)
+
+            results = self.run_cbq_query(query=prepare_query)
+            results = self.run_cbq_query(query=execute_query)
+            self.assertEqual(results['results'][0]['$1'], lyon_airport)
+        except Exception as e:
+            self.log.error("Query collection failed: {0}".format(e))
+            self.fail()
+        finally:
+            results = self.run_cbq_query(query=drop_collection)
+            results = self.run_cbq_query(query=drop_scope)
+
+    def run_test_transaction(self):
+        select_query = "select count(*) from `travel-sample`"
+        insert_query = "INSERT INTO `travel-sample`(KEY,VALUE) VALUES ('airport_9999', {'id':9999,'type':'airport','airportname':'Bron','city':'Lyon','country':'France'})"
+        update_query = "UPDATE `travel-sample` SET city = 'San Francisco' WHERE lower(city) = 'sanfrancisco'"
+        delete_query = "DELETE FROM `travel-sample` WHERE type = 'airport' AND airportname = 'Bron'"
+        merge_query = "MERGE INTO `travel-sample` AS target USING\
+                [{'iata':'DSA', 'name': 'Doncaster Sheffield Airport'}, {'iata':'VLY', 'name': 'Anglesey Airport / Maes Awyr Môn'}] AS source\
+                ON target.faa = source.iata \
+                WHEN MATCHED THEN UPDATE SET target.old_name = target.airportname, target.airportname = source.name, target.updated = true\
+                WHEN NOT MATCHED THEN INSERT (KEY UUID(), VALUE {'faa': source.iata, 'airportname': source.name, 'type': 'airport', 'inserted': true})"
+        try:
+            self.run_cbq_query(query="CREATE INDEX faa_idx on `travel-sample`(faa)")
+            results = self.run_cbq_query(query="BEGIN WORK", server=self.master, txtimeout="180s")
+            txid = results['results'][0]['txid']
+            results = self.run_cbq_query(query=select_query, txnid=txid, server=self.master)
+            results = self.run_cbq_query(query="SAVEPOINT S1", txnid=txid, server=self.master)
+            results = self.run_cbq_query(query=insert_query, txnid=txid, server=self.master)
+            results = self.run_cbq_query(query=update_query, txnid=txid, server=self.master)
+            results = self.run_cbq_query(query=merge_query, txnid=txid, server=self.master)
+            results = self.run_cbq_query(query=delete_query, txnid=txid, server=self.master)
+            results = self.run_cbq_query(query="ROLLBACK TO SAVEPOINT S1", txnid=txid, server=self.master)
+            results = self.run_cbq_query(query=select_query, txnid=txid, server=self.master)
+            results = self.run_cbq_query(query="COMMIT", txnid=txid, server=self.master)
+        except Exception as e:
+            self.log.error("Transaction statement failed: {0}".format(e))
+            self.fail()
+        finally:
+            self.run_cbq_query(query="DROP INDEX faa_idx on `travel-sample`")
+
+    def run_test_advisor_statement(self):
+        try:
+            results = self.run_cbq_query(query="SELECT ADVISOR([ \
+                \"UPDATE `travel-sample` SET city = 'San Francisco' WHERE lower(city) = 'sanfrancisco'\", \
+                \"UPDATE `travel-sample` SET city = 'San Francisco' WHERE lower(city) = 'sanfrancisco'\" \
+            ])", server=self.master)
+            statements = results['results'][0]['$1']['recommended_indexes'][0]['statements']
+            self.assertEqual(statements[0]['run_count'], 2)
+        except Exception as e:
+            self.log.error("Advisor statement failed: {0}".format(e))
+            self.fail()
+
+    def run_test_advisor_session(self):
+        select_query = "SELECT airportname FROM `travel-sample` WHERE lower(city) = 'lyon' AND country = 'France'"
+        try:
+            start_session = self.run_cbq_query(query="SELECT ADVISOR({'action': 'start', 'duration': '1h', 'query_count': 2 })")
+            session = start_session['results'][0]['$1']['session']
+            results = self.run_cbq_query(query=select_query)
+            results = self.run_cbq_query(query=select_query)
+            self.sleep(3)
+            stop_session = self.run_cbq_query(query=f"SELECT ADVISOR({{'action': 'stop', 'session': '{session}'}})")
+            get_session = self.run_cbq_query(query=f"SELECT ADVISOR({{'action': 'get', 'session': '{session}'}})")
+            self.assertTrue('recommended_indexes' in get_session['results'][0]['$1'][0][0], f"There are no recommended index: {get_session['results'][0]['$1'][0][0]}")
+        except Exception as e:
+            self.log.error("Advisor session failed: {0}".format(e))
+            self.fail()
+        finally:
+            purge_session = self.run_cbq_query(query=f"SELECT ADVISOR({{'action': 'purge', 'session': '{session}'}})")
+
+    def run_test_prepare(self, phase):
+        prepare_query = "prepare lyon_airport as select array_agg(airportname) from `travel-sample` where type = 'airport' and city = 'Lyon'"
+        execute_query = "execute lyon_airport"
+        lyon_airport = ['Bron', 'Lyon Part-Dieu Railway', 'Saint Exupery']
+        if phase == "pre-upgrade":
+            self.run_cbq_query(query=prepare_query)
+        if phase == "mixed-mode" or phase == "post-upgrade":
+            results = self.run_cbq_query(query=execute_query)
+            self.assertEqual(results['results'][0]['$1'], lyon_airport)
+
+    def run_test_cbo(self):
+        update_stats = "UPDATE STATISTICS FOR `travel-sample`(city) WITH {'update_statistics_timeout':600}"
+        explain_query = "EXPLAIN select airportname from `travel-sample` where city = 'Lyon'"
+        try:
+            self.run_cbq_query(query=update_stats)
+            explain_after = self.run_cbq_query(query=explain_query)
+            self.assertTrue(explain_after['results'][0]['cost'] > 0 and explain_after['results'][0]['cardinality'] > 0)
+        except Exception as e:
+            self.log.error(f"cbo failed: {e}")
+            self.fail()
+        finally:
+            self.run_cbq_query(query="UPDATE STATISTICS FOR `travel-sample` DELETE ALL")
+
+    def run_test_system_tables(self):
+        query_keyspaces_info = "select * from system:keyspaces_info where id = 'travel-sample'"
+        results = self.run_cbq_query(query=query_keyspaces_info)
+        keyspaces_info = results['results'][0]['keyspaces_info']
+        self.assertEqual(keyspaces_info['count'], 31591)
+
+        query_all_keyspaces = "select array_agg(`path`) from system:all_keyspaces where datastore_id = 'system'"
+        system_keyspaces = [
+            '#system:active_requests', '#system:all_indexes', '#system:all_keyspaces', '#system:all_keyspaces_info', '#system:all_scopes',
+            '#system:applicable_roles', '#system:buckets', '#system:completed_requests', '#system:datastores', '#system:dictionary',
+            '#system:dictionary_cache', '#system:dual', '#system:functions', '#system:functions_cache', '#system:indexes',
+            '#system:keyspaces', '#system:keyspaces_info', '#system:my_user_info', '#system:namespaces', '#system:nodes',
+            '#system:prepareds', '#system:scopes', '#system:tasks_cache', '#system:transactions', '#system:user_info'
+        ]
+        results = self.run_cbq_query(query=query_all_keyspaces)
+        all_keyspaces = results['results'][0]['$1']
+        self.assertEqual(all_keyspaces, system_keyspaces)
+
+        query_all_indexes = "select array_agg(distinct keyspace_id) from system:all_indexes where all_indexes.`namespace_id` = '#system'"
+        system_all_indexes = [
+            "active_requests", "all_indexes", "all_keyspaces", "all_keyspaces_info", "all_scopes", "applicable_roles", "buckets",
+            "completed_requests", "datastores", "dictionary", "dictionary_cache", "dual", "functions", "functions_cache", "indexes",
+            "keyspaces", "keyspaces_info", "my_user_info", "namespaces", "nodes", "prepareds", "scopes", "tasks_cache", "transactions",
+            "user_info"
+        ]
+        results = self.run_cbq_query(query=query_all_indexes)
+        all_indexes = results['results'][0]['$1']
+        self.assertEqual(all_indexes, system_all_indexes)
+
+        query_all_keyspaces_info = "select array_agg(id) from system:all_keyspaces_info where all_keyspaces_info.datastore_id = 'system'"
+        system_keyspaces_info = [
+            'active_requests', 'all_indexes', 'all_keyspaces', 'all_keyspaces_info', 'all_scopes', 'applicable_roles', 'buckets',
+            'completed_requests', 'datastores', 'dictionary', 'dictionary_cache', 'dual', 'functions', 'functions_cache', 'indexes',
+            'keyspaces', 'keyspaces_info', 'my_user_info', 'namespaces', 'nodes', 'prepareds', 'scopes', 'tasks_cache', 'transactions',
+            'user_info'
+        ]
+        results = self.run_cbq_query(query=query_all_keyspaces_info)
+        all_keyspaces_info = results['results'][0]['$1']
+        self.assertEqual(all_keyspaces_info, system_keyspaces_info)
+    
     ###############################
     #
     # Curl Whitelist Tests
@@ -390,14 +729,22 @@ class QueriesUpgradeTests(QueryTests, NewUpgradeBaseTest):
         query="select curl(" + url + ")"
         curl = self.shell.execute_commands_inside(self.cbqpath, query, '', '', '', '', '')
         actual_curl = self.convert_to_json(curl)
-        self.assertEqual(actual_curl['results'][0]['$1'], expected_curl)
+        # self.assertEqual(actual_curl['results'][0]['$1'], expected_curl)
+        self.assertEqual(actual_curl['results'][0]['$1']['expand'], expected_curl['expand'])
+        self.assertEqual(actual_curl['results'][0]['$1']['id'], expected_curl['id'])
+        self.assertEqual(actual_curl['results'][0]['$1']['self'], expected_curl['self'])
+        self.assertEqual(actual_curl['results'][0]['$1']['key'], expected_curl['key'])
 
         self.rest.create_whitelist(self.master, {"all_access": True,
                                                  "allowed_urls": None,
                                                  "disallowed_urls": None})
         curl = self.shell.execute_commands_inside(self.cbqpath, query, '', '', '', '', '')
         actual_curl = self.convert_to_json(curl)
-        self.assertEqual(actual_curl['results'][0]['$1'], expected_curl)
+        # self.assertEqual(actual_curl['results'][0]['$1'], expected_curl)
+        self.assertEqual(actual_curl['results'][0]['$1']['expand'], expected_curl['expand'])
+        self.assertEqual(actual_curl['results'][0]['$1']['id'], expected_curl['id'])
+        self.assertEqual(actual_curl['results'][0]['$1']['self'], expected_curl['self'])
+        self.assertEqual(actual_curl['results'][0]['$1']['key'], expected_curl['key'])
 
     # test_allowed_url from tuq_curl_whitelist.py
     def run_test_allowed_url(self):
@@ -541,7 +888,7 @@ class QueriesUpgradeTests(QueryTests, NewUpgradeBaseTest):
             expectedResults = {'node':'%s:%s' % (self.master.ip, self.master.port), 'status': 'success', 'isAdHoc': True,
                                'name': 'SELECT statement', 'real_userid': {'source': source, 'user': user},
                                'statement': 'SELECT * FROM default LIMIT 100',
-                               'userAgent': 'Python-httplib2/$Rev: 259 $', 'id': self.eventID,
+                               'userAgent': 'Python-httplib2/0.13.1 (gzip)', 'id': self.eventID,
                                'description': 'A N1QL SELECT statement was executed'}
         elif query_type == 'insert':
             if self.filter:
@@ -554,7 +901,7 @@ class QueriesUpgradeTests(QueryTests, NewUpgradeBaseTest):
                                'statement': 'INSERT INTO default ( KEY, VALUE ) VALUES ("1",{ "order_id": "1", "type": '
                                             '"order", "customer_id":"24601", "total_price": 30.3, "lineitems": '
                                             '[ "11", "12", "13" ] })',
-                               'userAgent': 'Python-httplib2/$Rev: 259 $', 'id': self.eventID,
+                               'userAgent': 'Python-httplib2/0.13.1 (gzip)', 'id': self.eventID,
                                'description': 'A N1QL INSERT statement was executed'}
 
         if query_type == 'delete':
@@ -748,8 +1095,9 @@ class QueriesUpgradeTests(QueryTests, NewUpgradeBaseTest):
         return self.get_values_for_compare('meta().id')
 
     def get_values_for_compare(self, field):
-        query_response = self.run_cbq_query("SELECT " + field + " FROM default")
-        docs = sorted(query_response['results'])
+        query_id = f'SELECT {field} FROM default'
+        query_response = self.run_cbq_query(query=query_id)
+        docs = sorted(query_response['results'], key=lambda item: item.get("id"))
         return docs
 
     def run_xattrs_query(self, query, index_statement, xattr_name, index_name, bucket_name, xattr_data=[], compare_fields=[], primary_compare=True, deleted_compare=False, with_retain=False, xattr_type="system", with_aggs=False, delete_leading=False):
@@ -792,7 +1140,17 @@ class QueriesUpgradeTests(QueryTests, NewUpgradeBaseTest):
                     self.assertTrue(docs == {"deleted": False})
         else:
             self.log.info("Compare: " + str(compare[0:5]))
-            self.assertTrue(sorted(docs_1) == sorted(compare))
+            key1 = list(compare[0].keys())[0]
+            if type(compare[0][key1]) == int:
+                self.assertTrue(sorted(docs_1, key=lambda item: item.get(key1)) == sorted(compare, key=lambda item: item.get(key1)))
+            else:
+                key2 = list(compare[0][key1].keys())[0]
+                if type(compare[0][key1][key2]) == int:
+                    self.assertTrue(sorted(docs_1, key=lambda item: item.get(key1).get(key2)) == sorted(compare, key=lambda item: item.get(key1).get(key2)))
+                else:
+                    key3 = list(compare[0][key1][key2].keys())[0]
+                    if type(compare[0][key1][key2][key3] == int):
+                        self.assertTrue(sorted(docs_1, key=lambda item: item.get(key1).get(key2).get(key3)) == sorted(compare, key=lambda item: item.get(key1).get(key2).get(key3)))
 
         if deleted_compare:
             meta_ids = self.get_meta_ids()
@@ -825,12 +1183,23 @@ class QueriesUpgradeTests(QueryTests, NewUpgradeBaseTest):
                 self.assertTrue(len(docs_1)-10 == len(compare_docs))
                 if delete_leading:
                     self.assertTrue(len(docs_2) == len(compare_docs))
-                    self.assertTrue(sorted(docs_2) == sorted(compare_docs))
+                    self.assertTrue(sorted(docs_2, key=lambda item: item.get(xattr_name)) == sorted(compare_docs, key=lambda item: item.get(xattr_name)))
                 else:
                     self.assertTrue(len(docs_2)-10 == len(compare_docs))
-                    self.assertTrue(sorted(docs_1) == sorted(docs_2))
+                    self.assertTrue(sorted(docs_1, key=lambda item: item.get(xattr_name)) == sorted(docs_2, key=lambda item: item.get(xattr_name)))
             else:
-                self.assertTrue(sorted(docs_2) == sorted(compare_docs))
+                key1 = list(compare_docs[0].keys())[0]
+                if type(compare_docs[0][key1]) == int:
+                    self.assertTrue(sorted(docs_2, key=lambda item: item.get(key1)) == sorted(compare_docs, key=lambda item: item.get(key1)))
+                else:
+                    key2 = list(compare_docs[0][key1].keys())[0]
+                    if type(compare_docs[0][key1][key2]) == int:
+                        self.assertTrue(sorted(docs_2, key=lambda item: item.get(key1).get(key2)) == sorted(compare_docs, key=lambda item: item.get(key1).get(key2)))
+                    else:
+                        key3 = list(compare_docs[0][key1][key2].keys())[0]
+                        if type(compare_docs[0][key1][key2][key3] == int):
+                            self.assertTrue(sorted(docs_2, key=lambda item: item.get(key1).get(key2).get(key3)) == sorted(compare_docs, key=lambda item: item.get(key1).get(key2).get(key3)))
+
                 if not with_aggs:
                     self.assertTrue(len(docs_1)-10 == len(docs_2))
 
@@ -849,10 +1218,10 @@ class QueriesUpgradeTests(QueryTests, NewUpgradeBaseTest):
 
             if delete_leading or xattr_type == 'user':
                 self.assertTrue(len(docs_3) == len(compare_docs))
-                self.assertTrue(sorted(docs_3) == sorted(compare_docs))
+                self.assertTrue(sorted(docs_3, key=lambda item: item.get(xattr_name)) == sorted(compare_docs, key=lambda item: item.get(xattr_name)))
             else:
                 self.assertTrue(len(docs_3)-10 == len(compare_docs))
-                self.assertTrue(sorted(docs_2) == sorted(docs_3))
+                self.assertTrue(sorted(docs_2, key=lambda item: item.get(xattr_name)) == sorted(docs_3, key=lambda item: item.get(xattr_name)))
 
             self.run_cbq_query("DROP INDEX default." + index_name)
 

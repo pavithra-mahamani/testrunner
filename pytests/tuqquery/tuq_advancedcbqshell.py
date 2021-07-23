@@ -191,72 +191,8 @@ class AdvancedQueryTests(QueryTests):
 
     # difference combinations of username/password and creds
     def check_onesaslbucket_auth(self):
-        for server in self.servers:
-            shell = RemoteMachineShellConnection(server)
-            for bucket in self.buckets:
-                try:
-                    if (bucket.saslPassword != ''):
-                        #sasl
-                        o = shell.execute_commands_inside('%s/cbq -c %s:%s -q' % (self.path, bucket.name, bucket.saslPassword), 'CREATE PRIMARY INDEX ON %s USING GSI' %bucket.name, '', '', '', '', '')
-                        self.assertTrue("requestID" in o)
-                        o = shell.execute_commands_inside('%s/cbq -c %s:%s -q' % (self.path, bucket.name, bucket.saslPassword), 'select *,join_day from %s limit 10'%bucket.name, '', '', '', '', '')
-                        if self.analytics:
-                            self.query = 'select join_day from %s limit 10'%bucket.name
-                            o = self.run_cbq_query()
-                        self.assertTrue("requestID" in o)
-                        o = shell.execute_commands_inside('%s/cbq -c %s:%s -q' % (self.path, bucket.name, 'wrong'), 'select * from %s limit 10'%bucket.name, '', '', '', '', '')
-                        self.assertTrue("AuthorizationFailed"  in o)
-
-                        o = shell.execute_commands_inside('%s/cbq -c %s:%s -q' % (self.path, '', 'wrong'), 'select * from %s limit 10'%bucket.name, '', '', '', '', '')
-                        self.assertEqual('FAIL', o[7:])
-                        o = shell.execute_commands_inside('%s/cbq -c %s:%s -q' % (self.path, 'wrong', bucket.saslPassword), 'select * from %s limit 10'%bucket.name, '', '', '', '', '')
-                        self.assertTrue("AuthorizationFailed"  in o)
-
-                        queries = ['\set -creds user:pass;', 'select *,join_day from bucketname limit 10;']
-                        o = shell.execute_commands_inside('%s/cbq -quiet' % (self.path), '', queries, bucket.name, bucket.saslPassword, bucket.name, '' )
-                        self.assertTrue("requestID" in o)
-                        queries = ['\set -creds user:pass;', 'select * from bucketname union all select * from default limit 10;']
-                        o = shell.execute_commands_inside('%s/cbq -quiet' % (self.path), '', queries, 'Administrator', 'password', bucket.name, '' )
-                        self.assertTrue("requestID" in o)
-                        queries = ['\set -creds user:pass;', 'SELECT buck.email FROM  bucketname buck LEFT JOIN default on keys "query-testemployee10153.1877827-0";']
-                        o = shell.execute_commands_inside('%s/cbq -quiet' % (self.path), '', queries, 'Administrator', 'password', bucket.name, '' )
-                        self.assertTrue("requestID" in o)
-                        queries = ['\set -creds user:pass;', 'SELECT buck.email FROM  bucketname buck LEFT JOIN default on keys "query-testemployee10153.1877827-0";']
-                        o = shell.execute_commands_inside('%s/cbq -quiet' % (self.path), '', queries, bucket.name, bucket.saslPassword, bucket.name, '' )
-                        self.assertTrue("requestID" in o)
-
-                        queries = ['select count(*) from bucketname  union all select count(*) from default;']
-                        o = shell.execute_commands_inside('%s/cbq -quiet' % (self.path), '', queries, '', bucket.saslPassword, bucket.name, ''  )
-                        self.assertTrue("AuthorizationFailed"  in o)
-
-                        queries = ['\set -creds user:pass;', 'select *,email,join_day from bucketname;']
-                        o = shell.execute_commands_inside('%s/cbq -quiet' % (self.path), '', queries, 'Administrator', 'password', bucket.name, '' )
-                        self.assertTrue("requestID" in o)
-                        queries = ['\set -creds user:pass;', 'create primary index on default;', 'select email,join_day from bucketname union all select email,join_day from default;']
-                        o = shell.execute_commands_inside('%s/cbq -quiet' % (self.path), '', queries, bucket.name, bucket.saslPassword, bucket.name, '' )
-                        self.assertTrue("requestID" in o)
-
-                        o = shell.execute_commands_inside('%s/cbq -quiet' % (self.path), '', queries, 'wrong', 'wrong', bucket.name, '' )
-                        self.assertTrue("AuthorizationFailed"  in o)
-                        o = shell.execute_commands_inside('%s/cbq -quiet' % (self.path), '', queries, 'wrong', bucket.saslPassword, bucket.name, '' )
-                        self.assertTrue("AuthorizationFailed"  in o)
-                        o = shell.execute_commands_inside('%s/cbq -quiet' % (self.path), '', queries, bucket.name, 'wrong', bucket.name, '' )
-                        self.assertTrue("AuthorizationFailed"  in o)
-                        o = shell.execute_commands_inside('%s/cbq -q -u=%s -p=%s' % (self.path, 'Administrator', 'password'), 'select * from %s limit 10;' %bucket.name, '', '', '', '', '' )
-                        self.assertTrue("requestID" in o)
-                        o = shell.execute_commands_inside('%s/cbq -q -u=%s -p=%s' % (self.path, bucket.name, bucket.saslPassword), 'select * from %s limit 10;' %bucket.name, '', '', '', '', '' )
-                        self.assertTrue("requestID" in o)
-                        #nonsasl
-                        o = shell.execute_commands_inside('%s/cbq -q -u %s -p %s' % (self.path, 'Administrator', 'password'), 'select * from default limit 10;', '', '', '', '', '' )
-                        self.assertTrue("requestID" in o)
-                        o = shell.execute_commands_inside('%s/cbq -q -u %s -p %s' % (self.path, bucket.name, bucket.saslPassword), 'select * from default limit 10;', '', '', '', '', '' )
-                        self.assertTrue("requestID" in o)
-                        o = shell.execute_commands_inside('%s/cbq -q ' % (self.path), 'select * from default limit 10;', '', '', '', '', '' )
-                        self.assertTrue("requestID" in o)
-                        break;
-
-                finally:
-                    shell.disconnect()
+        # No longer valid test as sasl password is no longer used
+        return
 
 
     def check_multiple_saslbuckets_auth(self):
@@ -353,15 +289,15 @@ class AdvancedQueryTests(QueryTests):
                 #wrong port
                 queries = ['\connect http://localhost:8097;', 'create primary index on bucketname;']
                 o = self.execute_commands_inside(self.cbqpath, '', queries, '', '', bucket.name, '' )
-                self.assertTrue("Connection failed" in o)
+                self.assertTrue("Unable to connect to endpoint" in o)
                 #wrong url including http
                 queries = ['\connect http://localhost345:8097;', 'create primary index on bucketname;']
                 o = self.execute_commands_inside(self.cbqpath, '', queries, '', '', bucket.name, '' )
-                self.assertTrue("Connection failed" in o)
+                self.assertTrue("Unable to connect to endpoint" in o)
                 #wrong url not including http
                 queries = ['\connect localhost3458097;', 'create primary index on bucketname;']
                 o = self.execute_commands_inside(self.cbqpath, '', queries, '', '', bucket.name, '' )
-                self.assertTrue("no such host" in o)
+                self.assertTrue("Unable to connect to endpoint" in o)
                 queries = ['\disconnect', 'drop primary index on bucketname;']
                 o = self.execute_commands_inside(self.cbqpath, '', queries, '', '', bucket.name, '' )
                 self.assertTrue("Too many input arguments to command" in o)
@@ -449,6 +385,41 @@ class AdvancedQueryTests(QueryTests):
                 queries = ['\SET -args [7, 0,1,2011];', 'prepare temp from SELECT tasks_points.task1 AS task from bucketname WHERE join_mo>$1 GROUP BY tasks_points.task1 HAVING COUNT(tasks_points.task1) > $2 AND  (MIN(join_day)=$3 OR MAX(join_yr=$4)) ORDER BY tasks_points.task1 ;', 'execute temp;']
                 o = self.execute_commands_inside(self.cbqpath, '', queries, '', '', bucket.name, '')
                 # Test neeeds to be finished
+
+    def test_query_context(self):
+        queries = ['\SET -query_context default.test;',
+                   'select name from test1 b where b.name="old hotel"']
+        o = self.execute_commands_inside(self.cbqpath, '', queries, '', '', 'default', '')
+        self.assertTrue('{"name": "old hotel"},{"name": "old hotel"},{"name": "old hotel"}' in o,
+                        "Results are incorrect : {0}".format(o))
+
+    def test_query_collection(self):
+        queries = ['select name from default:default.test.test1 b where b.name="old hotel"']
+        o = self.execute_commands_inside(self.cbqpath, '', queries, '', '', 'default', '')
+        self.assertTrue('{"name": "old hotel"},{"name": "old hotel"},{"name": "old hotel"}' in o,
+                        "Results are incorrect : {0}".format(o))
+
+    def test_context_join(self):
+        queries = ['\SET -query_context default:default.test;',
+                   'select * from default:default.test.test1 t1 INNER JOIN test2 t2 ON t1.name = t2.name where t1.name = "new hotel"']
+        o = self.execute_commands_inside(self.cbqpath, '', queries, '', '', 'default', '')
+        self.assertTrue('{"t1": {"name": "new hotel","type": "hotel"},"t2": {"name": "new hotel","type": "hotel"}}' in o,
+                        "Results are incorrect : {0}".format(o))
+
+    def test_ddl_collections(self):
+        queries = ['\SET -query_context default:default.test;',
+                   'INSERT INTO {0}'.format(self.collections[0]) + '(KEY, VALUE) VALUES ("key10", { "type" : "hotel", "name" : "new hotel" })']
+        o = self.execute_commands_inside(self.cbqpath, '', queries, '', '', 'default', '')
+        self.assertTrue('"mutationCount": 1' in o)
+
+    def test_batch_queries(self):
+        queries = ['\SET -query_context default.test;',
+                   'select name from test1 b where b.name="old hotel";','select name from test2 b1 where b1.name="new hotel";']
+        o = self.execute_commands_inside(self.cbqpath, '', queries, '', '', 'default', '')
+        self.assertTrue('{"name": "old hotel"},{"name": "old hotel"},{"name": "old hotel"}' in o,
+                        "Results are incorrect : {0}".format(o))
+        self.assertTrue('{"name": "new hotel"}' in o,
+                        "Results are incorrect : {0}".format(o))
 
     def test_named_params(self):
         for server in self.servers:

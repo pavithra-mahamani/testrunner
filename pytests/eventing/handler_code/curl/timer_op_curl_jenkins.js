@@ -26,12 +26,7 @@ function NDtimerCallback(context) {
     	log('response headers received from server:', response.headers);
     	log('response status received from server:', response.status);
     	var res= new Uint8Array(response.body);
-    	if(response.status == 200){
-    	    delete dst_bucket[context.docID];
-    	}
-    	else{
-    	    dst_bucket[meta.id] = response.status;
-    	}
+    	delete dst_bucket[context.docID];
     }
     catch (e) {
     	log('error:', e);

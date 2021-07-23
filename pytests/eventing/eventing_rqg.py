@@ -125,12 +125,13 @@ class EventingRQG(EventingBaseTest):
                 self.n1ql_helper.run_cbq_query(query=query, server=self.n1ql_node)
                 self.sleep(10)
                 self.eventing_stats()
+                self.verify_n1ql_stats(s*k)
             except Exception as e:
                 log.error(e)
             finally:
                 self.undeploy_delete_all_functions()
-        self.delete_temp_handler_code()
-        self.verify_n1ql_stats(s)
+            self.delete_temp_handler_code()
+
 
 
     def create_function_and_deploy(self, query, replace=True):
@@ -184,7 +185,7 @@ class EventingRQG(EventingBaseTest):
         script_dir = os.path.dirname(__file__)
         abs_file_path = os.path.join(script_dir, handler_code)
         fh = open(abs_file_path, "r")
-        code = Template(fh.read()).substitute(n1ql=query)
+        code = Template(fh.read()).substitute(n1ql=query.strip())
         fh.close()
         ts = datetime.datetime.now().strftime('%m%d%y%H%M%S%f')
         temp_file_path = HANDLER_CODE.N1QL_TEMP_PATH + "f_" + ts + ".js"

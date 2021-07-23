@@ -189,37 +189,44 @@ class ElasticSearchBase(object):
         self.http = httplib2.Http
 
     def _http_request(self, api, method='GET', params='', headers=None,
-                      timeout=120):
+                      timeout=600):
         if not headers:
             headers = {'Content-Type': 'application/json',
                        'Accept': '*/*'}
-        try:
-            response, content = httplib2.Http(timeout=timeout).request(api,
-                                                                       method,
-                                                                       params,
-                                                                       headers)
-            if response['status'] in ['200', '201', '202']:
-                return True, content, response
-            else:
-                try:
-                    json_parsed = ast.literal_eval(content)
-                except ValueError as e:
-                    json_parsed = {}
-                    json_parsed["error"] = "status: {0}, content: {1}".\
-                        format(response['status'], content)
-                reason = "unknown"
-                if "error" in json_parsed:
-                    reason = json_parsed["error"]
-                self.__log.error('{0} error {1} reason: {2} {3}'.format(
-                    api,
-                    response['status'],
-                    reason,
-                    content.rstrip(b'\n')))
-                return False, content, response
-        except socket.error as e:
-            self.__log.error("socket error while connecting to {0} error {1} ".
-                             format(api, e))
-            raise ServerUnavailableException(ip=self.__host.ip)
+
+        wait = 5
+        for i in range(1, 6):
+            try:
+                response, content = httplib2.Http(timeout=timeout).request(api,
+                                                                           method,
+                                                                           params,
+                                                                           headers)
+
+                if response['status'] in ['200', '201', '202']:
+                    return True, content, response
+                else:
+                    try:
+                        json_parsed = ast.literal_eval(content)
+                    except ValueError as e:
+                        json_parsed = {}
+                        json_parsed["error"] = "status: {0}, content: {1}".\
+                            format(response['status'], content)
+                    reason = "unknown"
+                    if "error" in json_parsed:
+                        reason = json_parsed["error"]
+                    self.__log.error('{0} error {1} reason: {2} {3}'.format(
+                        api,
+                        response['status'],
+                        reason,
+                        content.rstrip(b'\n')))
+                    return False, content, response
+            except socket.error as e:
+                self.__log.error("socket error while connecting to {0} error {1} ".
+                                 format(api, e))
+                self.sleep(wait*i, "Resilience sleeps")
+
+        raise ServerUnavailableException(ip=self.__host.ip)
+
 
     def restart_es(self):
         shell = RemoteMachineShellConnection(self.__host)
@@ -229,13 +236,13 @@ class ElasticSearchBase(object):
 
         es_start = False
         for i in range(2):
-            self.sleep(10)
+            self.sleep(10, "is running sleep")
             if self.is_running():
                 es_start = True
                 break
         if not es_start:
-            self.fail("Could not reach Elastic Search server on %s"
-                      % self.ip)
+            self.__log.error("Could not reach Elastic Search server on %s"
+                      % self.__host.ip)
         else:
             self.__log.info("Restarted ES server %s successfully" % self.__host.ip)
 
@@ -246,7 +253,7 @@ class ElasticSearchBase(object):
         """
 
         try:
-            status, content, _ = self._http_request(
+            status, content, response = self._http_request(
                 self.__connection_url,
                 'GET')
             if status:
@@ -254,7 +261,7 @@ class ElasticSearchBase(object):
             else:
                 return False
         except Exception as e:
-            raise e
+            return False
 
     def delete_index(self, index_name):
         """
@@ -444,7 +451,7 @@ class ElasticSearchBase(object):
         except Exception as e:
             raise e
 
-    def load_data(self, index_name, document_json, doc_type, doc_id):
+    def load_data(self, index_name, document_json, doc_type, doc_id, scope=None, collection=None):
         """
         index_name : name of index into which the doc is loaded
         document_json: json doc

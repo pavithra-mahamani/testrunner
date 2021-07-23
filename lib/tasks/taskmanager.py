@@ -2,7 +2,7 @@ import time
 import queue
 
 from threading import Thread
-from tasks.task import Task
+from tasks.task import FINISHED, Task
 
 class TaskManager(Thread):
     def __init__(self, thread_name=None):
@@ -16,6 +16,8 @@ class TaskManager(Thread):
     def schedule(self, task, sleep_time=0):
         if not isinstance(task, Task):
             raise TypeError("Tried to schedule somthing that's not a task")
+        if not self.running:
+            raise Exception("Tried to schedule a task when task manager not running")
         if sleep_time <= 0:
             self.readyq.put(task)
         else:
@@ -28,7 +30,11 @@ class TaskManager(Thread):
                 time.sleep(1)
             else:
                 task = self.readyq.get()
-                task.step(self)
+                try:
+                    task.step(self)
+                except Exception as error:
+                    task.state = FINISHED
+                    task.set_exception(error)
             for i in range(self.sleepq.qsize()):
                 s_task = self.sleepq.get()
                 if time.time() >= s_task['time']:

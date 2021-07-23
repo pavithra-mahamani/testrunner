@@ -40,7 +40,11 @@ class cbstatsTests(CliBaseTest):
                                         self.item_size, self.command_options)
                         self.sleep(5)
                 for bucket in self.buckets:
-                    output, error = self.shell.execute_cbstats(bucket, self.command)
+                    if "allocator" in self.command:
+                        output, error = self.shell.execute_mcstat(bucket,"",
+                                keyname=self.command, vbid="", enable_ipv6=self.enable_ipv6)
+                    else:
+                        output, error = self.shell.execute_cbstats(bucket, self.command)
                     self.verify_results(output, error)
                     if self.command in ["allocator", "kvtimings", "timings"]:
                         self.log.warning("We will not verify exact values for this stat")
@@ -50,12 +54,16 @@ class cbstatsTests(CliBaseTest):
             mc_conn = MemcachedClientHelper.direct_client(self.master, self.buckets[0].name, self.timeout)
             bucket_info = RestConnection(self.master).get_bucket(self.buckets[0])
             keys_map = {}
-            for i in range(self.num_items):
+            for i in range(1, self.num_items + 1):
                 vb_id = i - len(bucket_info.vbuckets) * int(i // len(bucket_info.vbuckets))
-                mc_conn.set("test_docs-%s" % i, 0, 0, json.dumps('{ "test" : "test"}').encode("ascii", "ignore"), vb_id)
+                try:
+                    mc_conn.set("test_docs-%s" % i, 0, 0, json.dumps('{ "test" : "test"}').encode("ascii", "ignore"), vb_id)
+                except Exception:
+                    continue
                 keys_map["test_docs-%s" % i] = vb_id
             for key, vb_id in keys_map.items():
                 output, error = self.shell.execute_cbstats(self.buckets[0], self.command, key, vb_id)
+                self.sleep(20)
                 self.verify_results(output, error)
 
     def test_software_version(self):
@@ -136,12 +144,10 @@ class cbstatsTests(CliBaseTest):
 
     def verify_results(self, output, error):
         if len(error) > 0 and '\n'.join(error).find("DeprecationWarning") == -1:
-            raise Exception("Command throw out error message.\
-                             Please check the output of remote_util")
+            raise Exception("Please see error of remote_util: " + '\n'.join(error))
         else:
             if '\n'.join(output).lower().find("not found") != -1:
-                raise Exception("Command throw out error message.\
-                                 Please check the output of remote_util")
+                raise Exception("Please see output of remote_util: " + '\n'.join(output))
             elif output.__len__() < 1:
                 raise Exception("Command does not throw out error message \
                                  but the output is empty. \
@@ -152,6 +158,8 @@ class cbstatsTests(CliBaseTest):
                                                       bucket.name, self.timeout)
         for line in output:
             stats = line.rsplit(":", 1)
+            if "c:/" in line:
+                stats = line.split(":", 1)
             collect_stats = ""
             commands = ["hash", "tapagg"]
             if command in commands:
@@ -165,14 +173,22 @@ class cbstatsTests(CliBaseTest):
                                      but cbstats gives no output. \
                                      Please check the output manually")
             else:
-                collect_stats = mc_conn.stats(command)[stats[0].strip()]
+                try:
+                    if "magma" in stats[0]:
+                        """ skip to check magma stats.  Will check in other test """
+                        continue
+                    collect_stats = mc_conn.stats(command)[stats[0].strip()]
+                except Exception as e:
+                    print("\n Exception error: ", e)
             self.log.info("CbStats###### for {0}:::{1}=={2}" \
                           .format(stats[0].strip(), collect_stats, stats[1].strip()))
             if stats[1].strip() == collect_stats:
                 continue
             else:
-                if stats[0].find('tcmalloc') != -1 or stats[0].find('bytes') != -1 or\
-                stats[0].find('mem_used') != -1:
+                if stats[0].find('tcmalloc') != -1 or stats[0].find('bytes') != -1 or \
+                   stats[0].find('mem_used') != -1 or stats[0].find("allocated") != -1 or \
+                   stats[0].find('fragmentation_size') != -1 or stats[0].find('mapped') != -1 or \
+                   stats[0].find('resident') != -1 or stats[0].find('retained') != -1:
                     self.log.warning("Stat didn't match, but it can be changed, not a bug")
                     continue
                 raise Exception("Command does not throw out error message \

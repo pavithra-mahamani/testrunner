@@ -29,6 +29,8 @@ class TestInput(object):
         self.elastic = []
         self.advisor = []
         self.cbas = []
+        self.cbbackupmgr = {}
+        self.bkrs_client = None
         #servers , each server can have u,p,port,directory
 
     def param(self, name, *args):
@@ -45,6 +47,27 @@ class TestInput(object):
         else:
             raise Exception("Parameter `{}` must be set "
                             "in the test configuration".format(name))
+
+    def cbbackupmgr_param(self, name, *args):
+        """Returns the config value from the ini whose key matches 'name' and is stored under the 'cbbackupmgr'
+        section heading.
+
+        Args:
+            name (str): The key under which an expected value is stored.
+            args (str): Expects a single parameter which will be used as the default if the requested key is not found.
+
+        Returns:
+            string: The value parsed from the ini file/default value if the given key is not found.
+
+        Raises:
+            Exception: If the given key does not exist in the ini and no default value is provided.
+        """
+        if name in self.cbbackupmgr:
+            return TestInput._parse_param(self.cbbackupmgr[name])
+        if len(args) == 1:
+            return args[0]
+        if self.cbbackupmgr["name"] != "local_bkrs":
+            raise Exception(f"Parameter '{name}' must be set in the test configuration")
 
     @staticmethod
     def _parse_param(value):
@@ -81,6 +104,7 @@ class TestInputServer(object):
         self.cli_path = ''
         self.data_path = ''
         self.index_path = ''
+        self.cbas_path = ''
         self.n1ql_port = ''
         self.index_port = ''
         self.fts_port = ''
@@ -89,6 +113,7 @@ class TestInputServer(object):
         self.es_password = ''
         self.upgraded = False
         self.collections_map = {}
+        self.cbbackupmgr = {}
 
     def __str__(self):
         #ip_str = "ip:{0}".format(self.ip)
@@ -123,7 +148,7 @@ class TestInputParser():
     def get_test_input(argv):
         #if file is given use parse_from_file
         #if its from command line
-        (opts, args) = getopt.getopt(argv[1:], 'ht:c:v:s:i:p:l:d:e:r:g:m', [])
+        (opts, args) = getopt.getopt(argv[1:], 'ht:c:v:s:i:p:l:d:e:r:g:m:a:s:k:o', [])
         #first let's loop over and find out if user has asked for help
         #if it has i
         params = {}
@@ -197,6 +222,8 @@ class TestInputParser():
         input.dashboard = []
         input.ui_conf = {}
         cbas = []
+        bkrs_client_ips = []
+        input.cbbackupmgr = {}
         for section in sections:
             result = re.search('^cluster', section)
             if section == 'servers':
@@ -223,6 +250,11 @@ class TestInputParser():
                 input.advisor = TestInputParser.get_advisor_config(config, section, global_properties)
             elif section == 'cbas':
                 input.cbas = TestInputParser.get_cbas_config(config, section)
+            elif section == 'bkrs_client':
+                input.bkrs_client = TestInputParser.get_bkrs_client_config(config, section,
+                                                 global_properties, input.membase_settings)
+            elif section == 'cbbackupmgr':
+                input.cbbackupmgr = TestInputParser.get_cbbackupmgr_config(config, section)
             elif result is not None:
                 cluster_list = TestInputParser.get_server_ips(config, section)
                 cluster_ips.extend(cluster_list)
@@ -255,6 +287,12 @@ class TestInputParser():
             moxis.append(TestInputParser.get_server(moxi_ip, config))
         input.moxis = TestInputParser.get_server_options(moxis, input.membase_settings, global_properties)
 
+        if 'cbbackupmgr' not in sections:
+            input.cbbackupmgr["name"] = "local_bkrs"
+
+        if 'bkrs_client' not in sections:
+            input.bkrs_client = None
+
         # Setting up 'clients' tag
         input.clients = client_ips
 
@@ -281,6 +319,8 @@ class TestInputParser():
                     server.data_path = global_properties['data_path']
                 if server.index_path == '' and 'index_path' in global_properties:
                     server.index_path = global_properties['index_path']
+                if server.cbas_path == '' and 'cbas_path' in global_properties:
+                    server.cbas_path = global_properties['cbas_path']
                 if server.services == '' and 'services' in global_properties:
                     server.services = global_properties['services']
                 if server.n1ql_port == '' and 'n1ql_port' in global_properties:
@@ -361,6 +401,13 @@ class TestInputParser():
         return server
 
     @staticmethod
+    def get_cbbackupmgr_config(config, section):
+        options = {}
+        for option in config.options(section):
+            options[option] = config.get(section, option)
+        return options
+
+    @staticmethod
     def get_advisor_config(config, section, global_properties):
         server = TestInputServer()
         options = config.options(section)
@@ -392,6 +439,34 @@ class TestInputParser():
         return server
 
     @staticmethod
+    def get_bkrs_client_config(config, section, global_properties,
+                                                     ui_settings):
+        server = TestInputServer()
+        options = config.options(section)
+        for option in options:
+            if option == 'ip':
+                server.ip = config.get(section, option)
+            if option == 'password':
+                server.ssh_password = config.get(section, option)
+            if option == 'port':
+                server.port = config.get(section, option)
+        if 'username' not in options:
+            server.ssh_username = global_properties['username']
+        if 'password' not in options:
+            server.ssh_password = global_properties['password']
+        if 'port' not in option:
+            server.port = global_properties['port']
+        if ui_settings is None:
+            try:
+                ui_settings = TestInputParser.get_membase_settings(config, "membase")
+            except Exception:
+                raise Exception("Ini file needs 'membase' section")
+        server.rest_username = ui_settings.rest_username
+        server.rest_password = ui_settings.rest_password
+        server.bkrs_client = True
+        return server
+
+    @staticmethod
     def get_collection_config(collection, config):
         collection_config = {}
         for section in config.sections():
@@ -410,6 +485,7 @@ class TestInputParser():
     def get_server(ip, config):
         server = TestInputServer()
         server.ip = ip
+        server.bkrs_client = False
         for section in config.sections():
             if section == ip:
                 options = config.options(section)

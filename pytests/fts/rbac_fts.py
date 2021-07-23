@@ -16,6 +16,7 @@ class RbacFTS(FTSBaseTest):
         self.master = self._cb_cluster.get_master_node()
         self.users = self.get_user_list()
         self.roles = self.get_user_role_list()
+        self.collection_test = TestInputSingleton.input.param("container_type", "") == "collection"
 
     def tearDown(self):
         self.delete_role()
@@ -48,7 +49,7 @@ class RbacFTS(FTSBaseTest):
         #Assign roles to users
         if not roles:
             roles = self.roles
-        RbacBase().add_user_role(roles, rest, 'builtin')
+        RbacBase().add_user_role(roles, rest, 'builtin', collection_rbac=self.collection_test)
         for user_role in roles:
             self.log.info("SUCCESS: Role(s) %s assigned to %s"
                           %(user_role['roles'], user_role['id']))
@@ -167,7 +168,7 @@ class RbacFTS(FTSBaseTest):
         self.load_sample_buckets(server=server, bucketName="travel-sample")
         index = FTSIndex(self._cb_cluster,
                          name="travel",
-                         source_name="travel-sample")
+                         source_name="travel-sample", scope="_default", collections=["_default"])
         rest = self.get_rest_handle_for_credentials("Administrator", "password")
         index.create(rest)
         self.wait_for_indexing_complete()
@@ -190,10 +191,22 @@ class RbacFTS(FTSBaseTest):
         else:
             self.log.info("Querying without credentials failed as expected!")
 
-    def create_index_with_credentials(self, username, password, index_name,
-                                      bucket_name="default"):
-        index = FTSIndex(self._cb_cluster, name=index_name,
-                         source_name=bucket_name)
+    def create_index_with_credentials(self, username, password, index_name, bucket_name="default", collection_index=False, _type=None, analyzer="standard", scope=None, collections=None):
+
+        index = FTSIndex(self._cb_cluster, name=index_name, source_name=bucket_name, scope=scope, collections=collections)
+        if collection_index:
+            if type(_type) is list:
+                for typ in _type:
+                    index.add_type_mapping_to_index_definition(type=typ, analyzer=analyzer)
+            else:
+                index.add_type_mapping_to_index_definition(type=_type, analyzer=analyzer)
+
+            doc_config = {}
+            doc_config['mode'] = 'scope.collection.type_field'
+            doc_config['type_field'] = "type"
+            index.index_definition['params']['doc_config'] = {}
+            index.index_definition['params']['doc_config'] = doc_config
+
         rest = self.get_rest_handle_for_credentials(username, password)
         index.create(rest)
         return index
@@ -276,12 +289,17 @@ class RbacFTS(FTSBaseTest):
         for user in self.users:
             for bucket in self._cb_cluster.get_buckets():
                 try:
-
+                    collection_index, type, index_scope, index_collections = self.define_index_parameters_collection_related()
                     index = self.create_index_with_credentials(
                         username= user['id'],
                         password=user['password'],
                         index_name="%s_%s_idx" %(user['id'], bucket.name),
-                        bucket_name=bucket.name)
+                        bucket_name=bucket.name,
+                        collection_index=collection_index,
+                        _type=type,
+                        scope=index_scope,
+                        collections=index_collections
+                    )
 
                     self.wait_for_indexing_complete()
                     alias = self.create_alias_with_credentials(
@@ -329,11 +347,17 @@ class RbacFTS(FTSBaseTest):
         self.show_user_permissions()
         for user in self.users:
             for bucket in self._cb_cluster.get_buckets():
+                collection_index, _type, index_scope, index_collections = self.define_index_parameters_collection_related()
                 index = self.create_index_with_credentials(
                     username= user['id'],
                     password=user['password'],
                     index_name="%s_%s_idx" %(user['id'], bucket.name),
-                    bucket_name=bucket.name)
+                    bucket_name=bucket.name,
+                    collection_index=collection_index,
+                    _type=_type,
+                    scope=index_scope,
+                    collections=index_collections
+                )
                 self.delete_role(user_ids=[user['id']])
                 # Temporary work around for deleting role now also deletes user
                 #  in RbacBase()
@@ -387,12 +411,17 @@ class RbacFTS(FTSBaseTest):
             for bucket in self._cb_cluster.get_buckets():
                 # creating an index
                 try:
-
+                    collection_index, _type, index_scope, index_collections = self.define_index_parameters_collection_related()
                     self.create_index_with_credentials(
                         username= user['id'],
                         password=user['password'],
                         index_name="%s_%s_idx" %(user['id'], bucket.name),
-                        bucket_name=bucket.name)
+                        bucket_name=bucket.name,
+                        collection_index=collection_index,
+                        _type=_type,
+                        scope=index_scope,
+                        collections=index_collections
+                    )
                 except Exception as e:
                     self.log.info("Expected exception: %s" %e)
                 else:
@@ -401,11 +430,17 @@ class RbacFTS(FTSBaseTest):
                 # creating an alias
                 try:
                     self.log.info("Creating index as administrator...")
+                    collection_index, _type, index_scope, index_collections = self.define_index_parameters_collection_related()
                     index = self.create_index_with_credentials(
                         username='Administrator',
                         password='password',
                         index_name="%s_%s_idx" % ('Admin', bucket.name),
-                        bucket_name=bucket.name)
+                        bucket_name=bucket.name,
+                        collection_index=collection_index,
+                        _type=_type,
+                        scope=index_scope,
+                        collections=index_collections
+                    )
                     self.wait_for_indexing_complete()
                     self.log.info("Creating alias as fts_searcher...")
                     self.create_alias_with_credentials(
@@ -414,7 +449,7 @@ class RbacFTS(FTSBaseTest):
                         target_indexes=[index],
                         alias_name="%s_%s_alias" % (user['id'], bucket.name))
                 except Exception as e:
-                    self.log.info("Expected exception: %s" %e)
+                    self.log.info(f"Expected exception: {e}")
                 else:
                     self.fail("An fts_searcher is able to create alias!")
 
@@ -472,18 +507,28 @@ class RbacFTS(FTSBaseTest):
         indexes = []
 
         # create indexes for those buckets for which the user is fts admin
+        collection_index, _type, index_scope, index_collections = self.define_index_parameters_collection_related()
         def_index = self.create_index_with_credentials(
             username='willSmith',
             password='password2',
             index_name='def_index',
-            bucket_name='default')
+            bucket_name='default',
+            collection_index=collection_index,
+            _type=_type,
+            scope=index_scope, collections=index_collections
+        )
         indexes.append(def_index)
 
         sasl_index = self.create_index_with_credentials(
             username='johnDoe',
             password='password1',
             index_name='sasl_index',
-            bucket_name='sasl_bucket_1')
+            bucket_name='sasl_bucket_1',
+            collection_index=collection_index,
+            _type=_type,
+            scope=index_scope,
+            collections=index_collections
+        )
         indexes.append(sasl_index)
 
         # Try creating composite alias using credentials of a user who is
@@ -535,12 +580,18 @@ class RbacFTS(FTSBaseTest):
         self.assign_role()
         self.show_user_permissions()
 
+        collection_index, _type, index_scope, index_collections = self.define_index_parameters_collection_related()
+
         # create indexes for those buckets for which the user is fts admin
         def_index = self.create_index_with_credentials(
             username='willSmith',
             password='password2',
             index_name='def_index',
-            bucket_name='default')
+            bucket_name='default',
+            collection_index=collection_index,
+            _type=_type,
+            scope=index_scope,
+            collections=index_collections)
         try:
             self.edit_index_different_source(index = def_index,
                                          new_source="sasl_bucket_1",
@@ -570,4 +621,64 @@ class RbacFTS(FTSBaseTest):
         except Exception as e:
             self.fail("User with permissions is unable to change the "
                       "index source bucket %s" %e)
+
+    def test_fts_searcher_permissions_multi_collection_index(self):
+        """
+        Tests if an 'fts_searcher' is able to create index, alias (negative test)
+        and if he can get an index count and is able to run a query on a
+        pre-existing index (positive case)
+        """
+        self.load_data()
+        self.create_users()
+        self.assign_role()
+
+        for user in self.users:
+            for bucket in self._cb_cluster.get_buckets():
+                collection_index, _type, index_scope, index_collections = self.define_index_parameters_collection_related()
+                index = self._cb_cluster.create_fts_index(
+                    name=f'{bucket.name}_index',
+                    source_name=bucket.name,
+                    collection_index=collection_index,
+                    _type=_type,
+                    scope=index_scope,
+                    collections=index_collections)
+                self.wait_for_indexing_complete()
+                try:
+                    self.query_index_with_credentials(
+                        index=index,
+                        username=user['id'],
+                        password=user['password'])
+                except Exception as e:
+                    self.log.error(f"Exception happened: {e}")
+                    self.fail(f"The user failed to query fts index {user['id']}")
+
+    def test_fts_searcher_permissions_multi_collection_index_negative(self):
+        """
+        Tests if an 'fts_searcher' is able to create index, alias (negative test)
+        and if he can get an index count and is able to run a query on a
+        pre-existing index (positive case)
+        """
+        self.load_data()
+        self.create_users()
+        self.assign_role()
+        self.show_user_permissions()
+
+        for user in self.users:
+            for bucket in self._cb_cluster.get_buckets():
+                collection_index, _type, index_scope, index_collections = self.define_index_parameters_collection_related()
+                index = self._cb_cluster.create_fts_index(
+                    name=f'{bucket.name}_index',
+                    source_name=bucket.name,
+                    collection_index=collection_index,
+                    _type=_type,
+                    scope=index_scope,
+                    collections=index_collections)
+                try:
+                    self.query_index_with_credentials(
+                        index=index,
+                        username=user['id'],
+                        password=user['password'])
+                    self.fail(f"The user successfully queried fts index {user['id']}")
+                except Exception as e:
+                    pass
 

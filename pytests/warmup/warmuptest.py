@@ -215,6 +215,8 @@ class WarmUpTests(BaseTestCase):
 
 
     def warmup_test(self):
+        rest = RestConnection(self.master)
+        rest.update_autofailover_settings(False, 120)
         self._additional_ops()
 
         # wait for draining of data before restart and warmup
@@ -231,7 +233,10 @@ class WarmUpTests(BaseTestCase):
             self._create_access_log()
 
         for bucket in self.buckets:
-            self._restart_memcache(bucket.name)
+            try:
+                self._restart_memcache(bucket.name)
+            except:
+                pass
 
         if self._warmup_check():
             generate_load = BlobGenerator('nosql', 'nosql-', self.value_size, end=self.num_items)

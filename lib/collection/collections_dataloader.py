@@ -16,60 +16,54 @@ class DockerManager(object):
             image = self.client.images.get("jsc:latest")
             image.tag("jsc", tag=self.tag)
             self.handle = self.client.containers.run("jsc:" + self.tag,
-                                                        environment=self.environment,
-                                                        detach=True)
-            for line in self.handle.logs(stream=True):
-                print(line.strip())
-            #self.client.remove_container(self.handle.id)
+                                                     environment=self.environment,
+                                                     detach=True)
+            self.stream_logs()
+            self.terminate()
         except ConnectionError as e:
-            print('Error connecting to docker service, please start/restart it:', e)    
-
-    def _list_containers(self):
-        images = []
-        for image in self.client.images.list():
-            images.append(image.id)
-        return images
-
-    def check_status(self):
-        pass
+            print('Error connecting to docker service, please start/restart it:', e)
 
     def stream_logs(self):
-        pass
+        for line in self.handle.logs(stream=True):
+            if b"Exception:" in line:
+                raise Exception("Exception occurred {}".format(line))
 
-    def terminate(self):
-        for container in self._list_images():
-            container.stop()
-
+def terminate(self, tag):
+        self.client.images.remove(tag)
+        self.client.containers.prune()
 class JavaSDKClient(object):
     def __init__(self, server, bucket, params):
         self.server = server
         self.bucket = bucket
         self.params = params
-
+        self.tag = self.server.ip + '_' + self.bucket
+        self.docker_instance = DockerManager(self.tag)
 
     def params_to_environment(self):
-        _environment = {}
-        _environment["CLUSTER"] = self.server.ip
-        # _environment["USERNAME"] = self.server.rest_username
-        # _environment["PASSWORD"] = self.server.rest_password
-        _environment["BUCKET"] = self.bucket
-        _environment["SCOPE"] = self.params.scope
-        _environment["COLLECTION"] = self.params.collection
-        _environment["N"] = self.params.num_ops
-        _environment["PC"] = self.params.percent_create
-        _environment["PU"] = self.params.percent_update
-        _environment["PD"] = self.params.percent_delete
-        _environment["L"] = self.params.load_pattern
-        _environment["DSN"] = self.params.start_seq_num
-        _environment["DPX"] = self.params.key_prefix
-        _environment["DSX"] = self.params.key_suffix
-        _environment["DT"] = self.params.json_template
-        _environment["O"] = self.params.print_sdk_logs
-
+        _environment = {
+                        "CLUSTER": self.server.ip,
+                        "USERNAME": self.params.username,
+                        "PASSWORD": self.params.password,
+                        "BUCKET": self.bucket,
+                        "SCOPE": self.params.scope,
+                        "COLLECTION": self.params.collection,
+                        "N": self.params.num_ops,
+                        "PC": self.params.percent_create,
+                        "PU": self.params.percent_update,
+                        "PD": self.params.percent_delete,
+                        "L": self.params.load_pattern,
+                        "DSN": self.params.start_seq_num,
+                        "DPX": self.params.key_prefix,
+                        "DSX": self.params.key_suffix,
+                        "DT": self.params.json_template,
+                        "O": self.params.print_sdk_logs
+                        }
         return _environment
 
     def do_ops(self):
         # 1 docker image per bucket, identified by server_bucket tag
-        self.docker_instance = DockerManager(self.server.ip + '_' + self.bucket)
         env = self.params_to_environment()
         self.docker_instance.start(env)
+
+    def cleanup(self):
+        self.docker_instance.terminate("jsc" + ':' + self.tag)

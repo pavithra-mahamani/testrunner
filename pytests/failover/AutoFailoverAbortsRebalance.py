@@ -24,15 +24,11 @@ class AutoFailoverAbortsRebalance(AutoFailoverBaseTest, BaseTestCase):
         self.master = self.servers[0]
         self._get_params()
         self.rest = RestConnection(self.orchestrator)
-        self.task_manager = TaskManager("Autofailover_thread")
-        self.task_manager.start()
-        self.node_failure_task_manager = TaskManager("Nodes_failure_detector_thread")
-        self.node_failure_task_manager.start()
         node_ram_ratio = BucketOperationHelper.base_bucket_ratio(self.servers)
         self.num_buckets = self.num_buckets - 1  # this is done as default is created by base class
         if self.num_buckets:
             BucketOperationHelper.create_multiple_buckets(self.master, self.num_replicas, node_ram_ratio * (2.0 / 3.0),
-                                                          howmany=self.num_buckets)
+                                                          howmany=self.num_buckets, bucket_storage=self.bucket_storage)
         self.buckets = self.rest.get_buckets()
         for bucket in self.buckets:
             ready = BucketOperationHelper.wait_for_memcached(self.master, bucket.name)
@@ -59,6 +55,12 @@ class AutoFailoverAbortsRebalance(AutoFailoverBaseTest, BaseTestCase):
 
     def tearDown(self):
         super(AutoFailoverAbortsRebalance, self).tearDown()
+
+    def suite_tearDown(self):
+        pass
+
+    def suite_setUp(self):
+        pass
 
     def test_failure_scenarios_during_rebalance_in_of_node_A(self):
         # enable auto failover and canAbortRebalance

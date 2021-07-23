@@ -188,11 +188,14 @@ class EventingLifeCycle(EventingBaseTest):
         # do some mutations
         self.load(self.gens_load, buckets=self.src_bucket, flag=self.item_flag, verify_data=False,
                   batch_size=self.batch_size)
+        eventing_ip = self.get_nodes_from_services_map(service_type="eventing")
         # get debugger url
-        pattern = re.compile(r'chrome-devtools://devtools/bundled/js_app.html(.*)')
+        pattern = re.compile(eventing_ip.ip+':9140(.*)')
         while count < 10:
             out2 = self.rest.get_eventing_debugger_url(self.function_name)
-            matched = re.match(pattern, out2)
+            self.log.info("url generated {}".format(out2))
+            url=json.loads(out2)
+            matched = re.match(pattern, url["websocket"])
             if matched:
                 log.info("Got debugger url : {0}{1}".format(matched.group(0), matched.group(1)))
                 match = True
@@ -225,11 +228,13 @@ class EventingLifeCycle(EventingBaseTest):
         # do some mutations
         self.load(self.gens_load, buckets=self.src_bucket, flag=self.item_flag, verify_data=False,
                   batch_size=self.batch_size)
+        eventing_ip = self.get_nodes_from_services_map(service_type="eventing")
         # get debugger url
-        pattern = re.compile(r'chrome-devtools://devtools/bundled/js_app.html(.*)')
+        pattern = re.compile(eventing_ip.ip + ':9140(.*)')
         while count < 10:
             out2 = self.rest.get_eventing_debugger_url(self.function_name)
-            matched = re.match(pattern, out2)
+            url = json.loads(out2)
+            matched = re.match(pattern, url["websocket"])
             if matched:
                 log.info("Got debugger url : {0}{1}".format(matched.group(0), matched.group(1)))
                 match = True
@@ -283,10 +288,13 @@ class EventingLifeCycle(EventingBaseTest):
         self.load(self.gens_load, buckets=self.src_bucket, flag=self.item_flag, verify_data=False,
                   batch_size=self.batch_size)
         # get debugger url
-        pattern = re.compile(r'chrome-devtools://devtools/bundled/js_app.html(.*)')
+        eventing_ip = self.get_nodes_from_services_map(service_type="eventing")
+        # get debugger url
+        pattern = re.compile(eventing_ip.ip + ':9140(.*)')
         while count < 10:
             out2 = self.rest.get_eventing_debugger_url(self.function_name)
-            matched = re.match(pattern, out2)
+            url = json.loads(out2)
+            matched = re.match(pattern, url["websocket"])
             if matched:
                 log.info("Got debugger url : {0}{1}".format(matched.group(0), matched.group(1)))
                 match = True
@@ -332,11 +340,13 @@ class EventingLifeCycle(EventingBaseTest):
         # do some mutations
         self.load(self.gens_load, buckets=self.src_bucket, flag=self.item_flag, verify_data=False,
                   batch_size=self.batch_size)
+        eventing_ip = self.get_nodes_from_services_map(service_type="eventing")
         # get debugger url
-        pattern = re.compile(r'chrome-devtools://devtools/bundled/js_app.html(.*)')
+        pattern = re.compile(eventing_ip.ip + ':9140(.*)')
         while count < 10:
             out2 = self.rest.get_eventing_debugger_url(self.function_name)
-            matched = re.match(pattern, out2)
+            url = json.loads(out2)
+            matched = re.match(pattern, url["websocket"])
             if matched:
                 log.info("Got debugger url : {0}{1}".format(matched.group(0), matched.group(1)))
                 match = True
@@ -358,6 +368,7 @@ class EventingLifeCycle(EventingBaseTest):
         body['depcfg']['curl'].append(
             {"hostname": self.hostname, "value": "server", "auth_type": self.auth_type, "username": self.curl_username,
              "password": self.curl_password, "cookies": self.cookies})
+        self.rest.create_function(body['appname'], body)
         self.deploy_function(body)
         #enable debugger
         self.rest.enable_eventing_debugger()
@@ -367,11 +378,13 @@ class EventingLifeCycle(EventingBaseTest):
         # do some mutations
         self.load(self.gens_load, buckets=self.src_bucket, flag=self.item_flag, verify_data=False,
                   batch_size=self.batch_size)
+        eventing_ip = self.get_nodes_from_services_map(service_type="eventing")
         # get debugger url
-        pattern = re.compile(r'chrome-devtools://devtools/bundled/js_app.html(.*)')
+        pattern = re.compile(eventing_ip.ip + ':9140(.*)')
         while count < 10:
             out2 = self.rest.get_eventing_debugger_url(self.function_name)
-            matched = re.match(pattern, out2)
+            url = json.loads(out2)
+            matched = re.match(pattern, url["websocket"])
             if matched:
                 log.info("Got debugger url : {0}{1}".format(matched.group(0), matched.group(1)))
                 match = True
@@ -393,6 +406,7 @@ class EventingLifeCycle(EventingBaseTest):
         body['depcfg']['curl'].append(
             {"hostname": self.hostname, "value": "server", "auth_type": self.auth_type, "username": self.curl_username,
              "password": self.curl_password, "cookies": self.cookies})
+        self.rest.create_function(body['appname'],body)
         self.deploy_function(body)
         # export the function that we have created
         output = self.rest.export_function(self.function_name)
@@ -406,3 +420,96 @@ class EventingLifeCycle(EventingBaseTest):
         self.assertTrue(output['depcfg']['curl'][0]['password'] == "", msg="password is not empty")
         self.assertTrue(output['depcfg']['curl'][0]['username'] == "", msg="username is not empty")
         self.undeploy_and_delete_function(body)
+
+    def test_eventing_debugger_ABO(self):
+        count = 0
+        match = False
+        body = self.create_save_function_body(self.function_name, "handler_code/ABO/insert.js")
+        self.deploy_function(body)
+        #enable debugger
+        self.rest.enable_eventing_debugger()
+        # Start eventing debugger
+        out1 = self.rest.start_eventing_debugger(self.function_name)
+        log.info(" Started eventing debugger : {0}".format(out1))
+        # do some mutations
+        self.load(self.gens_load, buckets=self.src_bucket, flag=self.item_flag, verify_data=False,
+                  batch_size=self.batch_size)
+        # get debugger url
+        eventing_ip = self.get_nodes_from_services_map(service_type="eventing")
+        # get debugger url
+        pattern = re.compile(eventing_ip.ip + ':9140(.*)')
+        while count < 10:
+            out2 = self.rest.get_eventing_debugger_url(self.function_name)
+            url = json.loads(out2)
+            matched = re.match(pattern, url["websocket"])
+            if matched:
+                log.info("Got debugger url : {0}{1}".format(matched.group(0), matched.group(1)))
+                match = True
+                break
+            count += 1
+            self.sleep(30)
+        if not match:
+            self.fail("Debugger url was not generated even after waiting for 300 secs...    ")
+        # stop debugger
+        self.rest.stop_eventing_debugger(self.function_name)
+        # undeploy and delete the function
+        self.undeploy_and_delete_function(body)
+
+    # MB-42177
+    def test_single_function_filter(self):
+        body = self.create_save_function_body(self.function_name, HANDLER_CODE.BUCKET_OPS_ON_UPDATE, worker_count=3)
+        function_details = self.rest.get_function_details(body['appname'])
+        body1 = json.loads(function_details)
+        assert body1['appname'] == self.function_name, True
+
+    # MB-40502
+    def same_api_call_multiple_times(self):
+        try:
+            body = self.create_save_function_body(self.function_name, HANDLER_CODE.BUCKET_OPS_ON_UPDATE, worker_count=3)
+            self.deploy_function(body)
+            self.deploy_function(body)
+        except Exception as e:
+            self.log.info(e)
+            assert "ERR_APP_ALREADY_DEPLOYED" in str(e), True
+        finally:
+            self.undeploy_and_delete_function(body)
+
+    # MB-40423
+    def test_error_deploy_after_pause(self):
+        try:
+            body = self.create_save_function_body(self.function_name, HANDLER_CODE.BUCKET_OPS_ON_UPDATE, worker_count=3)
+            self.deploy_function(body)
+            self.pause_function(body)
+            self.deploy_function(body)
+        except Exception as e:
+            self.log.info(e)
+            assert "ERR_APP_NOT_UNDEPLOYED" in str(e), True
+        finally:
+            self.undeploy_and_delete_function(body)
+
+    def test_update_appcode_when_handler_is_paused(self):
+        bucket_params = self._create_bucket_params(server=self.server, size=self.bucket_size,
+                                                   replicas=self.num_replicas)
+        self.cluster.create_standard_bucket(name=self.dst_bucket_name1, port=STANDARD_BUCKET_PORT + 1,
+                                            bucket_params=bucket_params)
+        self.load(self.gens_load, buckets=self.src_bucket, flag=self.item_flag, verify_data=False,
+                  batch_size=self.batch_size)
+        body = self.create_save_function_body(self.function_name, "handler_code/appcode_before_update.js")
+        body1 = self.create_save_function_body(self.function_name + "1", "handler_code/appcode_after_update.js")
+        body['depcfg']['buckets'].append(
+            {"alias": self.dst_bucket_name1, "bucket_name": self.dst_bucket_name1, "access": "rw"})
+        self.rest.create_function(body['appname'], body)
+        self.deploy_function(body)
+        self.verify_eventing_results(self.function_name, self.docs_per_day * 2016)
+        self.pause_function(body)
+        self.rest.update_function_appcode(body1['appcode'], self.function_name)
+        self.load(self.gens_load, buckets=self.src_bucket, flag=self.item_flag, verify_data=False,
+                  batch_size=self.batch_size)
+        self.resume_function(body)
+        self.verify_eventing_results(self.function_name, self.docs_per_day * 2016, skip_stats_validation=True, bucket=self.dst_bucket_name1)
+        self.load(self.gens_load, buckets=self.src_bucket, flag=self.item_flag, verify_data=False,
+                          batch_size=self.batch_size, op_type='delete')
+        self.verify_eventing_results(self.function_name, 0, skip_stats_validation=True, bucket=self.dst_bucket_name1)
+        self.verify_eventing_results(self.function_name, self.docs_per_day * 2016)
+        self.undeploy_and_delete_function(body)
+        self.delete_function(body1)

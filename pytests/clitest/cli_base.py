@@ -6,6 +6,9 @@ import logger
 from basetestcase import BaseTestCase
 from membase.api.rest_client import RestConnection
 from remote.remote_util import RemoteMachineShellConnection
+from collection.collections_cli_client import CollectionsCLI
+from collection.collections_rest_client import CollectionsRest
+from collection.collections_stats import CollectionsStats
 from testconstants import LINUX_COUCHBASE_SAMPLE_PATH, \
     WIN_COUCHBASE_SAMPLE_PATH_C, \
     WIN_BACKUP_C_PATH, LINUX_BACKUP_PATH, LINUX_COUCHBASE_LOGS_PATH, \
@@ -44,6 +47,9 @@ class CliBaseTest(BaseTestCase):
         self.shell = RemoteMachineShellConnection(self.master)
         if not self.skip_init_check_cbserver:
             self.rest = RestConnection(self.master)
+            self.rest_col = CollectionsRest(self.master)
+            self.cli_col = CollectionsCLI(self.master)
+            self.stat_col = CollectionsStats(self.master)
             self.cb_version = self.rest.get_nodes_version()
             """ cli output message """
             self.cli_bucket_create_msg = "SUCCESS: Bucket created"
@@ -79,6 +85,54 @@ class CliBaseTest(BaseTestCase):
         self.field_substitutions = self.input.param("field-substitutions", None)
         self.check_preload_keys = self.input.param("check-preload-keys", True)
         self.debug_logs = self.input.param("debug-logs", False)
+
+        self.use_rest = self.input.param("use_rest", True)
+        self.use_cli = self.input.param("use_cli", False)
+        self.custom_scopes = self.input.param("custom_scopes", False)
+        self.custom_collections = self.input.param("custom_collections", False)
+        self.map_data_collection = self.input.param("map_data_collection", False)
+        self.col_per_scope = self.input.param("col_per_scope", 1)
+        self.load_to_collection = self.input.param("load_to_collection", False)
+        self.collection_string = self.input.param("collection_string", None)
+        self.non_ascii_name = self.input.param("non_ascii_name", None)
+        self.create_scopes = self.input.param("create_scopes", True)
+        self.create_collections = self.input.param("create_collections", True)
+        self.relative_path = self.input.param("relative_path", False)
+        self.buckets_only = self.input.param("buckets_only", False)
+        self.scopes_only = self.input.param("scopes_only", False)
+        self.collections_only = self.input.param("collections_only", False)
+        self.drop_scopes = self.input.param("drop_scopes", False)
+        self.drop_sc_default = self.input.param("drop_sc_default", False)
+        self.drop_collections = self.input.param("drop_collections", False)
+        self.check_scopes = self.input.param("check_scopes", False)
+        self.check_scopes_details = self.input.param("check_scopes_details", False)
+        self.check_collections = self.input.param("check_collections", False)
+        self.check_collections_details = self.input.param("check_collections_details", False)
+        self.check_collection_enable = self.input.param("check_collection_enable", True)
+        self.json_output = self.input.param("json_output", False)
+        self.load_json_format = self.input.param("load_json_format", False)
+        self.load_to_scopes = self.input.param("load_to_scopes", False)
+        self.load_to_collections = self.input.param("load_to_collections", False)
+        self.load_to_default_scopes = self.input.param("load_to_scopes", False)
+        self.cbwg_no_value_in_col_flag = self.input.param("cbwg_no_value_in_col_flag", False)
+        self.cbwg_invalid_value_in_col_flag = self.input.param("cbwg_invalid_value_in_col_flag", False)
+        self.load_to_default_collections = self.input.param("load_to_collections", False)
+        self.create_existing_scope = self.input.param("create_existing_scope", False)
+        self.create_existing_collection = self.input.param("create_existing_collection", False)
+        self.block_char = self.input.param("block_char", "")
+        self.drop_default_scope = self.input.param("drop_default_scope", False)
+        self.drop_default_collection = self.input.param("drop_default_collection", False)
+        self.log_filename = self.input.param("filename", "loginfo_collecion")
+        self.node_down = self.input.param("node_down", False)
+        self.enable_ipv6 = self.input.param('enable_ipv6', False)
+
+
+
+
+        self.scopes = None
+        self.collections = None
+        self.load_scope_id = None
+
         self.should_fail = self.input.param("should-fail", False)
         info = self.shell.extract_remote_info()
         self.os_version = info.distribution_version.lower()
@@ -147,7 +201,8 @@ class CliBaseTest(BaseTestCase):
             self.base_cb_path = WIN_CB_PATH
         if info.distribution_type.lower() == 'mac':
             self.os = 'mac'
-        self.full_v, self.short_v, self.build_number = self.shell.get_cbversion(type)
+        shell = RemoteMachineShellConnection(self.master)
+        self.full_v, self.short_v, self.build_number = shell.get_cbversion(type)
         self.couchbase_usrname = "%s" % (self.input.membase_settings.rest_username)
         self.couchbase_password = "%s" % (self.input.membase_settings.rest_password)
         self.cb_login_info = "%s:%s" % (self.couchbase_usrname,
@@ -167,13 +222,23 @@ class CliBaseTest(BaseTestCase):
             if len(self.servers) > 1 and int(self.nodes_init) == 1 and self.start_with_cluster:
                 servers_in = [self.servers[i + 1] for i in range(self.num_servers - 1)]
                 self.cluster.rebalance(self.servers[:1], servers_in, [])
+        """ Remove these code when bug MB-45741 and MB-45061 are fixed
+            Master node is not available more than 2 minutes after rebalance """
+        if self.os == "windows":
+            status = self.rest.update_autofailover_settings(False, 120)
+            if not status:
+                self.sleep(15)
+                shell.execute_command("wget --user=Administrator --password=password --post-data='rpc:call(mb_master:master_node(), erlang, apply ,[fun () -> erlang:exit(erlang:whereis(mb_master), kill) end, []]).' http://localhost:8091/diag/eval'''")
+            """ ****************** """
         for bucket in self.buckets:
             testuser = [{'id': bucket.name, 'name': bucket.name, 'password': 'password'}]
             rolelist = [{'id': bucket.name, 'name': bucket.name, 'roles': 'admin'}]
             self.add_built_in_server_user(testuser=testuser, rolelist=rolelist)
+        shell.disconnect()
 
 
     def tearDown(self):
+        self.shell = RemoteMachineShellConnection(self.master)
         if not self.input.param("skip_cleanup", True):
             if self.times_teardown_called > 1 :
                 self.shell.disconnect()
@@ -224,20 +289,20 @@ class CliBaseTest(BaseTestCase):
         """
         if expect_error:
             for line in output:
-                if line == "ERROR: " + message:
+                if "ERROR" in line and message in line:
                     return True
             log.info("Did not receive expected error message `ERROR: %s`", message)
             return False
         else:
             for line in output:
-                if line == "SUCCESS: " + message:
+                if "SUCCESS" in line and message in line:
                     return True
             log.info("Did not receive expected success message `SUCCESS: %s`", message)
             return False
 
     def verifyWarningOutput(self, output, message):
         for line in output:
-            if line == "WARNING: " + message:
+            if "WARNING" in line and message in line:
                 return True
         log.info("Did not receive expected error message `WARNING: %s`", message)
         return False
@@ -961,3 +1026,206 @@ class CliBaseTest(BaseTestCase):
                 return True
         log.info("Waiting for item count to be %d timed out", count)
         return False
+
+    def create_scope(self, num_scope=2, rest=None, cli=None):
+        bucket_name = self.buckets[0].name
+        if rest:
+            rest_client = rest
+        else:
+            rest_client = self.rest_col
+        if cli:
+            cli_client = cli
+        else:
+            cli_client = self.cli_col
+        for x in range(num_scope):
+            scope_name = "scope{0}".format(x)
+            if self.non_ascii_name:
+                scope_name = self.non_ascii_name + str(x)
+            if self.use_rest:
+                rest_client.create_scope(bucket=bucket_name, scope=scope_name,
+                                              params=None)
+            else:
+                cli_client.create_scope(bucket=bucket_name, scope=scope_name)
+
+    def delete_scope(self, num_scope=2):
+        bucket_name = self.buckets[0].name
+        for x in range(num_scope):
+            scope_name = "scope{0}".format(x)
+            if self.non_ascii_name:
+                scope_name = self.non_ascii_name + str(x)
+            if self.use_rest:
+                self.rest_col.delete_scope(bucket_name, scope_name)
+            else:
+                self.cli_col.delete_scope(scope_name, bucket=bucket_name)
+
+    def create_collection(self, num_collection=1, rest=None, cli=None):
+        bucket_name = self.buckets[0].name
+        if rest:
+            rest_client = rest
+        else:
+            rest_client = self.rest_col
+        if cli:
+            cli_client = cli
+        else:
+            cli_client = self.cli_col
+
+        scopes = self.get_bucket_scope(rest_client, cli_client)
+        if scopes[0][:4] == "\x1b[6n":
+            scopes[0] = scopes[0][4:]
+        if scopes:
+            for x in range(num_collection):
+                for scope in scopes:
+                    if bucket_name in scope:
+                        continue
+                    if self.use_rest:
+                        rest_client.create_collection(bucket=bucket_name, scope=scope,
+                                                   collection="mycollection_{0}_{1}".format(scope, x))
+                    else:
+                        cli_client.create_collection(bucket=bucket_name, scope=scope,
+                                                   collection="mycollection_{0}_{1}".format(scope, x))
+        self.sleep(10, "time needs for stats up completely")
+
+    def delete_collection(self, num_collection=1):
+        bucket_name = self.buckets[0].name
+        for x in range(num_collection):
+            if self.use_rest:
+                self.rest_col.delete_collection(bucket=bucket_name, scope="_{0}".format(bucket_name),
+                                                   collection="_{0}".format(bucket_name))
+            else:
+                self.cli_col.delete_collection(bucket=bucket_name, scope="_{0}".format(bucket_name),
+                                                  collection="_{0}".format(bucket_name))
+
+    def create_scope_collection(self, num_scope_collection=2):
+        bucket_name = self.buckets[0].name
+        for x in range(num_collection):
+            scope_name = "scope{0}".format(x)
+            if self.non_ascii_name:
+                scope_name = self.non_ascii_name + str(x)
+            if self.use_rest:
+                self.rest_col.create_scope_collection(bucket_name, scope_name,
+                                                     "mycollection{0}".format(x))
+            else:
+                self.cli_col.create_scope_collection(bucket_name, scope_name,
+                                                    "mycollection{0}".format(x))
+
+    def get_bucket_scope(self, rest=None, cli=None):
+        bucket_name = self.buckets[0].name
+        if rest:
+            rest_client = rest
+        else:
+            rest_client = self.rest_col
+        if cli:
+            cli_client = cli
+        else:
+            cli_client = self.cli_col
+        if self.use_rest:
+            scopes = rest_client.get_bucket_scopes(bucket_name)
+        else:
+            scopes = cli_client.get_bucket_scopes(bucket_name)[0]
+        return scopes
+
+    def get_bucket_scope_ex(self):
+        bucket_name = self.buckets[0].name
+        scopes = None
+        if self.use_rest:
+            scopes = self.rest_rs.get_bucket_scopes(bucket_name)
+        else:
+            scopes = self.cli_rs.get_bucket_scopes(bucket_name)
+        return scopes
+
+    def get_bucket_collection(self,):
+        bucket_name = self.buckets[0].name
+        collections = None
+        if self.use_rest:
+            collections = self.rest_col.get_bucket_collections(bucket_name)
+        else:
+            collections = self.cli_col.get_bucket_collections(bucket_name)
+        return collections
+
+    def get_collection_stats(self, buckets=None, cluster=None):
+        """ return output, error """
+        col_stats = []
+        if buckets:
+            bucket = buckets[0]
+        else:
+            bucket = self.buckets[0]
+        if cluster is None:
+            return self.stat_col.get_collection_stats(bucket)
+        elif cluster:
+            for node in cluster:
+                stat_col = CollectionsStats(node)
+                node_stats = stat_col.get_collection_stats(bucket)
+                if isinstance(node_stats, tuple):
+                    node_stats = node_stats[0]
+                col_stats.append(node_stats)
+            return col_stats
+
+    def get_collection_names(self):
+        shell = RemoteMachineShellConnection(self.master)
+        #collections, error = self.get_collection_stats()
+        bucket = self.buckets[0]
+        output, error = shell.execute_cbstats(bucket, "collections",
+                                                   cbadmin_user="Administrator",
+                                                   options=" | grep ':name'")
+        shell.disconnect()
+        collection_names = []
+        if output:
+            for x in output:
+                if "_default" in x:
+                    continue
+                collection_names.append(x.split(":name:")[1].strip())
+        return collection_names, error
+
+    def get_scopes_id(self, scope):
+        bucket = self.buckets[0]
+        return self.stat_col.get_scope_id(bucket, scope)
+
+    def get_collections_id(self, scope, collection):
+        bucket = self.buckets[0]
+        return self.stat_col.get_collection_id(bucket, scope, collection)
+
+    def load_all_buckets(self, cluster=None, item_size=125, ratio=0.9, command_options=""):
+        return self.__load_all_buckets(cluster, item_size, ratio, command_options)
+
+    def __load_all_buckets(self, cluster=None, item_size=125, ratio=0.9, command_options=""):
+        if not cluster:
+            cluster = self.master
+        shell = RemoteMachineShellConnection(cluster)
+        for bucket in self.buckets:
+            shell.execute_cbworkloadgen(cluster.rest_username,
+                                        cluster.rest_password,
+                                        self.num_items,
+                                        ratio,
+                                        bucket.name,
+                                        item_size,
+                                        command_options)
+
+    def _check_output(self, word_check, output):
+        found = False
+        if len(output) >= 1:
+            if isinstance(word_check, list):
+                for ele in word_check:
+                    for x in output:
+                        if ele.lower() in x.lower():
+                            self.log.info("Found '{0} in CLI output".format(ele))
+                            found = True
+                            break
+            elif isinstance(word_check, str):
+                for x in output:
+                    if word_check.lower() in x.lower():
+                        self.log.info("Found '{0}' in CLI output".format(word_check))
+                        found = True
+                        break
+            else:
+                self.log.error("invalid {0}".format(word_check))
+        return found
+
+    def _extract_collection_names(self, collections):
+        if collections and collections[0]:
+            collections = collections[0]
+            collections = collections[1::2]
+            collections = [x.replace("-", "") for x in collections]
+            collections = [x.strip() for x in collections]
+            return collections
+        else:
+            self.fail("Need to pass collection list")

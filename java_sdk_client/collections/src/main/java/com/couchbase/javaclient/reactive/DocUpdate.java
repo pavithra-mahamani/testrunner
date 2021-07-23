@@ -1,60 +1,75 @@
 package com.couchbase.javaclient.reactive;
 
-import static com.couchbase.client.java.kv.ReplaceOptions.replaceOptions;
-import static com.couchbase.client.java.kv.InsertOptions.insertOptions;
+import static com.couchbase.client.java.kv.UpsertOptions.upsertOptions;
 
+import java.io.File;
 import java.time.Duration;
-import java.util.ArrayList;
-import java.util.Arrays;
-import java.util.Collections;
 import java.util.List;
+import java.util.ArrayList;
 import java.util.concurrent.Callable;
+import java.util.HashMap;
+import java.util.Map;
 
-import com.couchbase.client.core.error.CasMismatchException;
 import com.couchbase.client.java.Bucket;
 import com.couchbase.client.java.Collection;
 import com.couchbase.client.java.ReactiveCollection;
+import com.couchbase.client.java.codec.RawBinaryTranscoder;
 import com.couchbase.client.java.json.JsonObject;
-import com.couchbase.client.java.kv.GetResult;
-import com.couchbase.client.java.kv.MutateInSpec;
 import com.couchbase.client.java.kv.MutationResult;
 import com.couchbase.client.java.manager.collection.CollectionSpec;
 import com.couchbase.client.java.manager.collection.ScopeSpec;
-import com.couchbase.javaclient.doc.DocSpec;
-import com.couchbase.javaclient.doc.Person;
+import com.couchbase.javaclient.doc.*;
+import com.couchbase.javaclient.utils.FileUtils;
 
+import reactor.util.Logger;
+import reactor.util.Loggers;
+import java.util.logging.Level;
 import reactor.core.publisher.Flux;
 import reactor.core.scheduler.Schedulers;
 
 public class DocUpdate implements Callable<String> {
-	private DocSpec ds;
-	private Bucket bucket;
-	private Collection collection;
+
+	private final static Logger log = Loggers.getLogger(DocUpdate.class);
+
+	private static DocSpec ds;
+	private static Bucket bucket;
+	private static Collection collection;
+	private static int nThreads; 
 	private static int num_docs = 0;
 	private boolean done = false;
+	private Map<String, String> elasticMap = new HashMap<>();
 
-	public DocUpdate(DocSpec _ds, Bucket _bucket) {
+	public DocUpdate(DocSpec _ds, Bucket _bucket, int _nThreads) {
 		ds = _ds;
 		bucket = _bucket;
+		nThreads = _nThreads;
 	}
 
-	public DocUpdate(DocSpec _ds, Collection _collection) {
+	public DocUpdate(DocSpec _ds, Collection _collection, int _nThreads) {
 		ds = _ds;
 		collection = _collection;
+		nThreads = _nThreads;
 	}
 
 	@Override
 	public String call() throws Exception {
 		if (collection != null) {
-			updateCollection(ds, collection);
+			log.info("Update collection " + collection.bucketName() + "." + collection.scopeName() + "." + collection.name());
+			updateCollection(collection);
 		} else {
-			updateBucketCollections(ds, bucket);
+			log.info("Update bucket collections");
+			updateBucketCollections();
+		}
+		// upsert to elastic
+		if (ds.isElasticSync() && !elasticMap.isEmpty()) {
+			final List<File> elasticFiles = FileUtils.writeForElastic(elasticMap, ds.get_template(), "update");
+			ElasticSync.syncFiles(ds.getElasticIP(), ds.getElasticPort(), ds.getElasticLogin(), ds.getElasticPassword(), elasticFiles, 5);
 		}
 		done = true;
 		return num_docs + " DOCS UPDATED!";
 	}
 
-	public static void updateBucketCollections(DocSpec ds, Bucket bucket) {
+	public void updateBucketCollections() {
 		List<Collection> bucketCollections = new ArrayList<>();
 		List<ScopeSpec> bucketScopes = bucket.collections().getAllScopes();
 		for (ScopeSpec scope : bucketScopes) {
@@ -65,57 +80,60 @@ public class DocUpdate implements Callable<String> {
 				}
 			}
 		}
-		bucketCollections.parallelStream().forEach(c -> updateCollection(ds, c));
+		bucketCollections.parallelStream().forEach(c -> update(c));
 	}
 
-	public static void updateCollection(DocSpec ds, Collection collection) {
+	public void updateCollection(Collection collection) {
+		update(collection);
+	}
+
+	public void update(Collection collection) {
 		ReactiveCollection rcollection = collection.reactive();
 		num_docs = (int) (ds.get_num_ops() * ((float) ds.get_percent_update() / 100));
 		Flux<String> docsToUpdate = Flux.range(ds.get_startSeqNum(), num_docs)
 				.map(id -> ds.get_prefix() + id + ds.get_suffix());
-
-		docsToUpdate.buffer(100).subscribe(keys -> updateBatch(collection, keys));
-
-	}
-
-	public static void updateBatch(Collection collection, List<String> keys) {
-//		Flux<String> batchKeys = Flux.fromIterable(keys);
-//		List<MutateInSpec> addressSpec = new ArrayList<MutateInSpec>();
-//		addressSpec.add("streetAdress");
-//		
-//		
-//		batchKeys.publishOn(Schedulers.parallel()).flatMap(key -> 
-//		rcollection.mutateIn(key, addressSpec))
-//				// Num retries, first backoff, max backoff
-//				.retryBackoff(10, Duration.ofMillis(10), Duration.ofMillis(100))
-//				// Block until last value, complete or timeout expiry
-//				.blockLast(Duration.ofMinutes(10));
-		
-		keys.forEach(key -> replace(collection, key));
-
-	}
-
-	public boolean isDone() {
-		return done;
-	}
-
-	public static void replace(Collection collection, String key) {
-		try {
-			GetResult found = collection.get(key);
-			JsonObject content = found.contentAsObject();
-			content.put("modified", true).put("initial", false);
-			for (int attempt = 0; attempt < 10; attempt++) {
-				try {
-					if (found != null) {
-						collection.replace(key, content, replaceOptions().cas(found.cas()));
-					}
-					break; // if successful, break out of the retry loop
-				} catch (CasMismatchException ex) {
-					// don't do anything, we'll retry the loop
-				}
-			}
-		} catch (Exception e) {
-
+		if(ds.get_shuffle_docs()){
+			List<String> docs = docsToUpdate.collectList().block();
+			java.util.Collections.shuffle(docs);
+			docsToUpdate = Flux.fromIterable(docs);
 		}
+		List<MutationResult> results;	
+		try {
+			if ("Binary".equals(ds.get_template())) {
+				results = docsToUpdate.publishOn(Schedulers
+						// Num threads, items in queue, thread name prefix
+						.newBoundedElastic(nThreads, 100, "catapult-update"))
+						.flatMap(
+								key -> rcollection.upsert(key, new Binary().createBinaryObject(ds.faker, ds.get_size()),
+										upsertOptions().transcoder(RawBinaryTranscoder.INSTANCE)
+												.expiry(Duration.ofSeconds(ds.get_expiry()))))
+						.log("", ds.getNewLogLevel())
+						.buffer(1000)
+						.retry(20)
+						.blockLast(Duration.ofMinutes(10));
+			} else {
+				DocTemplate docTemplate = DocTemplateFactory.getDocTemplate(ds);
+				results = docsToUpdate.publishOn(Schedulers
+						.newBoundedElastic(nThreads, 100, "catapult-update"))
+						.flatMap(key -> rcollection.upsert(key, getObject(key, docTemplate, elasticMap, collection),
+								upsertOptions().expiry(Duration.ofSeconds(ds.get_expiry()))))
+						.log("", ds.getNewLogLevel())
+						.buffer(1000)
+						// Num retries
+						.retry(20)
+						// Block until last value, complete or timeout expiry
+						.blockLast(Duration.ofMinutes(10));
+			}
+		} catch (Throwable e) {
+			log.error(e.toString());
+		}
+		log.info("Completed update");
+	}
+
+	private JsonObject getObject(String key, DocTemplate docTemplate, Map<String, String> elasticMap, Collection collection) {
+		JsonObject obj = docTemplate.updateJsonObject(ds.faker, collection.get(key).contentAsObject(), 
+				ds.get_fieldsToUpdate());
+		elasticMap.put(key, obj.toString());
+		return obj;
 	}
 }

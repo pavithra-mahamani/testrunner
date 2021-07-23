@@ -34,7 +34,7 @@ class BaseRQGMySQLClient(MySQLClient):
             dict[str(row[primary_key_index])] = map
         return dict
 
-    def _gen_json_from_results(self, columns, rows):
+    def _gen_json_from_results(self, columns, rows, round_level=0):
         data = []
         # Convert to JSON and capture in a dictionary
         for row in rows:
@@ -60,34 +60,36 @@ class BaseRQGMySQLClient(MySQLClient):
             data.append(map)
         return data
 
-    def _convert_to_mysql_json_compatible_val(self, value, type):
+    def _convert_to_mysql_json_compatible_val(self, value, datatype, round_level=0):
         if isinstance(value, float):
-            return round(value, 0)
-        if "tiny" in str(type):
+            return round(value, round_level)
+        if "tiny" in str(datatype):
             if value == 0:
                 return False
             elif value == 1:
                 return True
             else:
                 return None
-        if "int" in str(type):
+        if "int" in str(datatype):
             return value
-        if "long" in str(type):
+        if "blob" in str(datatype) and value is not None and type(value) is bytes:
+            return value.decode()
+        if "long" in str(datatype):
             return value
-        if "datetime" in str(type):
+        if "datetime" in str(datatype):
             return str(value)
-        if ("float" in str(type)) or ("double" in str(type)):
+        if ("float" in str(datatype)) or ("double" in str(datatype)):
             if value is None:
                 return None
             else:
-                return round(value, 0)
-        if "decimal" in str(type):
+                return round(value, round_level)
+        if "decimal" in str(datatype):
             if value is None:
                 return None
             else:
                 if isinstance(value, float):
-                    return round(value, 0)
-                return int(round(value, 0))
+                    return round(value, round_level)
+                return int(round(value, round_level))
         return str(value)
 
     def _get_table_list(self):

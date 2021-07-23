@@ -5,6 +5,7 @@ import uuid
 import math
 import re
 import time
+import ast
 import testconstants
 import datetime
 import time
@@ -16,6 +17,10 @@ from membase.api.rest_client import RestConnection
 import copy
 import traceback
 from deepdiff import DeepDiff
+from decimal import Decimal
+from couchbase.cluster import Cluster
+from couchbase.cluster import PasswordAuthenticator
+from couchbase.n1ql import N1QLQuery, STATEMENT_PLUS, CONSISTENCY_REQUEST, MutationState
 
 class N1QLHelper():
     def __init__(self, version=None, master=None, shell=None,  max_verify=0, buckets=[], item_flag=0,
@@ -35,6 +40,112 @@ class N1QLHelper():
         if self.full_docs_list and len(self.full_docs_list) > 0:
             self.gen_results = TuqGenerators(self.log, self.full_docs_list)
 
+    def create_collection(self, server=None, keyspace="default", bucket_name="", scope_name="", collection_name="",
+                          poll_interval=1, timeout=30):
+        if not bucket_name:
+            raise Exception("Bucket name cannot be empty!")
+
+        if not scope_name:
+            scope_name = "_default"
+
+        query = f"create collection {keyspace}:{bucket_name}.{scope_name}.{collection_name}"
+        try:
+            self.run_cbq_query(query=query, server=server)
+        except CBQError as e:
+            raise e
+        collection_created = self.wait_till_collection_created(server=server, bucket_name=bucket_name, scope_name=scope_name,
+                                          collection_name=collection_name, poll_interval=poll_interval, timeout=timeout)
+        return collection_created
+
+    def create_scope(self, server=None, keyspace="default", bucket_name="", scope_name="", poll_interval=1, timeout=30):
+        if not bucket_name:
+            raise Exception("Bucket name cannot be empty!")
+
+        query = f"create scope {keyspace}:{bucket_name}.{scope_name}"
+        self.run_cbq_query(server=server, query=query)
+        scope_created = self.wait_till_scope_created(server=server, bucket_name=bucket_name, scope_name=scope_name,
+                                                     poll_interval=poll_interval, timeout=timeout)
+        return scope_created
+
+    def delete_collection(self, server=None, keyspace="", bucket_name="", scope_name="", collection_name="",
+                          poll_interval=1, timeout=30):
+        objects = RestConnection(server).get_scope_collections(bucket_name, scope_name)
+        if not collection_name in objects:
+            self.log.info(f"Cannot find specified collection {keyspace}:{bucket_name}.{scope_name}.{collection_name}. Nothing to delete, returning.")
+            return
+
+        query = f"drop collection {keyspace}:{bucket_name}.{scope_name}.{collection_name}"
+        self.run_cbq_query(server=server, query=query)
+        self.wait_till_collection_dropped(server, bucket_name, scope_name, collection_name, poll_interval, timeout)
+
+    def check_if_scope_exists(self, server=None, namespace=None, bucket=None, scope=None):
+        scope_query = f"select count(*) as cnt from system:scopes where `namespace`='{namespace}' and `bucket`='{bucket}' and name='{scope}'"
+        res = self.run_cbq_query(query=scope_query, server=server)
+        return res['results'][0]['cnt'] == 1
+
+    def delete_scope(self, server=None, keyspace="", bucket_name="", scope_name="", poll_interval=1, timeout=30):
+        scope_exists = self.check_if_scope_exists(server=server, namespace=keyspace, bucket=bucket_name, scope=scope_name)
+        if scope_exists:
+            query = f"drop scope {keyspace}:{bucket_name}.{scope_name}"
+            self.run_cbq_query(query=query, server=server)
+            self.wait_till_scope_dropped(server, bucket_name, scope_name, poll_interval, timeout)
+        else:
+            self.log.info(f"Cannot find specified scope {keyspace}:{bucket_name}.{scope_name}. Nothing to delete, returning.")
+
+    def wait_till_scope_dropped(self, server=None, bucket_name="", scope_name="", poll_interval=1, timeout=30):
+        start_time = time.time()
+        scope_dropped = False
+        while time.time() < start_time + timeout:
+            # todo: get_bucket_scopes(bucket_name) function seems suspicious, need to investigate
+            objects = RestConnection(server).get_bucket_scopes(bucket_name)
+            if scope_name in objects:
+                time.sleep(poll_interval)
+            else:
+                scope_dropped = True
+                break
+        return scope_dropped
+
+    def wait_till_collection_dropped(self, server=None, bucket_name="", scope_name="", collection_name="",
+                                     poll_interval=1, timeout=30):
+        start_time = time.time()
+        collection_dropped = False
+        while time.time() < start_time + timeout:
+            # todo: get_scope_collections(bucket_name, scope_name) function seems suspicious, need to investigate
+            objects = RestConnection(server).get_scope_collections(bucket_name, scope_name)
+            if collection_name in objects:
+                time.sleep(poll_interval)
+            else:
+                collection_dropped = True
+                break
+        return collection_dropped
+
+    def wait_till_scope_created(self, server=None, bucket_name="", scope_name="", poll_interval=1, timeout=30):
+        start_time = time.time()
+        scope_created = False
+        while time.time() < start_time + timeout:
+            # todo: get_bucket_scopes(bucket_name) function seems suspicious, need to investigate
+            objects = RestConnection(server).get_bucket_scopes(bucket_name)
+            if not scope_name in objects:
+                time.sleep(poll_interval)
+            else:
+                scope_created = True
+                break
+        return scope_created
+
+    def wait_till_collection_created(self, server=None, bucket_name=None, scope_name=None, collection_name=None,
+                                     poll_interval=1, timeout=30):
+        start_time = time.time()
+        collection_created = False
+        while time.time() < start_time + timeout:
+            # todo: get_scope_collections(bucket_name, scope_name) function seems suspicious, need to investigate
+            objects = RestConnection(server).get_scope_collections(bucket_name, scope_name)
+            if not collection_name in objects:
+                time.sleep(poll_interval)
+            else:
+                collection_created = True
+                break
+        return collection_created
+
     def killall_tuq_process(self):
         self.shell.execute_command("killall cbq-engine")
         self.shell.execute_command("killall tuqtng")
@@ -53,9 +164,27 @@ class N1QLHelper():
         if leave_primary:
             current_indexes = [index for index in current_indexes if index['is_primary'] is False]
         for index in current_indexes:
+            bucket = index['bucket'].replace("()","")
+            index_name = index['name']
+            if index['using'] != 'fts':
+                self.run_cbq_query("drop index {0}.{1}".format(bucket, index_name))
+        for index in current_indexes:
             bucket = index['bucket']
             index_name = index['name']
-            self.run_cbq_query("drop index %s.%s" % (bucket, index_name))
+            if index['using'] != 'fts':
+                self.wait_for_index_drop(bucket, index_name)
+
+    def drop_all_indexes_on_keyspace(self, bucket=None, leave_primary=True):
+        current_indexes = self.get_parsed_indexes_online()
+        if bucket is not None:
+            current_indexes = [index for index in current_indexes if index['bucket'] == bucket]
+        if leave_primary:
+            current_indexes = [index for index in current_indexes if index['is_primary'] is False]
+        for index in current_indexes:
+            keyspace = index['keyspace']
+            index_name = index['name']
+            self.run_cbq_query("drop index %s ON %s" % (index_name, keyspace))
+        time.sleep(120)
         for index in current_indexes:
             bucket = index['bucket']
             index_name = index['name']
@@ -82,6 +211,7 @@ class N1QLHelper():
 
     def is_index_present(self, bucket_name, index_name, fields_set=None, using=None, status="online"):
         query_response = self.run_cbq_query("SELECT * FROM system:indexes")
+        self.log.info(f'{query_response}')
         if fields_set is None and using is None:
             if status is "any":
                 desired_index = (index_name, bucket_name)
@@ -117,7 +247,8 @@ class N1QLHelper():
             return False
 
     def run_cbq_query(self, query=None, min_output_size=10, server=None, query_params={}, is_prepared=False,
-                      scan_consistency=None, scan_vector=None, verbose=True):
+                      scan_consistency=None, scan_vector=None, scan_vectors=None, verbose=True, timeout=None,
+                      rest_timeout=None, query_context=None,txnid=None,txtimeout=None, use_sdk = False):
         if query is None:
             query = self.query
         if server is None:
@@ -127,59 +258,100 @@ class N1QLHelper():
         else:
             if server.ip == "127.0.0.1":
                 self.n1ql_port = server.n1ql_port
-            if self.input.tuq_client and "client" in self.input.tuq_client:
+            if self.input and self.input.tuq_client and "client" in self.input.tuq_client:
                 server = self.tuq_client
+
+        rest = RestConnection(server)
+
         if self.n1ql_port is None or self.n1ql_port == '':
             self.n1ql_port = self.input.param("n1ql_port", 8093)
             if not self.n1ql_port:
                 self.log.info(" n1ql_port is not defined, processing will not proceed further")
                 raise Exception("n1ql_port is not defined, processing will not proceed further")
-        cred_params = {'creds': []}
-        for bucket in self.buckets:
-            if bucket.saslPassword:
-                cred_params['creds'].append({'user': 'local:%s' % bucket.name, 'pass': bucket.saslPassword})
-        query_params.update(cred_params)
-        if self.use_rest:
+
+        result = ""
+        if use_sdk and ("prepare" not in query.lower()) and ("insert" not in query.lower()):
+            sdk_cluster = Cluster('couchbase://' + str(server.ip))
+            authenticator = PasswordAuthenticator(rest.username, rest.password)
+            sdk_cluster.authenticate(authenticator)
+            for bucket in self.buckets:
+                cb = sdk_cluster.open_bucket(bucket.name)
+
+            sdk_query = N1QLQuery(query)
+
+            if 'scan_consistency' in query_params:
+                if query_params['scan_consistency'] == 'REQUEST_PLUS':
+                    sdk_query.consistency = CONSISTENCY_REQUEST  # request_plus is currently mapped to the CONSISTENT_REQUEST constant in the Python SDK
+                elif query_params['scan_consistency'] == 'STATEMENT_PLUS':
+                    sdk_query.consistency = STATEMENT_PLUS
+                else:
+                    raise ValueError('Unknown consistency')
+            # Python SDK returns results row by row, so we need to iterate through all the results
+            row_iterator = cb.n1ql_query(sdk_query)
+            content = []
+            try:
+                for row in row_iterator:
+                    content.append(row)
+                row_iterator.meta['results'] = content
+                result = row_iterator.meta
+            except Exception as e:
+                # This will parse the resulting HTTP error and return only the dictionary containing the query results
+                result = ast.literal_eval(str(e).split("value=")[1].split(", http_status")[0])
+        elif self.use_rest:
             query_params = {}
+            if txtimeout:
+                query_params['txtimeout'] = txtimeout
+            if txnid:
+                query_params['txid'] = ''"{0}"''.format(txnid)
             if scan_consistency:
                 query_params['scan_consistency']= scan_consistency
             if scan_vector:
                 query_params['scan_vector']= str(scan_vector).replace("'", '"')
+            if scan_vectors:
+                query_params['scan_vectors'] = str(scan_vectors).replace("'", '"')
+            if timeout:
+                query_params['timeout'] = timeout
+            if query_context:
+                query_params['query_context'] = query_context
             if verbose:
                 self.log.info('RUN QUERY %s' % query)
-            result = RestConnection(server).query_tool(query, self.n1ql_port, query_params=query_params, is_prepared = is_prepared, verbose = verbose)
+            result = RestConnection(server).query_tool(query, self.n1ql_port, query_params=query_params,
+                                                       is_prepared=is_prepared, verbose=verbose, timeout=rest_timeout)
         else:
-            shell = RemoteMachineShellConnection(server)
-            url = "'http://%s:8093/query/service'" % server.ip
-            cmd = "%s/cbq  -engine=http://%s:8093/" % (testconstants.LINUX_COUCHBASE_BIN_PATH, server.ip)
+            if not self.shell:
+                shell = RemoteMachineShellConnection(server)
+            cmd = f"{testconstants.LINUX_COUCHBASE_BIN_PATH}/cbq  -engine=http://{server.ip}:8093/ -u {rest.username} -p {rest.password} "
             query = query.replace('"', '\\"')
             if "#primary" in query:
                 query = query.replace("'#primary'", '\\"#primary\\"')
-            query = "select curl('POST', " + url + ", {'data' : 'statement=%s'})" % query
-            print(query)
-            output = shell.execute_commands_inside(cmd, query, "", "", "", "", "")
-            print("-"*128)
-            print(output)
-            new_curl = json.dumps(output[47:])
-            string_curl = json.loads(new_curl)
-            result = json.loads(string_curl)
-            print(result)
+            if not self.shell:
+                output = shell.execute_commands_inside(cmd, query, "", "", "", "", "")
+            else:
+                output = self.shell.execute_commands_inside(cmd, query, "", "", "", "", "")
+            output = output[output.find('{"requestID":'):]
+            try:
+                result = json.loads(output)
+            except Exception as ex:
+                self.log.error(f"CANNOT LOAD QUERY RESULT IN JSON: {ex}" )
+                self.log.error("INCORRECT DOCUMENT IS: " + str(output))
         if isinstance(result, str) or 'errors' in result:
             error_result = str(result)
             length_display = len(error_result)
             if length_display > 500:
                 error_result = error_result[:500]
             raise CBQError(error_result, server.ip)
-        self.log.info("TOTAL ELAPSED TIME: %s" % result["metrics"]["elapsedTime"])
+
+        self.log.info(f"TOTAL ELAPSED TIME: {result['metrics']['elapsedTime']}")
         return result
 
-    def wait_for_all_indexes_online(self):
+    def wait_for_all_indexes_online(self,verbose=True):
         cur_indexes = self.get_parsed_indexes()
         for index in cur_indexes:
-            self._wait_for_index_online(index['bucket'], index['name'])
+            self.log.info("Indexes {0}".format(index))
+            self._wait_for_index_online(index['bucket'], index['name'],verbose=verbose)
 
     def get_parsed_indexes(self):
-        query_response = self.run_cbq_query("SELECT * FROM system:indexes")
+        query_response = self.run_cbq_query("SELECT * FROM system:indexes where bucket_id is missing and name not like 'default%'")
         current_indexes = [{'name': i['indexes']['name'],
                             'bucket': i['indexes']['keyspace_id'],
                             'fields': frozenset([(key.replace('`', '').replace('(', '').replace(')', '').replace('meta.id', 'meta().id'), j)
@@ -190,12 +362,28 @@ class N1QLHelper():
                             'is_primary': i['indexes'].get('is_primary', False)} for i in query_response['results']]
         return current_indexes
 
-    def _wait_for_index_online(self, bucket, index_name, timeout=12000):
+    def get_parsed_indexes_online(self):
+        query_response = self.run_cbq_query("SELECT * FROM system:indexes")
+        current_indexes = [{'name': i['indexes']['name'],
+                            'keyspace': i['indexes']['namespace_id'] + ":" + i['indexes']['bucket_id'] + "." +
+                            i['indexes']['scope_id'] + "." +
+                            i['indexes']['keyspace_id'],
+                            'bucket': i['indexes']['keyspace_id'],
+                            'fields': frozenset([(key.replace('`', '').replace('(', '').replace(')', '').replace(
+                                'meta.id', 'meta().id'), j)
+                                for j, key in enumerate(i['indexes']['index_key'], 0)]),
+                            'state': i['indexes']['state'],
+                            'using': i['indexes']['using'],
+                            'where': i['indexes'].get('condition', ''),
+                            'is_primary': i['indexes'].get('is_primary', False)} for i in query_response['results']]
+        return current_indexes
+
+    def _wait_for_index_online(self, bucket, index_name, timeout=300, poll_interval=1, verbose=True):
         end_time = time.time() + timeout
         res = {}
         while time.time() < end_time:
             query = "SELECT * FROM system:indexes where name='%s'" % index_name
-            res = self.run_cbq_query(query)
+            res = self.run_cbq_query(query,verbose=verbose)
             for item in res['results']:
                 if 'keyspace_id' not in item['indexes']:
                     self.log.error(item)
@@ -208,7 +396,7 @@ class N1QLHelper():
                 if item['indexes']['keyspace_id'] == bucket_name:
                     if item['indexes']['state'] == "online":
                         return
-            time.sleep(timeout)
+            time.sleep(poll_interval)
         raise Exception('index %s is not online. last response is %s' % (index_name, res))
 
 
@@ -220,16 +408,21 @@ class N1QLHelper():
         if len(actual_result) != len(expected_result):
             raise Exception("Results are incorrect.Actual num %s. Expected num: %s.\n" % (len(actual_result), len(expected_result)))
         msg = "The number of rows match but the results mismatch, please check"
-        diffs = DeepDiff(actual_result, expected_result, ignore_order=True)
+        diffs = DeepDiff(actual_result, expected_result, ignore_order=True, ignore_numeric_type_changes=True)
         if diffs:
             self.log.info("-->actual vs expected diffs found:{}".format(diffs))
             raise Exception(msg)
 
-    def _verify_results_rqg(self, subquery, aggregate=False, n1ql_result=[], sql_result=[], hints=["a1"], aggregate_pushdown=False):
+    def _verify_results_rqg(self, subquery, aggregate=False, n1ql_result=[], sql_result=[], hints=["a1"],
+                            aggregate_pushdown=False, window_function_test=False, delta=0, use_fts=False):
         new_n1ql_result = []
+        keyspace = '_default'
         for result in n1ql_result:
             if result != {}:
-                new_n1ql_result.append(result)
+                if list(result.keys()) == [keyspace]:
+                    new_n1ql_result.append(result[keyspace])
+                else:
+                    new_n1ql_result.append(result)
 
         n1ql_result = new_n1ql_result
 
@@ -241,11 +434,10 @@ class N1QLHelper():
 
         if actual_result == [{}]:
             actual_result = []
-        if check:
+        if check and not use_fts:
             actual_result = self._gen_dict(n1ql_result)
 
-        actual_result = sorted(actual_result)
-        expected_result = sorted(sql_result)
+        expected_result = sql_result
 
         if len(actual_result) != len(expected_result):
             extra_msg = self._get_failure_message(expected_result, actual_result)
@@ -270,10 +462,32 @@ class N1QLHelper():
                     print("expected result is %s" % expected_result)
                     extra_msg = self._get_failure_message(expected_result, actual_result)
                     raise Exception(msg+"\n "+extra_msg)
+        elif window_function_test:
+            for x, y in zip(actual_result, expected_result):
+                if not x['wf']:
+                    x['wf'] = 0
+                if not y['wf']:
+                    y['wf'] = 0
+                if type(x['wf']) == list and type(y['wf']) == str:
+                    diffs = DeepDiff(x['wf'], eval(y['wf']), ignore_order=True, ignore_numeric_type_changes=True)
+                    if diffs:
+                        diff = 1
+                    else:
+                        diff = 0
+                else:
+                    max_val = max([x['wf'], y['wf']])
+                    min_val = min([x['wf'], y['wf']])
+                    diff = max_val - min_val
+                if x['char_field1'] != y['char_field1'] or x['decimal_field1'] != y['decimal_field1'] or diff > delta:
+                    print("actual_result is %s" % x)
+                    print("expected result is %s" % y)
+                    extra_msg = self._get_failure_message(expected_result, actual_result)
+                    raise Exception(msg + "\n " + extra_msg)
         else:
-            if self._sort_data(actual_result) != self._sort_data(expected_result):
-                extra_msg = self._get_failure_message(expected_result, actual_result)
-                raise Exception(msg+"\n "+extra_msg)
+            diffs = DeepDiff(actual_result, expected_result, ignore_order=True, ignore_numeric_type_changes=True, ignore_string_case=True)
+            if diffs:
+                self.log.info("-->actual vs expected diffs found:{}".format(diffs))
+                raise Exception("-->actual vs expected diffs found:{}".format(diffs))
 
     def _sort_data(self, result):
         new_data = []
@@ -295,16 +509,16 @@ class N1QLHelper():
             actual_result = []
         if check:
             actual_result = self._gen_dict(n1ql_result)
-        actual_result = sorted(actual_result)
-        expected_result = sorted(sql_result)
+
+        expected_result = sql_result
 
         if len(actual_result) != len(expected_result):
             extra_msg = self._get_failure_message(expected_result, actual_result)
             raise Exception("Results are incorrect. Actual num %s. Expected num: %s.:: %s \n" % (len(actual_result), len(expected_result), extra_msg))
-        if not self._result_comparison_analysis(actual_result, expected_result):
-            msg = "The number of rows match but the results mismatch, please check"
-            extra_msg = self._get_failure_message(expected_result, actual_result)
-            raise Exception(msg+"\n "+extra_msg)
+        diffs = DeepDiff(actual_result, expected_result, ignore_order=True, ignore_numeric_type_changes=True)
+        if diffs:
+            self.log.info("-->actual vs expected diffs found:{}".format(diffs))
+            raise Exception("-->actual vs expected diffs found:{}".format(diffs))
 
     def _get_failure_message(self, expected_result, actual_result):
         if expected_result is None:
@@ -372,7 +586,7 @@ class N1QLHelper():
         sql_result = self._gen_dict_n1ql_func_result(sql_result)
         if len(sql_result) == 0 and len(n1ql_result) == 0:
             return
-        diffs = DeepDiff(n1ql_result, sql_result, ignore_order=True)
+        diffs = DeepDiff(n1ql_result, sql_result, ignore_order=True, ignore_numeric_type_changes=True)
         if diffs:
             self.log.info("-->actual vs expected diffs found:{0}".format(diffs))
             raise Exception("mismatch in results:{0}".format(diffs))
@@ -535,9 +749,12 @@ class N1QLHelper():
                 self.query += " USING VIEW "
             if self.use_rest:
                 try:
+                    self.log.info("Check if index existed in {0} on server {1}".format(bucket.name, server.ip))
                     check = self._is_index_in_list(bucket.name, "#primary", server=server)
                     if not check:
+                        self.log.info("Create primary index")
                         self.run_cbq_query(server=server, query_params={'timeout': '900s'})
+                        self.log.info("Check if index is online")
                         check = self.is_index_online_and_in_list(bucket.name, "#primary", server=server)
                         if not check:
                             raise Exception(" Timed-out Exception while building primary index for bucket {0} !!!".format(bucket.name))
@@ -687,12 +904,19 @@ class N1QLHelper():
         query = "SELECT * FROM system:indexes where name = \'{0}\'".format(index_name)
         if server is None:
             server = self.master
-        res = self.run_cbq_query(query=query, server=server)
-        for item in res['results']:
-            if 'keyspace_id' not in item['indexes']:
-                return False
-            if item['indexes']['keyspace_id'] == str(bucket) and item['indexes']['name'] == index_name and item['indexes']['state'] not in index_state:
-                return True
+        try:
+            res = self.run_cbq_query(query=query, server=server)
+            if res and res['results']:
+                for item in res['results']:
+                    if item['indexes'] and 'keyspace_id' not in item['indexes']:
+                        return False
+                    if item['indexes']['keyspace_id'] == str(bucket) and item['indexes']['name'] == index_name and item['indexes']['state'] not in index_state:
+                        return True
+            else:
+                self.log.error("Fail to get index list.  List output: {0}".format(res))
+        except Exception as e:
+            self.log.error("Query index in list throws exception: {0}".format(str(e)))
+            raise Exception(str(e))
         return False
 
     def _is_index_in_list_bulk(self, bucket, index_names=[], server=None, index_state=["pending","building"]):
@@ -738,6 +962,20 @@ class N1QLHelper():
 
     def get_index_count_using_index(self, bucket, index_name, server=None):
         query = 'SELECT COUNT(*) FROM {0} USE INDEX ({1})'.format(bucket.name, index_name)
+        if not server:
+            server = self.master
+        res = self.run_cbq_query(query=query, server=server)
+        return int(res['results'][0]['$1'])
+
+    def get_index_count_using_index_collection(self, keyspace, index_name, server=None):
+        query = 'SELECT COUNT(*) FROM {0} USE INDEX ({1})'.format(keyspace, index_name)
+        if not server:
+            server = self.master
+        res = self.run_cbq_query(query=query, server=server)
+        return int(res['results'][0]['$1'])
+
+    def get_collection_itemCount(self, keyspace, server=None):
+        query = 'SELECT COUNT(*) FROM {0}'.format(keyspace)
         if not server:
             server = self.master
         res = self.run_cbq_query(query=query, server=server)
@@ -1011,8 +1249,7 @@ class N1QLHelper():
         for key in index_map.keys():
             if index_name in list(index_map[key].keys()):
                 return index_map[key][index_name]['hosts'], index_map[key][index_name]['id']
-            else:
-                raise Exception ("Index does not exist - {0}".format(index_name))
+        raise Exception("Index does not exist - {0}".format(index_name))
 
     def get_index_status_using_index_name(self, index_name, index_map):
         for key in index_map.keys():
@@ -1021,9 +1258,3 @@ class N1QLHelper():
                        index_map[key][index_name]['progress']
             else:
                 raise Exception("Index does not exist - {0}".format(index_name))
-
-
-
-
-
-

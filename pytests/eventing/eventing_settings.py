@@ -104,6 +104,8 @@ class EventingSettings(EventingBaseTest):
         # load data
         self.load(self.gens_load, buckets=self.src_bucket, flag=self.item_flag, verify_data=False,
                   batch_size=self.batch_size)
+        body['settings']['deployment_status']=True
+        body['settings']['processing_status']=True
         # dynamically change the log level
         # currently this is the only setting that can be dynamically modified when a function is deployed
         for i in range(5):
@@ -177,6 +179,7 @@ class EventingSettings(EventingBaseTest):
         # remove alias before deploying
         del body['depcfg']['buckets']
         # deploy a function without any alias
+        self.rest.create_function(body['appname'],body)
         self.deploy_function(body)
         # make sure no doc in destination bucket
         self.verify_eventing_results(self.function_name, 0, skip_stats_validation=True)
@@ -255,3 +258,86 @@ class EventingSettings(EventingBaseTest):
         else:
             self.verify_eventing_results(self.function_name, self.docs_per_day * 2016, skip_stats_validation=True)
         self.undeploy_and_delete_function(body)
+
+    def test_timer_context_max_size_less_than_20b(self):
+        try:
+            body = self.create_save_function_body(self.function_name, self.handler_code)
+            body['settings']['timer_context_size']=19
+            self.rest.create_function(body['appname'], body)
+        except Exception as e:
+            self.log.info(e)
+            assert "ERR_INVALID_CONFIG" in str(e) and "timer_context_size value can not be less than 20 bytes" in str(e), True
+
+    def test_timer_context_max_size_greater_than_20mb(self):
+        try:
+            body = self.create_save_function_body(self.function_name, self.handler_code)
+            body['settings']['timer_context_size']=200000000
+            self.rest.create_function(body['appname'], body)
+        except Exception as e:
+            self.log.info(e)
+            assert "ERR_INVALID_CONFIG" in str(e) and "timer_context_size value can not be more than 20MB" in str(e), True
+
+    def test_timer_context_max_size_less_than_handler_size(self):
+        body = self.create_save_function_body(self.function_name, "handler_code/timer_context_size.js")
+        body['settings']['timer_context_size'] = 20
+        self.rest.create_function(body['appname'], body)
+        self.deploy_function(body)
+        self.load(self.gens_load, buckets=self.src_bucket, flag=self.item_flag, verify_data=False,
+                  batch_size=self.batch_size)
+        self.verify_eventing_results(self.function_name, self.docs_per_day * 2016, skip_stats_validation=True)
+        self.load(self.gens_load, buckets=self.src_bucket, flag=self.item_flag, verify_data=False,
+                  batch_size=self.batch_size, op_type='delete')
+        self.verify_eventing_results(self.function_name, 0, skip_stats_validation=True)
+        self.undeploy_and_delete_function(body)
+
+    def test_timer_context_max_size_value_empty(self):
+        try:
+            body = self.create_save_function_body(self.function_name, self.handler_code)
+            body['settings']['timer_context_size']=None
+            self.rest.create_function(body['appname'], body)
+        except Exception as e:
+            self.log.info(e)
+            assert "ERR_INVALID_CONFIG" in str(e) and "timer_context_size must be a number" in str(e), True
+
+    def test_bindings_to_non_existent_buckets(self):
+        try:
+            body = self.create_save_function_body(self.function_name, self.handler_code)
+            body['depcfg']['buckets'].append({"alias": "new_bucket", "bucket_name": "new_bucket", "access": "rw"})
+            self.rest.create_function(body['appname'], body)
+        except Exception as e:
+            self.log.info(e)
+            assert "ERR_BUCKET_MISSING" in str(e) and "Bucket does not exist in the cluster" in str(e), True
+
+    def test_update_bindings_via_config_api_call(self):
+        # load documents
+        self.load(self.gens_load, buckets=self.src_bucket, flag=self.item_flag, verify_data=False,
+                  batch_size=self.batch_size)
+        body = self.create_save_function_body(self.function_name, self.handler_code)
+        # remove bucket bindings
+        del body['depcfg']['buckets']
+        body['depcfg']['buckets'] = []
+        body['depcfg']['buckets'].append(
+            {"alias": self.dst_bucket_name, "bucket_name": self.dst_bucket_name, "scope_name": "_default",
+             "collection_name": "_default", "access": "rw"})
+        body['depcfg']['metadata_scope'] = "_default"
+        body['depcfg']['metadata_collection'] = "_default"
+        body['depcfg']['source_scope'] = "_default"
+        body['depcfg']['source_collection'] = "_default"
+        # update handler config via new api call
+        self.rest.update_eventing_config_per_function(body['depcfg'], self.function_name)
+        log.info(self.rest.get_eventing_config_per_function(self.function_name))
+        self.deploy_function(body)
+        self.verify_eventing_results(self.function_name, self.docs_per_day * 2016, skip_stats_validation=True)
+        self.load(self.gens_load, buckets=self.src_bucket, flag=self.item_flag, verify_data=False,
+                  batch_size=self.batch_size, op_type='delete')
+        self.verify_eventing_results(self.function_name, 0, skip_stats_validation=True)
+        self.undeploy_and_delete_function(body)
+
+    def test_create_function_without_settings(self):
+        try:
+            body = self.create_save_function_body(self.function_name, self.handler_code)
+            del body['settings']
+            self.rest.create_function(body['appname'], body)
+        except Exception as e:
+            self.log.info(e)
+            assert "ERR_INVALID_CONFIG" in str(e) and "processing_status is required" in str(e), True

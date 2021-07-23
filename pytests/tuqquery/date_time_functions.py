@@ -99,6 +99,12 @@ class DateTimeFunctionClass(QueryTests):
                     actual_result = self.run_cbq_query(query)
                     query = 'SELECT LENGTH("{0}")'.format(expected_format)
                     expected_result = self.run_cbq_query(query)
+                    if actual_result["results"][0]["$1"] != expected_result["results"][0]["$1"]:
+                        query = 'SELECT ' + date_format_query
+                        str_actual_result = self.run_cbq_query(query)
+                        query = 'SELECT "{0}"'.format(expected_format)
+                        str_expected_result = self.run_cbq_query(query)
+                        self.log.info("Test is failed. Actual result is {0}, expected result is {1}.".format(str_actual_result, str_expected_result))
                     self.assertEqual(actual_result["results"][0]["$1"], expected_result["results"][0]["$1"],
                                      "Results mismatch for query {0}".format(date_format_query))
 
@@ -127,6 +133,8 @@ class DateTimeFunctionClass(QueryTests):
                 query = self._generate_date_format_str_query(temp_expression, first_expression)
                 result = self.run_cbq_query(query)
                 second_expression = result["results"][0]["$1"]
+                if (first_expression == "2006-01-02T15:04:05" or first_expression == "2006-01-02 15:04:05") and part == "millisecond":
+                    expect_null_result = 1
                 if part in local_parts[:8]:
                     if not (self._is_date_part_present(first_expression) and
                                 self._is_date_part_present(second_expression)):

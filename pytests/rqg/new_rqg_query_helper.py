@@ -390,7 +390,7 @@ class RQGQueryHelperNew(BaseRQGQueryHelper):
                     left_table = table_name
                     right_table = with_alias
 
-                from_clause += " " + left_table + " " + join_type + " " + right_table + " " + "ON" + " " + "(" + left_table + "." + join_field + " " + "==" + " " + right_table + "." + join_field + ")"
+                from_clause += " " + left_table + " " + join_type + " " + right_table + " " + "ON" + " " + "(" + left_table + "." + join_field + " " + "=" + " " + right_table + "." + join_field + ")"
                 from_map = {"left_table": left_table, "class": "TABLE_AND_CTE_JOIN", "type": "joins",
                             "right_table": right_table, "left_on_field": join_field, "right_on_field": join_field,
                             "join_type": join_type}
@@ -403,7 +403,7 @@ class RQGQueryHelperNew(BaseRQGQueryHelper):
                 left_table_alias = left_table+"_ALIAS_LEFT"
                 right_table = table_name
                 right_table_alias = right_table+"_ALIAS_RIGHT"
-                from_clause += " " + left_table + " AS " + left_table_alias + " " + join_type + " " + right_table + " AS " + right_table_alias + " " + "ON" + " " + "(" + left_table_alias + "." + join_field + " " + "==" + " " + right_table_alias + "." + join_field + ")"
+                from_clause += " " + left_table + " AS " + left_table_alias + " " + join_type + " " + right_table + " AS " + right_table_alias + " " + "ON" + " " + "(" + left_table_alias + "." + join_field + " " + "=" + " " + right_table_alias + "." + join_field + ")"
                 from_map = {"left_table": left_table, "left_table_alias": left_table_alias, "class": "TABLE_AND_CTE_JOIN", "type": "joins",
                         "right_table": right_table, "right_table_alias": right_table_alias, "left_on_field": join_field, "right_on_field": join_field,
                         "join_type": join_type}
@@ -414,7 +414,7 @@ class RQGQueryHelperNew(BaseRQGQueryHelper):
                 join_field = random.choice(common_fields)
 
                 join_type = random.choice(["LEFT OUTER JOIN", "RIGHT OUTER JOIN", "INNER JOIN"])
-                from_clause += " " + left_table + " AS " + left_table_alias + " " + join_type + " " + right_table + " AS " + right_table_alias + " " + "ON" + " " + "(" + left_table_alias + "." + join_field + " " + "==" + " " + right_table_alias + "." + join_field + ")"
+                from_clause += " " + left_table + " AS " + left_table_alias + " " + join_type + " " + right_table + " AS " + right_table_alias + " " + "ON" + " " + "(" + left_table_alias + "." + join_field + " " + "=" + " " + right_table_alias + "." + join_field + ")"
                 from_map = {"left_table": left_table, "left_table_alias": left_table_alias, "class": "TABLE_AND_CTE_JOIN", "type": "joins",
                             "right_table": right_table, "right_table_alias": right_table_alias, "left_on_field": join_field, "right_on_field": join_field,
                             "join_type": join_type}
@@ -924,9 +924,9 @@ class RQGQueryHelperNew(BaseRQGQueryHelper):
                 query_map['indexes'][key]['definition'] = query_map['indexes'][key]['definition'].replace("simple_table", database + "_" + "simple_table")
         return query_map
 
-    def _random_sample(self, list):
-        size_of_sample = random.choice(list(range(1, len(list) + 1)))
-        random_sample = [list[i] for i in random.sample(range(len(list)), size_of_sample)]
+    def _random_sample(self, sample_list):
+        size_of_sample = random.choice(list(range(1, len(sample_list) + 1)))
+        random_sample = random.sample(sample_list, size_of_sample)
         return random_sample
 
     def _random_constant(self, field=None):
@@ -1301,13 +1301,13 @@ class RQGQueryHelperNew(BaseRQGQueryHelper):
         if 'WINDOW_ORDER_START' in sql:
             sql_map['window_order'] = sql[sql.find('WINDOW_ORDER_START')+len('WINDOW_ORDER_START'):sql.find('WINDOW_ORDER_END')]
             if sql_map['window_function_name'].strip() in ['RANK', 'DENSE_RANK', 'PERCENT_RANK', 'CUME_DIST', 'LAG', 'NTILE', 'LEAD'] and sql_map['window_order'].strip() == '':
-                sql_map['window_order'] = ' ORDER BY DECIMAL_FIELD1 '
+                sql_map['window_order'] = ' ORDER BY DECIMAL_FIELD1, CHAR_FIELD1 '
 
             n1ql_map['window_order'] = sql[sql.find('WINDOW_ORDER_START') + len('WINDOW_ORDER_START'):sql.find(
                 'WINDOW_ORDER_END')]
             if n1ql_map['window_function_name'].strip() in ['RANK', 'DENSE_RANK', 'PERCENT_RANK', 'CUME_DIST', 'LAG',
                                                            'NTILE', 'LEAD'] and n1ql_map['window_order'].strip() == '':
-                n1ql_map['window_order'] = ' ORDER BY DECIMAL_FIELD1 '
+                n1ql_map['window_order'] = ' ORDER BY DECIMAL_FIELD1, CHAR_FIELD1 '
 
         if 'WINDOW_FRAME_START' in sql:
             sql_map['window_frame'] = sql[sql.find('WINDOW_FRAME_START')+len('WINDOW_FRAME_START'):sql.find('WINDOW_FRAME_END')]
@@ -1315,14 +1315,14 @@ class RQGQueryHelperNew(BaseRQGQueryHelper):
                 sql_map['window_frame'] = ''
             if sql_map['window_function_name'].strip() in ['FIRST_VALUE', 'LAST_VALUE', 'NTH_VALUE', 'ARRAY_AGG', 'VAR_POP', 'VAR_SAMP', 'AVG', 'STDDEV_POP', 'MIN',
                                                            'STDDEV_SAMP', 'COUNT', 'COUNTN', 'STDDEV', 'MAX', 'VARIANCE', 'MEAN', 'SUM'] and sql_map['window_order'].strip() == '':
-                sql_map['window_order'] = ' ORDER BY DECIMAL_FIELD1 '
+                sql_map['window_order'] = ' ORDER BY DECIMAL_FIELD1, CHAR_FIELD1 '
 
             n1ql_map['window_frame'] = sql[sql.find('WINDOW_FRAME_START')+len('WINDOW_FRAME_START'):sql.find('WINDOW_FRAME_END')]
             if n1ql_map['window_function_name'].strip() in ['ROW_NUMBER', 'LEAD', 'CUME_DIST', 'LAG', 'PERCENT_RANK', 'DENSE_RANK', 'NTILE', 'RANK']:
                 n1ql_map['window_frame'] = ''
             if n1ql_map['window_function_name'].strip() in ['FIRST_VALUE', 'LAST_VALUE', 'NTH_VALUE', 'ARRAY_AGG', 'VAR_POP', 'VAR_SAMP', 'AVG', 'STDDEV_POP', 'MIN',
                                                             'STDDEV_SAMP', 'COUNT', 'COUNTN', 'STDDEV', 'MAX', 'VARIANCE', 'MEAN', 'SUM'] and n1ql_map['window_order'].strip() == '':
-                n1ql_map['window_order'] = ' ORDER BY DECIMAL_FIELD1 '
+                n1ql_map['window_order'] = ' ORDER BY DECIMAL_FIELD1, CHAR_FIELD1 '
 
         if 'WINDOW_FRAME_EXCLUSION_START' in sql:
             sql_map['window_frame_exclusion'] = sql[sql.find('WINDOW_FRAME_EXCLUSION_START')+len('WINDOW_FRAME_EXCLUSION_START'):sql.find('WINDOW_FRAME_EXCLUSION_END')]
@@ -1340,10 +1340,10 @@ class RQGQueryHelperNew(BaseRQGQueryHelper):
                 n1ql_map['window_frame_exclusion'] = ''
 
         converted_sql = 'SELECT char_field1, decimal_field1, '+sql_map['window_function_name']+'('+sql_map['window_function_arguments']+')'+' '+sql_map['nthval_from']+' '+sql_map['nulls_treatment']+\
-                        ' OVER('+sql_map['window_partition']+' '+sql_map['window_order']+' '+sql_map['window_frame']+' '+sql_map['window_frame_exclusion']+') as wf FROM simple_table where primary_key_id is not null'
+                        ' OVER('+sql_map['window_partition']+' '+sql_map['window_order']+' '+sql_map['window_frame']+' '+sql_map['window_frame_exclusion']+') as wf FROM simple_table where primary_key_id is not null order by decimal_field1, char_field1, wf'
 
         converted_n1ql = 'SELECT char_field1, decimal_field1, '+n1ql_map['window_function_name']+'('+n1ql_map['window_function_arguments']+')'+' '+n1ql_map['nthval_from']+' '+n1ql_map['nulls_treatment']+\
-                        ' OVER('+n1ql_map['window_partition']+' '+n1ql_map['window_order']+' '+n1ql_map['window_frame']+' '+n1ql_map['window_frame_exclusion']+') as wf FROM simple_table  where primary_key_id is not null'
+                        ' OVER('+n1ql_map['window_partition']+' '+n1ql_map['window_order']+' '+n1ql_map['window_frame']+' '+n1ql_map['window_frame_exclusion']+') as wf FROM simple_table  where primary_key_id is not null order by decimal_field1, char_field1, wf'
 
         return converted_sql.lower(), converted_n1ql.lower()
 

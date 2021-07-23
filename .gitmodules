@@ -1,3 +1,0 @@
-[submodule "java_sdk_client"]
-	path = java_sdk_client
-	url = git://github.com/couchbaselabs/java_sdk_client.git

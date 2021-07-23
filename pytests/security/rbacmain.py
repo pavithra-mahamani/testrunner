@@ -49,7 +49,7 @@ class rbacmain:
         url = "/settings/rbac/roles"
         api = rest.baseUrl + url
         status, content, header = rest._http_request(api, 'GET')
-        log.info(" Retrieve all User roles - Status - {0} -- Content - {1} -- Header - {2}".format(status, content, header))
+        #log.info(" Retrieve all User roles - Status - {0} -- Content - {1} -- Header - {2}".format(status, content, header))
         return status, content, header
 
     def _retrieve_user_roles(self):
@@ -57,12 +57,24 @@ class rbacmain:
         url = "/settings/rbac/users"
         api = rest.baseUrl + url
         status, content, header = rest._http_request(api, 'GET')
-        log.info(" Retrieve User Roles - Status - {0} -- Content - {1} -- Header - {2}".format(status, content, header))
+        #log.info(" Retrieve User Roles - Status - {0} -- Content - {1} -- Header - {2}".format(status, content, header))
         return status, content, header
+
+    def _retrieve_user_details(self, user):
+        content = self._retrieve_user_roles()
+        content = content[1].decode('utf-8')
+        temp = ""
+        for ch in content:
+            temp = temp + ch
+        content = json.loads(temp)
+
+        for usr in content:
+            if usr['id'] == user:
+                return usr
 
     def _set_user_roles(self, user_name, payload):
         rest = RestConnection(self.master_ip)
-        if self.auth_type == "ldap" or self.auth_type == "pam":
+        if self.auth_type == "ldap" or self.auth_type == "pam" or self.auth_type == "ExternalGrp":
             url = "settings/rbac/users/external/" + user_name
         elif self.auth_type == 'builtin':
             url = "settings/rbac/users/local/" + user_name
@@ -73,7 +85,7 @@ class rbacmain:
 
     def _delete_user(self, user_name):
         rest = RestConnection(self.master_ip)
-        if self.auth_type == 'ldap' or self.auth_type == "pam":
+        if self.auth_type == 'ldap' or self.auth_type == "pam" or self.auth_type == "ExternalGrp":
             url = "/settings/rbac/users/external/" + user_name
         else:
             url = "settings/rbac/users/local/" + user_name
@@ -110,7 +122,7 @@ class rbacmain:
         status, content, header = rbacmain(server)._retrieve_user_roles()
         content = json.loads(content)
         for temp in content:
-            if self.auth_type == 'ldap' or self.auth_type == "pam":
+            if self.auth_type == 'ldap' or self.auth_type == "pam" or self.auth_type == "ExternalGrp":
                 response = rest.delete_user_roles(temp['id'])
             elif self.auth_type == "builtin":
                 response = rest.delete_builtin_user(temp['id'])
@@ -132,7 +144,7 @@ class rbacmain:
         else:
             temp_dict =  expected['permissionSet']
 
-        for permission in temp_dict.keys():
+        for permission in list(temp_dict.keys()):
             if "[<bucket_name>]" in permission:
                 new_key = permission.replace("<bucket_name>", bucket_name)
                 temp_dict[new_key] = temp_dict.pop(permission)

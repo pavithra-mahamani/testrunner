@@ -40,7 +40,7 @@ class StoppableThread(Thread):
 
     def stopit(self):
         for task in self.tasks:
-            task.cancel();
+            task.cancel()
         self._stopper.set()
 
     def stopped(self):
@@ -1937,30 +1937,27 @@ class ViewQueryTests(BaseTestCase):
     # later in the test case
     ###
     def _query_test_init(self, data_set, verify_results=False):
-        try:
-            views = data_set.views
-            rest = self._rconn()
-            load_task = None
+        views = data_set.views
+        rest = self._rconn()
+        load_task = None
 
-            generators = data_set.generate_docs(views[0])
-            load_task = StoppableThread(target=self.load,
-                                       name="load_data_set",
-                                       args=(data_set, generators))
-            load_task.start()
+        generators = data_set.generate_docs(views[0])
+        load_task = StoppableThread(target=self.load,
+                                    name="load_data_set",
+                                    args=(data_set, generators))
+        load_task.start()
 
-            # run queries while loading data
-            self._query_all_views(views, generators, data_set.kv_store,
-                                  verify_expected_keys=verify_results,
-                                  threads=[load_task])
-            if 'result' in dir(load_task):
-                load_task.result()
-            else:
-                load_task.join()
+        # run queries while loading data
+        self._query_all_views(views, generators, data_set.kv_store,
+                                verify_expected_keys=verify_results,
+                                threads=[load_task])
+        if 'result' in dir(load_task):
+            load_task.result()
+        else:
+            load_task.join()
 
-            self._check_view_intergrity(views)
-            return generators
-        finally:
-            data_set.cluster.shutdown()
+        self._check_view_intergrity(views)
+        return generators
 
     def load(self, data_set, generators_load, exp=0, flag=0,
              kv_store=1, only_store_hash=True, batch_size=1, pause_secs=1,
@@ -1972,7 +1969,7 @@ class ViewQueryTests(BaseTestCase):
             task = None
             bucket = data_set.bucket
             if not isinstance(bucket, Bucket):
-                bucket = Bucket(name=bucket, authType="sasl", saslPassword="")
+                bucket = Bucket(name=bucket)
 
             # initialize the template for document generator
             items = 0
@@ -1991,9 +1988,9 @@ class ViewQueryTests(BaseTestCase):
             self.log.info("LOAD IS FINISHED")
             return gens_load
         except Exception as ex:
-            data_set.views[0].results.addError(self, (Exception, str(ex), sys.exc_info()[2]))
-            self.log.error("At least one of load data threads is crashed: {0}".format(ex))
             self.thread_crashed.set()
+            data_set.views[0].results.addError(self, sys.exc_info())
+            self.log.error("At least one of load data threads is crashed: {0}".format(ex))
             if task:
                 if 'stop' in dir(threading.currentThread()) and\
                    isinstance(threading.currentThread(), StoppableThread):
@@ -2194,9 +2191,9 @@ class QueryView:
                     self.results.addFailure(tc, (Exception, msg, sys.exc_info()[2]))
                     tc.thread_crashed.set()
         except Exception as ex:
-            self.log.error("Error {0} appeared during query run".format(ex))
-            self.results.addError(tc, (Exception, str(ex), sys.exc_info()[2]))
             tc.thread_crashed.set()
+            self.log.error("Error {0} appeared during query run".format(ex))
+            self.results.addError(tc, sys.exc_info())
             if task:
                 if 'stop' in dir(threading.currentThread()) and\
                    isinstance(threading.currentThread(), StoppableThread):

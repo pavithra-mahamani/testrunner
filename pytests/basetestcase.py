@@ -1,50 +1,48 @@
-import logger
-import unittest
 import copy
-import datetime
-import time
-import string
-import random
-import logging
 import json
+import logging
+import random
+import string
 import subprocess
-import mc_bin_client
 import traceback
-import re
-import os
+import unittest
+import os, ast
 
-
-from memcached.helper.data_helper import VBucketAwareMemcached
-from couchbase_helper.documentgenerator import BlobGenerator, SDKDataLoader
+import logger
+import testconstants
+from couchbase_cli import CouchbaseCLI
 from couchbase_helper.cluster import Cluster
+from couchbase_helper.data_analysis_helper import *
 from couchbase_helper.document import View
+from couchbase_helper.documentgenerator import BlobGenerator
 from couchbase_helper.documentgenerator import DocumentGenerator
 from couchbase_helper.stats_tools import StatsCommon
-from TestInput import TestInputSingleton, TestInputServer
-from membase.api.rest_client import RestConnection, Bucket, RestHelper
+
+from lib.couchbase_helper.documentgenerator import SDKDataLoader
+from lib.ep_mc_bin_client import MemcachedClient
+from lib.mc_bin_client import MemcachedClient as MC_MemcachedClient
+from membase.api.exception import ServerUnavailableException, ServerAlreadyJoinedException
+from membase.api.rest_client import Bucket, RestHelper
 from membase.helper.bucket_helper import BucketOperationHelper
 from membase.helper.cluster_helper import ClusterOperationHelper
 from membase.helper.rebalance_helper import RebalanceHelper
-from memcached.helper.data_helper import MemcachedClientHelper
-from remote.remote_util import RemoteMachineShellConnection, RemoteUtilHelper
-from membase.api.exception import ServerUnavailableException
-from couchbase_helper.data_analysis_helper import *
-from testconstants import STANDARD_BUCKET_PORT
-from testconstants import MIN_COMPACTION_THRESHOLD
-from testconstants import MAX_COMPACTION_THRESHOLD
-from testconstants import LINUX_DIST_CONFIG
-from membase.helper.cluster_helper import ClusterOperationHelper
-from security.rbac_base import RbacBase
+from memcached.helper.data_helper import VBucketAwareMemcached
+from remote.remote_util import RemoteUtilHelper
+from scripts.collect_server_info import cbcollectRunner
 from security.ntonencryptionBase import ntonencryptionBase
+from security.rbac_base import RbacBase
+from testconstants import MAX_COMPACTION_THRESHOLD
+from testconstants import MIN_COMPACTION_THRESHOLD
+from testconstants import STANDARD_BUCKET_PORT
 from security.SecretsMasterBase import SecretsMasterBase
-
+from security.IPv6_IPv4_grub_level import IPv6_IPv4
 
 from couchbase_cli import CouchbaseCLI
 import testconstants
 
-from lib.ep_mc_bin_client import MemcachedClient
-from lib.mc_bin_client import MemcachedClient as MC_MemcachedClient
-from scripts.collect_server_info import cbcollectRunner
+
+from TestInput import TestInputSingleton, TestInputServer
+from scripts.java_sdk_setup import JavaSdkSetup
 
 
 class BaseTestCase(unittest.TestCase):
@@ -67,10 +65,10 @@ class BaseTestCase(unittest.TestCase):
             self.servers = [server for server in self.servers
                             if server.ip != self.moxi_server.ip]
         self.buckets = []
-        self.bucket_base_params = {}
-        self.bucket_base_params['membase'] = {}
+        self.bucket_base_params = {'membase': {}}
         self.master = self.servers[0]
         self.upgrade_test = self.input.param("upgrade_test", False)
+
         self.indexManager = self.servers[0]
         if not hasattr(self, 'cluster'):
             self.cluster = Cluster()
@@ -91,26 +89,26 @@ class BaseTestCase(unittest.TestCase):
         self.data_analyzer = DataAnalyzer()
         self.result_analyzer = DataAnalysisResultAnalyzer()
         self.set_testrunner_client()
-        self.change_bucket_properties=False
+        self.change_bucket_properties = False
         self.cbas_node = self.input.cbas
         self.cbas_servers = []
         self.kv_servers = []
         self.otpNodes = []
-        self.collection_name={}
+        self.collection_name = {}
         for server in self.servers:
             if "cbas" in server.services:
                 self.cbas_servers.append(server)
             if "kv" in server.services:
                 self.kv_servers.append(server)
-        if not self.cbas_node and len(self.cbas_servers)>=1:
+        if not self.cbas_node and len(self.cbas_servers) >= 1:
             self.cbas_node = self.cbas_servers[0]
 
         try:
-            self.skip_setup_cleanup = self.input.param("skip_setup_cleanup", True)
+            self.skip_setup_cleanup = self.input.param("skip_setup_cleanup", False)
             self.vbuckets = self.input.param("vbuckets", 1024)
-            self.collection=self.input.param("collection", False)
-            self.scope_num=self.input.param("scope_num", 4)
-            self.collection_num=self.input.param("collection_num", [2] * self.scope_num )
+            self.collection = self.input.param("collection", False)
+            self.scope_num = self.input.param("scope_num", 4)
+            self.collection_num = self.input.param("collection_num", [2] * self.scope_num)
             self.upr = self.input.param("upr", None)
             self.index_quota_percent = self.input.param("index_quota_percent", None)
             self.targetIndexManager = self.input.param("targetIndexManager", False)
@@ -123,11 +121,11 @@ class BaseTestCase(unittest.TestCase):
             self.default_bucket = self.input.param("default_bucket", True)
             self.parallelism = self.input.param("parallelism", False)
             if self.default_bucket:
-                self.default_bucket_name = "default"
+                self.default_bucket_name = self.input.param('default_bucket_name', 'default')
             self.skip_standard_buckets = self.input.param("skip_standard_buckets", False)
             self.standard_buckets = self.input.param("standard_buckets", 0)
             # list of list [[2,1,1],[3,1,2,1],[4,1,1,2,3]]
-            self.standard_buckets_scope=self.input.param("bucket_scope", [2]*self.standard_buckets)
+            self.standard_buckets_scope = self.input.param("bucket_scope", [2] * self.standard_buckets)
             if self.skip_standard_buckets:
                 self.standard_buckets = 0
                 BucketOperationHelper.delete_all_buckets_or_assert(servers=self.servers, test_case=self)
@@ -177,17 +175,18 @@ class BaseTestCase(unittest.TestCase):
             # bucket parameters go here,
             self.bucket_size = self.input.param("bucket_size", None)
             self.bucket_type = self.input.param("bucket_type", 'membase')
+            self.bucket_storage = self.input.param("bucket_storage", 'couchstore')
             self.num_replicas = self.input.param("replicas", 1)
             self.enable_replica_index = self.input.param("index_replicas", 1)
             self.skip_bucket_setup = self.input.param("skip_bucket_setup", False)
             self.eviction_policy = self.input.param("eviction_policy", 'valueOnly')  # or 'fullEviction'
-                           # for ephemeral bucket is can be noEviction or nruEviction
+            # for ephemeral bucket is can be noEviction or nruEviction
             if self.bucket_type == 'ephemeral' and self.eviction_policy == 'valueOnly':
                 # use the ephemeral bucket default
                 self.eviction_policy = 'noEviction'
 
-                                          # for ephemeral buckets it
-            self.sasl_password=self.input.param("sasl_password", 'password')
+                # for ephemeral buckets it
+            self.sasl_password = self.input.param("sasl_password", 'password')
             self.lww = self.input.param("lww",
                                         False)  # only applies to LWW but is here because the bucket is created here
             self.maxttl = self.input.param("maxttl", None)
@@ -196,20 +195,24 @@ class BaseTestCase(unittest.TestCase):
             self.sasl_bucket_name = "bucket"
             self.sasl_bucket_priority = self.input.param("sasl_bucket_priority", None)
             self.standard_bucket_priority = self.input.param("standard_bucket_priority", None)
-            self.magma_storage = self.input.param("magma_storage", False)
             # end of bucket parameters spot (this is ongoing)
             self.disable_diag_eval_on_non_local_host = self.input.param("disable_diag_eval_non_local", False)
-            self.ntonencrypt = self.input.param('ntonencrypt','disable')
-            self.ntonencrypt_level = self.input.param('ntonencrypt_level','control')
-            self.hostname = self.input.param('hostname',False)
-            self.x509enable = self.input.param('x509enable',False)
+            self.ntonencrypt = self.input.param('ntonencrypt', 'disable')
+            self.ntonencrypt_level = self.input.param('ntonencrypt_level', 'control')
+            self.hostname = self.input.param('hostname', False)
+            self.x509enable = self.input.param('x509enable', False)
             self.enable_secrets = self.input.param("enable_secrets", False)
             self.secret_password = self.input.param("secret_password", 'p@ssw0rd')
+            self.skip_log_scan = self.input.param("skip_log_scan", False)
+            self.disable_ipv6_grub = self.input.param("disable_ipv6_grub",False)
+            self.upgrade_addr_family = self.input.param("upgrade_addr_family",None)
+            self.skip_metabucket_check = False
+            self.enable_dp = self.input.param("enable_dp", False)
 
-
-            if self.skip_setup_cleanup:
+            if self.skip_setup_cleanup or self.skip_bucket_setup:
                 self.buckets = RestConnection(self.master).get_buckets()
-                return
+                if self.skip_setup_cleanup:
+                    return
             if not self.skip_init_check_cbserver:
                 self.cb_version = None
                 if RestHelper(RestConnection(self.master)).is_ns_server_running():
@@ -228,9 +231,14 @@ class BaseTestCase(unittest.TestCase):
 
             self.log.info("==============  basetestcase setup was started for test #{0} {1}==============" \
                           .format(self.case_number, self._testMethodName))
-            if not self.skip_buckets_handle and not self.skip_init_check_cbserver:
+            if not self.input.param("skip_cleanup", False) and not self.skip_buckets_handle and not self.skip_init_check_cbserver:
                 self._cluster_cleanup()
 
+            if self.disable_ipv6_grub:
+                self._disable_ipv6_grub()
+
+            if self.upgrade_addr_family:
+                self._upgrade_addr_family(self.upgrade_addr_family)
 
             shared_params = self._create_bucket_params(server=self.master, size=self.bucket_size,
                                                        replicas=self.num_replicas,
@@ -251,14 +259,24 @@ class BaseTestCase(unittest.TestCase):
             memcached_params['bucket_type'] = 'memcached'
             self.bucket_base_params['memcached'] = memcached_params
 
+            self.java_sdk_client = self.input.param("java_sdk_client", False)
+            if self.java_sdk_client:
+                self.log.info("Building docker image with java sdk client")
+                JavaSdkSetup()
+
             # avoid any cluster operations in setup for new upgrade
             #  & upgradeXDCR tests
             if str(self.__class__).find('newupgradetests') != -1 or \
-                            str(self.__class__).find('upgradeXDCR') != -1 or \
-                            str(self.__class__).find('Upgrade_EpTests') != -1 or \
-                            (str(self.__class__).find('UpgradeTests') != -1 and self.skip_init_check_cbserver) or \
-                            hasattr(self, 'skip_buckets_handle') and \
-                            self.skip_buckets_handle:
+                    str(self.__class__).find('XDCRUpgradeCollectionsTests') != -1 or \
+                    str(self.__class__).find('Upgrade_EpTests') != -1 or \
+                    (str(self.__class__).find('UpgradeTests') != -1 and self.skip_init_check_cbserver) or \
+                    hasattr(self, 'skip_buckets_handle') and \
+                    self.skip_buckets_handle:
+                if not self.skip_log_scan:
+                    self.log_scan_file_prefix = f'{self._testMethodName}_test_{self.case_number}'
+                    _tasks = self.cluster.async_log_scan(self.servers, self.log_scan_file_prefix+"_BEFORE")
+                    for _task in _tasks:
+                        _task.result()
                 self.log.info("any cluster operation in setup will be skipped")
                 self.primary_index_created = True
                 self.log.info("==============  basetestcase setup was finished for test #{0} {1} ==============" \
@@ -281,11 +299,12 @@ class BaseTestCase(unittest.TestCase):
                     for server in self.servers:
                         options = '--node-init-hostname ' + server.ip
                         remote_client = RemoteMachineShellConnection(server)
-                        output, error = remote_client.execute_couchbase_cli(cli_command=cli_command, \
-                                options=options, cluster_host="localhost", user='Administrator', password='password') 
+                        output, error = remote_client.execute_couchbase_cli(cli_command=cli_command,
+                                                                            options=options, cluster_host="localhost",
+                                                                            user='Administrator', password='password')
                         print(output)
                         print(error)
-                
+
                 master_services = self.get_services(self.servers[:1],
                                                     self.services_init,
                                                     start_node=0)
@@ -306,8 +325,7 @@ class BaseTestCase(unittest.TestCase):
 
                 self.change_env_variables()
                 self.change_checkpoint_params()
-                
-                        
+
                 # Add built-in user
                 if not self.skip_init_check_cbserver:
                     self.add_built_in_server_user(node=self.master)
@@ -324,14 +342,27 @@ class BaseTestCase(unittest.TestCase):
                 self.change_port_info()
             if self.input.param("port", None):
                 self.port = str(self.input.param("port", None))
+
+            if self.enable_dp:
+                for node in self.servers:
+                    print("Enabling DP for %s" % node)
+                    cli = CouchbaseCLI(node)
+                    cli.enable_dp()
+            # Perform a custom rebalance by setting input param `custom_rebalance` to True
+            # and implement the make_cluster method in a child class. This works by setting
+            # skip_rebalance to True and then calling your custom rebalance method.
+            if self.input.param("custom_rebalance", False):
+                self.input.test_params["skip_rebalance"] = True
+                self.custom_rebalance()
+
             try:
                 if (str(self.__class__).find('rebalanceout.RebalanceOutTests') != -1) or \
                         (str(self.__class__).find('memorysanitytests.MemorySanity') != -1) or \
-                                str(self.__class__).find('negativetests.NegativeTests') != -1 or \
-                                str(self.__class__).find('warmuptest.WarmUpTests') != -1 or \
-                                str(self.__class__).find('failover.failovertests.FailoverTests') != -1 or \
-                                str(self.__class__).find('observe.observeseqnotests.ObserveSeqNoTests') != -1 or \
-                                str(self.__class__).find('epengine.lwwepengine.LWW_EP_Engine') != -1:
+                        str(self.__class__).find('negativetests.NegativeTests') != -1 or \
+                        str(self.__class__).find('warmuptest.WarmUpTests') != -1 or \
+                        str(self.__class__).find('failover.failovertests.FailoverTests') != -1 or \
+                        str(self.__class__).find('observe.observeseqnotests.ObserveSeqNoTests') != -1 or \
+                        str(self.__class__).find('epengine.lwwepengine.LWW_EP_Engine') != -1:
 
                     self.services = self.get_services(self.servers, self.services_init)
                     # rebalance all nodes into the cluster before each test
@@ -358,10 +389,10 @@ class BaseTestCase(unittest.TestCase):
                     self.services = self.get_services(self.servers, self.services_init)
                     if self.num_servers > 1:
                         self.cluster.rebalance(self.servers, self.servers[1:],
-                                           [], services=self.services)
+                                               [], services=self.services)
                 self.setDebugLevel(service_type="index")
                 if not self.disable_diag_eval_on_non_local_host and \
-                                   not self.skip_init_check_cbserver:
+                        not self.skip_init_check_cbserver:
                     self.enable_diag_eval_on_non_local_hosts()
             except BaseException as e:
                 # increase case_number to retry tearDown in setup for the next test
@@ -381,7 +412,7 @@ class BaseTestCase(unittest.TestCase):
                     to get the correct RAM quota available to create bucket(s)
                     after all services were set """
                 node_info = RestConnection(self.master).get_nodes_self()
-                if node_info.memoryQuota and int(node_info.memoryQuota) > 0 :
+                if node_info.memoryQuota and int(node_info.memoryQuota) > 0:
                     ram_available = node_info.memoryQuota
                 else:
                     ram_available = self.quota
@@ -391,8 +422,8 @@ class BaseTestCase(unittest.TestCase):
                             we need to set bucket size to dgm setting """
                         self.bucket_size = self.quota
                     else:
-                        self.bucket_size = self._get_bucket_size(ram_available,\
-                                                            self.total_buckets)
+                        self.bucket_size = self._get_bucket_size(ram_available,
+                                                                 self.total_buckets)
 
             self.bucket_base_params['membase']['non_ephemeral']['size'] = self.bucket_size
             self.bucket_base_params['membase']['ephemeral']['size'] = self.bucket_size
@@ -402,24 +433,38 @@ class BaseTestCase(unittest.TestCase):
                     str(self.__class__).find('newupgradetests') == -1 and \
                     not self.skip_bucket_setup:
                 self._bucket_creation()
+
             self.log.info("==============  basetestcase setup was finished for test #{0} {1} =============="
                           .format(self.case_number, self._testMethodName))
-            
-            if self.ntonencrypt == 'enable' and not self.x509enable:
-                self.setup_nton_encryption()
-            
+
+
+            #if self.ntonencrypt == 'enable' and not self.x509enable:
+            #    self.setup_nton_encryption()
+
             if self.enable_secrets:
                 self._setup_node_secret(self.secret_password)
-            
+
             if not self.skip_init_check_cbserver:
                 status, content, header = self._log_start(self)
                 if not status:
                     self.sleep(10)
+                if not self.skip_log_scan:
+                    self.log_scan_file_prefix = f'{self._testMethodName}_test_{self.case_number}'
+                    _tasks = self.cluster.async_log_scan(self.servers, self.log_scan_file_prefix+"_BEFORE")
+                    for _task in _tasks:
+                        _task.result()
             self.print_cluster_stats()
         except Exception as e:
             traceback.print_exc()
             self.cluster.shutdown(force=True)
             self.fail(e)
+
+    def custom_rebalance(self):
+        """ Override this method to perform a custom rebalance
+
+        To skip testrunner's default rebalance, implement this method in a child class.
+        """
+        raise NotImplementedError("Please Implement this method")
 
     def print_cluster_stats(self):
         cluster_stats = RestConnection(self.master).get_cluster_stats()
@@ -428,22 +473,68 @@ class BaseTestCase(unittest.TestCase):
             self.log.info("{0} => {1}".format(cluster_node, node_stats))
         self.log.info("--- End of cluster statistics ---")
 
-    def get_cbcollect_info(self, server):
+    def get_cbcollect_info(self, servers):
         """Collect cbcollectinfo logs for all the servers in the cluster.
         """
         path = TestInputSingleton.input.param("logs_folder", "/tmp")
-        print(("grabbing cbcollect from {0}".format(server.ip)))
         path = path or "."
-        try:
-            cbcollectRunner(server, path).run()
+        runner = cbcollectRunner(servers, path, log=self.log)
+        runner.run()
+        if len(runner.succ) > 0:
             TestInputSingleton.input.test_params[
                 "get-cbcollect-info"] = False
-        except Exception as e:
+        for (server, e) in runner.fail:
             self.log.error("IMPOSSIBLE TO GRAB CBCOLLECT FROM {0}: {1}"
                            .format(server.ip, e))
 
+    def compare_logscan_keyword_count(self):
+        keyword_count_before_filename = self.log_scan_file_prefix+"_BEFORE"
+        keyword_count_after_filename = self.log_scan_file_prefix+"_AFTER"
+        keyword_count_diff = {}
+        for server in self.servers:
+            before_keyword_counts = {}
+            after_keyword_counts = {}
+            before_file_exists = False
+            after_file_exists = False
+            if os.path.exists(f'{server.ip}_{keyword_count_before_filename}'):
+                before_file_exists = True
+                s = open(f'{server.ip}_{keyword_count_before_filename}', 'r').read()
+                before_keyword_counts = ast.literal_eval(s)
+                os.remove(f'{server.ip}_{keyword_count_before_filename}')
+            if os.path.exists(f'{server.ip}_{keyword_count_after_filename}'):
+                after_file_exists = True
+                s = open(f'{server.ip}_{keyword_count_after_filename}', 'r').read()
+                after_keyword_counts = ast.literal_eval(s)
+                os.remove(f'{server.ip}_{keyword_count_after_filename}')
+
+            if before_file_exists and after_file_exists:
+                for log, keyword_count in after_keyword_counts.items():
+                    if log in before_keyword_counts.keys():
+                        for keyword, count in keyword_count.items():
+                            if keyword in before_keyword_counts[log].keys():
+                                if count > before_keyword_counts[log][keyword]:
+                                    keyword_count_diff[f'{server.ip}:{log}:{keyword}'] = int(count) - int(before_keyword_counts[log][keyword])
+                            else:
+                                keyword_count_diff[f'{server.ip}:{log}:{keyword}'] = count
+                    else:
+                        keyword_count_diff[f'{server.ip}:{log}'] = keyword_count
+
+        return keyword_count_diff
+
     def tearDown(self):
         self.print_cluster_stats()
+
+        self.log_scan_file_prefix = f'{self._testMethodName}_test_{self.case_number}'
+        collect_logs = False
+        keyword_count_diff = {}
+        if not self.skip_log_scan:
+            _tasks = self.cluster.async_log_scan(self.servers, self.log_scan_file_prefix+"_AFTER")
+            for _task in _tasks:
+                _task.result()
+
+            keyword_count_diff = self.compare_logscan_keyword_count()
+            if keyword_count_diff:
+                collect_logs = True
 
         if self.skip_setup_cleanup:
             return
@@ -461,12 +552,10 @@ class BaseTestCase(unittest.TestCase):
                 self.log.warning("CLEANUP WAS SKIPPED")
             else:
 
-                if test_failed:
+                if test_failed or collect_logs:
                     # collect logs here instead of in test runner because we have not shut things down
-                    if TestInputSingleton.param("get-cbcollect-info", False):
-                        for server in self.servers:
-                            self.log.info("Collecting logs @ {0}".format(server.ip))
-                            self.get_cbcollect_info(server)
+                    if TestInputSingleton.input.param("get-cbcollect-info", False) or collect_logs:
+                        self.get_cbcollect_info(self.servers)
                         # collected logs so turn it off so it is not done later
                         TestInputSingleton.input.test_params["get-cbcollect-info"] = False
 
@@ -482,10 +571,6 @@ class BaseTestCase(unittest.TestCase):
                                 pass
                     if self.input.param('BUGS', False):
                         self.log.warning("Test failed. Possible reason is: {0}".format(self.input.param('BUGS', False)))
-
-
-
-
 
                 self.log.info("==============  basetestcase cleanup was started for test #{0} {1} ==============" \
                               .format(self.case_number, self._testMethodName))
@@ -505,10 +590,15 @@ class BaseTestCase(unittest.TestCase):
                     stopped = rest.stop_rebalance()
                     self.assertTrue(stopped, msg="unable to stop rebalance")
                 BucketOperationHelper.delete_all_buckets_or_assert(self.servers, self)
+                sleep_after_bucket_deletion = self.input.param("sleep_after_bucket_deletion", None)
+                if sleep_after_bucket_deletion:
+                        self.sleep(sleep_after_bucket_deletion)
                 ClusterOperationHelper.cleanup_cluster(self.servers, master=self.master)
                 ClusterOperationHelper.wait_for_ns_servers_or_assert(self.servers, self)
-                if self.ntonencrypt == 'enable' and not self.x509enable:
-                    ntonencryptionBase().disable_nton_cluster(self.servers)
+                #if self.ntonencrypt == 'enable' and not self.x509enable:
+                #    ntonencryptionBase().disable_nton_cluster(self.servers)
+                if self.input.param("disable_ipv6_grub", False):
+                    self._enable_ipv6_grub()
                 self.log.info("==============  basetestcase cleanup was finished for test #{0} {1} ==============" \
                               .format(self.case_number, self._testMethodName))
         except BaseException:
@@ -517,18 +607,19 @@ class BaseTestCase(unittest.TestCase):
             # increase case_number to retry tearDown in setup for the next test
             self.case_number += 1000
         finally:
+
             self.log.info("closing all ssh connections")
             for ins in RemoteMachineShellConnection.get_instances():
-                #self.log.info(str(ins))
+                # self.log.info(str(ins))
                 ins.disconnect()
 
             self.log.info("closing all memcached connections")
             for ins in MemcachedClient.get_instances():
-                #self.log.info(str(ins))
+                # self.log.info(str(ins))
                 ins.close()
 
             for ins in MC_MemcachedClient.get_instances():
-                #self.log.info(str(ins))
+                # self.log.info(str(ins))
                 ins.close()
 
             if not self.input.param("skip_cleanup", False):
@@ -539,6 +630,8 @@ class BaseTestCase(unittest.TestCase):
             else:
                 self.reset_env_variables()
             self.cluster.shutdown(force=True)
+            if not self.skip_log_scan and keyword_count_diff:
+                self.fail(f'Log scan completed, detected new occurrences of error keywords : {keyword_count_diff}')
             self._log_finish(self)
 
     def get_index_map(self):
@@ -588,9 +681,8 @@ class BaseTestCase(unittest.TestCase):
         BucketOperationHelper.delete_all_buckets_or_assert(self.servers, self)
         ClusterOperationHelper.cleanup_cluster(self.servers, master=self.master)
         # all required checks are implemented in ClusterOperationHelper.cleanup_cluster
-        #self.sleep(10)
+        # self.sleep(10)
         ClusterOperationHelper.wait_for_ns_servers_or_assert(self.servers, self)
-
 
     def _initialize_nodes(self, cluster, servers, disabled_consistent_view=None, rebalanceIndexWaitingDisabled=None,
                           rebalanceIndexPausingDisabled=None, maxParallelIndexers=None, maxParallelReplicaIndexers=None,
@@ -606,18 +698,18 @@ class BaseTestCase(unittest.TestCase):
                     assigned_services = None
             else:
                 if services is not None:
-                   assigned_services = []
-                   if len(servers) == len(services):
-                       if len(assigned_services) == 1 :
-                           assigned_services[0] = services[count]
-                       else:
-                           assigned_services.append(services[count])
-                       count += 1
-                   elif len(servers) > len(services):
-                       self.log.info("service will set to first element")
-                       assigned_services.append(services[0])
+                    assigned_services = []
+                    if len(servers) == len(services):
+                        if len(assigned_services) == 1:
+                            assigned_services[0] = services[count]
+                        else:
+                            assigned_services.append(services[count])
+                        count += 1
+                    elif len(servers) > len(services):
+                        self.log.info("service will set to first element")
+                        assigned_services.append(services[0])
                 else:
-                   assigned_services = None
+                    assigned_services = None
             init_tasks.append(cluster.async_init_node(server, disabled_consistent_view, rebalanceIndexWaitingDisabled,
                                                       rebalanceIndexPausingDisabled, maxParallelIndexers,
                                                       maxParallelReplicaIndexers, init_port,
@@ -674,6 +766,8 @@ class BaseTestCase(unittest.TestCase):
         bucket_params['lww'] = lww
         bucket_params['maxTTL'] = maxttl
         bucket_params['compressionMode'] = compression_mode
+        if bucket_type == "membase":
+            bucket_params['bucket_storage'] = self.bucket_storage
         return bucket_params
 
     def _bucket_creation(self):
@@ -686,13 +780,12 @@ class BaseTestCase(unittest.TestCase):
                 maxttl=self.maxttl, compression_mode=self.compression_mode)
             self.cluster.create_default_bucket(default_params)
             self.buckets.append(Bucket(name=self.default_bucket_name,
-                                       authType="sasl",
-                                       saslPassword="",
                                        num_replicas=self.num_replicas,
                                        bucket_size=self.bucket_size,
                                        eviction_policy=self.eviction_policy,
                                        lww=self.lww,
-                                       type=self.bucket_type))
+                                       type=self.bucket_type,
+                                       bucket_storage=self.bucket_storage))
             if self.enable_time_sync:
                 self._set_time_sync_on_buckets([self.default_bucket_name])
 
@@ -702,27 +795,6 @@ class BaseTestCase(unittest.TestCase):
 
         if len(self.master.collections_map):
             self._create_scope_collection()
-
-        if self.magma_storage:
-            command = "backend"
-            value = "magma"
-            self.log.info("Changing the bucket properties by changing {0} to {1}".
-                          format(command, value))
-            rest = RestConnection(self.master)
-
-            shell = RemoteMachineShellConnection(self.master)
-            shell.enable_diag_eval_on_non_local_hosts()
-            shell.disconnect()
-            for bucket in self.buckets:
-                cmd = 'ns_bucket:update_bucket_props("%s", [{extra_config_string, "%s=%s"}]).'%(bucket.name, command, value)
-                rest.diag_eval(cmd)
-
-            # Restart Memcached in all cluster nodes to reflect the settings
-            for server in self.get_kv_nodes(master=self.master):
-                shell = RemoteMachineShellConnection(server)
-                shell.restart_couchbase()
-                shell.disconnect()
-                self.wait_node_restarted(server)
 
     def _create_scope_collection(self):
         collection_tasks = []
@@ -758,28 +830,28 @@ class BaseTestCase(unittest.TestCase):
         memcache_credentials = {}
         for s in self.servers:
             memcache_admin, memcache_admin_password = RestConnection(s).get_admin_credentials()
-            memcache_credentials[s.ip] = {'id':memcache_admin, 'password':memcache_admin_password}
+            memcache_credentials[s.ip] = {'id': memcache_admin, 'password': memcache_admin_password}
 
             # this is a failed optimization, in theory sasl could be done here but it didn't work
-            #client = MemcachedClient(s.ip, 11210)
-            #client.sasl_auth_plain(memcache_credentials[s.ip]['id'], memcache_credentials[s.ip]['password'])
+            # client = MemcachedClient(s.ip, 11210)
+            # client.sasl_auth_plain(memcache_credentials[s.ip]['id'], memcache_credentials[s.ip]['password'])
 
         for b in buckets:
-            client1 = VBucketAwareMemcached( RestConnection(self.master), b)
+            client1 = VBucketAwareMemcached(RestConnection(self.master), b)
 
             for j in range(self.vbuckets):
-                #print 'doing vbucket', j
-                #try:
-                    active_vbucket = client1.memcached_for_vbucket ( j )
-                    #print memcache_credentials[active_vbucket.host]['id'], memcache_credentials[active_vbucket.host]['password']
-                    active_vbucket.sasl_auth_plain(memcache_credentials[active_vbucket.host]['id'],
-                                          memcache_credentials[active_vbucket.host]['password'])
-                    active_vbucket.bucket_select(b)
-                    result = active_vbucket.set_time_sync_state(j, 1)
-                #except:
-                    #print 'got a failure'
+                # print 'doing vbucket', j
+                # try:
+                active_vbucket = client1.memcached_for_vbucket(j)
+                # print memcache_credentials[active_vbucket.host]['id'], memcache_credentials[active_vbucket.host]['password']
+                active_vbucket.sasl_auth_plain(memcache_credentials[active_vbucket.host]['id'],
+                                               memcache_credentials[active_vbucket.host]['password'])
+                active_vbucket.bucket_select(b)
+                result = active_vbucket.set_time_sync_state(j, 1)
+            # except:
+            # print 'got a failure'
 
-    def _create_sasl_buckets(self, server, num_buckets, server_id=None,\
+    def _create_sasl_buckets(self, server, num_buckets, server_id=None, \
                              bucket_size=None, password='password'):
         if not num_buckets:
             return
@@ -804,8 +876,7 @@ class BaseTestCase(unittest.TestCase):
 
             bucket_tasks.append(self.cluster.async_create_sasl_bucket(
                 name=name, password=password, bucket_params=bucket_params))
-            self.buckets.append(Bucket(name=name, authType="sasl",
-                                       saslPassword=password,
+            self.buckets.append(Bucket(name=name,
                                        num_replicas=self.num_replicas,
                                        bucket_size=self.bucket_size,
                                        master_id=server_id,
@@ -815,7 +886,7 @@ class BaseTestCase(unittest.TestCase):
             task.result(self.wait_timeout * 10)
         if self.enable_time_sync:
             self._set_time_sync_on_buckets(['bucket' + str(i) \
-                                             for i in range(num_buckets)])
+                                            for i in range(num_buckets)])
 
     def _create_standard_buckets(self, server, num_buckets, server_id=None, bucket_size=None):
         if not num_buckets:
@@ -844,13 +915,16 @@ class BaseTestCase(unittest.TestCase):
                 bucket_priority = self.get_bucket_priority(self.standard_bucket_priority[i])
 
             bucket_params['bucket_priority'] = bucket_priority
+            bucket_params['bucket_storage'] = self.bucket_storage
             bucket_tasks.append(self.cluster.async_create_standard_bucket(name=name, port=port,
                                                                           bucket_params=bucket_params))
-            self.buckets.append(Bucket(name=name, authType=None, saslPassword=None,
+            self.buckets.append(Bucket(name=name,
                                        num_replicas=self.num_replicas,
                                        bucket_size=self.bucket_size,
                                        port=port, master_id=server_id,
-                                       eviction_policy=self.eviction_policy, lww=self.lww))
+                                       eviction_policy=self.eviction_policy,
+                                       bucket_storage=self.bucket_storage,
+                                       lww=self.lww))
 
         for task in bucket_tasks:
             task.result(self.wait_timeout * 10)
@@ -881,19 +955,21 @@ class BaseTestCase(unittest.TestCase):
             if self.standard_bucket_priority is not None:
                 bucket_priority = self.get_bucket_priority(self.standard_bucket_priority[i])
 
-            standard_params['bucket_priority']=bucket_priority
-            bucket_tasks.append(self.cluster.async_create_standard_bucket(name=bucket_name,port=STANDARD_BUCKET_PORT+i,
-                                                                          bucket_params=standard_params))
-            self.buckets.append(Bucket(name=bucket_name, authType=None, saslPassword=None,
+            standard_params['bucket_priority'] = bucket_priority
+            bucket_tasks.append(
+                self.cluster.async_create_standard_bucket(name=bucket_name, port=STANDARD_BUCKET_PORT + i,
+                                                          bucket_params=standard_params))
+            self.buckets.append(Bucket(name=bucket_name,
                                        num_replicas=self.num_replicas,
                                        bucket_size=bucket_size,
                                        port=STANDARD_BUCKET_PORT + i, master_id=server_id,
-                                       eviction_policy=self.eviction_policy, type=self.bucket_type));
+                                       eviction_policy=self.eviction_policy, type=self.bucket_type,
+                                       bucket_storage=self.bucket_storage));
         for task in bucket_tasks:
             task.result(self.wait_timeout * 10)
 
         if self.enable_time_sync:
-            self._set_time_sync_on_bucket( bucket_list )
+            self._set_time_sync_on_bucket(bucket_list)
 
     def _create_memcached_buckets(self, server, num_buckets, server_id=None, bucket_size=None):
         if not num_buckets:
@@ -921,7 +997,7 @@ class BaseTestCase(unittest.TestCase):
 
             bucket_tasks.append(self.cluster.async_create_memcached_bucket(name=name, port=port,
                                                                            bucket_params=bucket_params))
-            self.buckets.append(Bucket(name=name, authType=None, saslPassword=None,
+            self.buckets.append(Bucket(name=name,
                                        num_replicas=self.num_replicas,
                                        bucket_size=bucket_size, port=port,
                                        master_id=server_id, type='memcached'));
@@ -945,7 +1021,7 @@ class BaseTestCase(unittest.TestCase):
         for task in flush_tasks:
             task.result()
 
-    def _verify_stats_all_buckets(self, servers, master=None, timeout=60, collection=None):
+    def _verify_stats_all_buckets(self, servers, master=None, timeout=60, scope=None, collection=None):
         stats_tasks = []
         if not master:
             master = self.master
@@ -1008,15 +1084,19 @@ class BaseTestCase(unittest.TestCase):
 
     def _async_load_all_buckets(self, server, kv_gen, op_type, exp, kv_store=1, flag=0,
                                 only_store_hash=True, batch_size=1, pause_secs=1, timeout_secs=30,
-                                proxy_client=None, collection=None):
+                                proxy_client=None, scope=None, collection=None):
         tasks = []
-        if kv_gen.isGenerator():
+        use_to_check_generator = kv_gen
+        if isinstance(kv_gen, list):
+            # Assuming all generators in list are of the same type
+            use_to_check_generator = kv_gen[0]
+        if use_to_check_generator.isGenerator():
             for bucket in self.buckets:
                 gen = copy.deepcopy(kv_gen)
-                try :
+                try:
                     len(self.collection_name[bucket.name])
                 except KeyError:
-                    self.collection_name[bucket.name] =[]
+                    self.collection_name[bucket.name] = {}
                 if not collection and (len(self.collection_name[bucket.name]) > 0):
                     for collections in self.collection_name[bucket.name]:
                         gen = copy.deepcopy(kv_gen)
@@ -1025,27 +1105,57 @@ class BaseTestCase(unittest.TestCase):
                                                                           bucket.kvs[kv_store],
                                                                           op_type, exp, flag, only_store_hash,
                                                                           batch_size, pause_secs, timeout_secs,
-                                                                          proxy_client, compression=self.sdk_compression,collection=collections))
+                                                                          proxy_client,
+                                                                          compression=self.sdk_compression,
+                                                                          scope=scope, collection=collections))
                         else:
                             self._load_memcached_bucket(server, gen, bucket.name, collections)
 
                 else:
                     if bucket.type != 'memcached':
-                            tasks.append(self.cluster.async_load_gen_docs(server, bucket.name, gen,
-                                                                          bucket.kvs[kv_store],
-                                                                          op_type, exp, flag, only_store_hash,
-                                                                          batch_size, pause_secs, timeout_secs,
-                                                                          proxy_client, compression=self.sdk_compression,collection=collection))
+                        tasks.append(self.cluster.async_load_gen_docs(server, bucket.name, gen,
+                                                                      bucket.kvs[kv_store],
+                                                                      op_type, exp, flag, only_store_hash,
+                                                                      batch_size, pause_secs, timeout_secs,
+                                                                      proxy_client, compression=self.sdk_compression,
+                                                                      scope=scope, collection=collection))
                     else:
-                        self._load_memcached_bucket(server, gen, bucket.name, collection)
+                        self._load_memcached_bucket(server, gen, bucket.name, scope=scope, collection=collection)
         else:
+            # Java SDK Client
             for bucket in self.buckets:
                 tasks.append(self.cluster.async_load_gen_docs(server, bucket, kv_gen, pause_secs=1,
-                        timeout_secs=300))
+                                                              timeout_secs=300))
+        return tasks
+
+    def data_ops_javasdk_loader_in_batches(self, sdk_data_loader, batch_size):
+        start_document = sdk_data_loader.get_start_seq_num()
+        tot_num_items_in_collection = sdk_data_loader.get_num_ops()
+        batches = []
+        for start in range(0, tot_num_items_in_collection, batch_size):
+            end = start + batch_size
+            if end >= tot_num_items_in_collection:
+                end = tot_num_items_in_collection
+            num_ops = end - start
+            start_seq = start + start_document
+
+            loader_batch = copy.deepcopy(sdk_data_loader)
+            loader_batch.set_num_ops(num_ops)
+            loader_batch.set_start_seq_num(start_seq)
+            batches.append(loader_batch)
+
+        self.log.info("Number of batches : {0}".format(len(batches)))
+        self.sleep(10)
+        tasks = []
+        for bucket in self.buckets:
+            for batch in batches:
+                tasks.append(self.cluster.async_load_gen_docs(self.master, bucket, batch, pause_secs=1,
+                                                              timeout_secs=300))
+
+        self.log.info("done")
         return tasks
 
     """Synchronously applys load generation to all bucekts in the cluster.
-
     Args:
         server - A server in the cluster. (TestInputServer)
         kv_gen - The generator to use to generate load. (DocumentGenerator)
@@ -1053,10 +1163,9 @@ class BaseTestCase(unittest.TestCase):
         exp - The expiration for the items if updated or created (int)
         kv_store - The index of the bucket's kv_store to use. (int)
     """
-
     def _load_all_buckets(self, server, kv_gen, op_type="create", exp=0, kv_store=1, flag=0,
                           only_store_hash=True, batch_size=1000, pause_secs=1,
-                          timeout_secs=30, proxy_client=None, collection=None):
+                          timeout_secs=30, proxy_client=None, scope=None, collection=None):
 
         if self.enable_bloom_filter:
             for bucket in self.buckets:
@@ -1065,7 +1174,7 @@ class BaseTestCase(unittest.TestCase):
 
         tasks = self._async_load_all_buckets(server, kv_gen, op_type, exp, kv_store, flag,
                                              only_store_hash, batch_size, pause_secs,
-                                             timeout_secs, proxy_client, collection)
+                                             timeout_secs, proxy_client, scope=scope, collection=collection)
 
         for task in tasks:
             task.result()
@@ -1074,7 +1183,11 @@ class BaseTestCase(unittest.TestCase):
            Load bucket to DGM if params active_resident_threshold is passed
         """
         if self.active_resident_threshold < 100.0:
-            if kv_gen.isGenerator():
+            use_to_check_generator = kv_gen
+            if isinstance(kv_gen, list):
+                # Assuming all generators in list are of the same type
+                use_to_check_generator = kv_gen[0]
+            if use_to_check_generator.isGenerator():
                 stats_all_buckets = {}
                 for bucket in self.buckets:
                     stats_all_buckets[bucket.name] = StatsCommon()
@@ -1087,12 +1200,12 @@ class BaseTestCase(unittest.TestCase):
                             rest.get_bucket_stats(bucket)['vb_active_resident_items_ratio']
                         if active_resident >= self.active_resident_threshold:
                             self.log.info(
-                                "resident ratio is %s > %s for %s in bucket %s.\n"\
+                                "resident ratio is %s > %s for %s in bucket %s.\n" \
                                 " Continue loading to the cluster" %
-                                                   (active_resident,
-                                                    self.active_resident_threshold,
-                                                    self.master.ip,
-                                                    bucket.name))
+                                (active_resident,
+                                 self.active_resident_threshold,
+                                 self.master.ip,
+                                 bucket.name))
                             random_key = self.key_generator()
                             generate_load = BlobGenerator(random_key,
                                                           '%s-' % random_key,
@@ -1102,40 +1215,40 @@ class BaseTestCase(unittest.TestCase):
                                               "create", exp=0, kv_store=1, flag=0,
                                               only_store_hash=True,
                                               batch_size=batch_size,
-                                              pause_secs=5, timeout_secs=60, collection=collection)
+                                              pause_secs=5, timeout_secs=60, scope=scope, collection=collection)
                         else:
                             threshold_reached = True
-                            self.log.info("\n DGM state achieved at %s %% for %s in bucket %s!"\
-                                                                         % (active_resident,
-                                                                            self.master.ip,
-                                                                            bucket.name))
+                            self.log.info("\n DGM state achieved at %s %% for %s in bucket %s!" \
+                                          % (active_resident,
+                                             self.master.ip,
+                                             bucket.name))
                             break
 
     def _async_load_bucket(self, bucket, server, kv_gen, op_type, exp, kv_store=1, flag=0, only_store_hash=True,
-                           batch_size=1000, pause_secs=1, timeout_secs=30, collection=None):
+                           batch_size=1000, pause_secs=1, timeout_secs=30, scope=None, collection=None):
         gen = copy.deepcopy(kv_gen)
         task = self.cluster.async_load_gen_docs(server, bucket.name, gen,
                                                 bucket.kvs[kv_store], op_type,
                                                 exp, flag, only_store_hash,
                                                 batch_size, pause_secs, timeout_secs,
-                                                compression=self.sdk_compression, collection=collection)
+                                                compression=self.sdk_compression, scope=scope, collection=collection)
         return task
 
     def _load_bucket(self, bucket, server, kv_gen, op_type, exp, kv_store=1, flag=0, only_store_hash=True,
-                     batch_size=1000, pause_secs=1, timeout_secs=30, collection=None):
+                     batch_size=1000, pause_secs=1, timeout_secs=30, scope=None, collection=None):
         task = self._async_load_bucket(bucket, server, kv_gen, op_type, exp, kv_store, flag, only_store_hash,
-                                       batch_size, pause_secs, timeout_secs, collection=collection)
+                                       batch_size, pause_secs, timeout_secs, scope=scope, collection=collection)
         task.result()
 
     # Load all the buckets until there is no more memory
     # Assumption - all buckets are ephemeral
     # Work in progress
 
-    def _load_all_ephemeral_buckets_until_no_more_memory(self, server, kv_gen, op_type, exp, increment, kv_store=1, flag=0,
-                          only_store_hash=True, batch_size=1000, pause_secs=1, timeout_secs=30,
-                          proxy_client=None, percentage=0.90):
-
-
+    def _load_all_ephemeral_buckets_until_no_more_memory(self, server, kv_gen, op_type, exp, increment, kv_store=1,
+                                                         flag=0,
+                                                         only_store_hash=True, batch_size=1000, pause_secs=1,
+                                                         timeout_secs=30,
+                                                         proxy_client=None, percentage=0.90):
 
         stats_all_buckets = {}
         for bucket in self.buckets:
@@ -1146,7 +1259,7 @@ class BaseTestCase(unittest.TestCase):
             while not memory_is_full:
                 memory_used = \
                     stats_all_buckets[bucket.name].get_stats([self.master], bucket, '',
-                                                             'mem_used')[ server]
+                                                             'mem_used')[server]
                 # memory is considered full if mem_used is at say 90% of the available memory
                 if int(memory_used) < percentage * self.bucket_size * 1000000:
                     self.log.info(
@@ -1154,7 +1267,7 @@ class BaseTestCase(unittest.TestCase):
                         (memory_used, self.bucket_size, self.master.ip, bucket.name))
 
                     self._load_bucket(bucket, self.master, kv_gen, "create", exp=0, kv_store=1, flag=0,
-                    only_store_hash=True, batch_size=batch_size, pause_secs=5, timeout_secs=60)
+                                      only_store_hash=True, batch_size=batch_size, pause_secs=5, timeout_secs=60)
                     kv_gen.start = kv_gen.start + increment
                     kv_gen.end = kv_gen.end + increment
                     kv_gen = BlobGenerator('key-root', 'param2', self.value_size, start=kv_gen.start, end=kv_gen.end)
@@ -1179,9 +1292,9 @@ class BaseTestCase(unittest.TestCase):
         timeout - Waiting the end of the thread. (str)
     """
 
-    def _wait_for_stats_all_buckets(self, servers, ep_queue_size=0, \
+    def _wait_for_stats_all_buckets(self, servers, ep_queue_size=0,
                                     ep_queue_size_cond='==',
-                                    check_ep_items_remaining=False, timeout=360, collection=None):
+                                    check_ep_items_remaining=False, timeout=360, scope=None, collection=None):
         tasks = []
         servers = self.get_kv_nodes(servers)
         for server in servers:
@@ -1228,31 +1341,28 @@ class BaseTestCase(unittest.TestCase):
     """
 
     def _verify_all_buckets(self, server, kv_store=1, timeout=180, max_verify=None, only_store_hash=True,
-                            batch_size=1000,
-                            replica_to_read=None, collection_name=None):
-        tasks = []
-
-        if len(self.buckets) > 1:
-            batch_size = 1
+                            batch_size=1000, replica_to_read=None, scope=None, collection_name=None):
         for bucket in self.buckets:
-            try :
+            try:
                 len(self.collection_name[bucket.name])
             except KeyError:
-                self.collection_name[bucket.name] =[]
+                self.collection_name[bucket.name] = {}
             if bucket.type == 'memcached':
                 continue
-            #self.collection_bucket=self.collection_name[bucket]
+            # self.collection_bucket=self.collection_name[bucket]
             if not collection_name and (len(self.collection_name[bucket.name]) > 0):
                 for collections in self.collection_name[bucket.name]:
-                    tasks.append(self.cluster.async_verify_data(server, bucket, bucket.kvs[kv_store], max_verify,
-                                                        only_store_hash, batch_size, replica_to_read,
-                                                        compression=self.sdk_compression, collection=collections))
+                    task = self.cluster.async_verify_data(server, bucket, bucket.kvs[kv_store], max_verify,
+                                                                only_store_hash, batch_size, replica_to_read,
+                                                                compression=self.sdk_compression,
+                                                                scope=scope, collection=collections)
+                    task.result(timeout)
             else:
-                tasks.append(self.cluster.async_verify_data(server, bucket, bucket.kvs[kv_store], max_verify,
-                                                        only_store_hash, batch_size, replica_to_read,
-                                                        compression=self.sdk_compression, collection=collection_name))
-        for task in tasks:
-            task.result(timeout)
+                task = self.cluster.async_verify_data(server, bucket, bucket.kvs[kv_store], max_verify,
+                                                            only_store_hash, batch_size, replica_to_read,
+                                                            compression=self.sdk_compression,
+                                                            scope=scope, collection=collection_name)
+                task.result(timeout)
 
     def disable_compaction(self, server=None, bucket="default"):
 
@@ -1315,7 +1425,7 @@ class BaseTestCase(unittest.TestCase):
     def verify_cluster_stats(self, servers=None, master=None, max_verify=None,
                              timeout=None, check_items=True, only_store_hash=True,
                              replica_to_read=None, batch_size=1000, check_bucket_stats=True,
-                             check_ep_items_remaining=False, verify_total_items=True, collection=None):
+                             check_ep_items_remaining=False, verify_total_items=True, scope=None, collection=None):
         servers = self.get_kv_nodes(servers)
         if servers is None:
             servers = self.servers
@@ -1330,14 +1440,14 @@ class BaseTestCase(unittest.TestCase):
             try:
                 self._verify_all_buckets(master, timeout=timeout, max_verify=max_verify,
                                          only_store_hash=only_store_hash, replica_to_read=replica_to_read,
-                                         batch_size=batch_size, collection_name=collection)
+                                         batch_size=batch_size, scope=scope, collection_name=collection)
             except ValueError as e:
                 """ get/verify stats if 'ValueError: Not able to get values
                                              for following keys' was gotten """
-                self._verify_stats_all_buckets(servers, timeout=(timeout or 120), collection=collection)
+                self._verify_stats_all_buckets(servers, timeout=(timeout or 120), scope=scope, collection=collection)
                 raise e
             if check_bucket_stats:
-                self._verify_stats_all_buckets(servers, timeout=(timeout or 120), collection=collection)
+                self._verify_stats_all_buckets(servers, timeout=(timeout or 120), scope=scope, collection=collection)
             # verify that curr_items_tot corresponds to sum of curr_items from all nodes
             if verify_total_items:
                 verified = True
@@ -1437,6 +1547,9 @@ class BaseTestCase(unittest.TestCase):
                 if server.ip == _node.ip:
                     _servers.append(server)
 
+        _nodes = sorted(_nodes, key=lambda x: x.ip)
+        _servers = sorted(_servers, key=lambda x: x.ip)
+
         self._kill_nodes(_nodes, _servers, bucket_name)
 
         start = time.time()
@@ -1450,8 +1563,10 @@ class BaseTestCase(unittest.TestCase):
                     stats = mc.stats()
                     new_uptime = int(stats["uptime"])
                     self.log.info("New warmup uptime %s:%s" % (
-                        new_uptime, self.pre_warmup_stats[bucket_name]["%s:%s" % (server.ip, server.port)]["uptime"]))
-                    if new_uptime < self.pre_warmup_stats[bucket_name]["%s:%s" % (server.ip, server.port)]["uptime"]:
+                        new_uptime,
+                        int(self.pre_warmup_stats[bucket_name]["%s:%s" % (server.ip, server.port)]["uptime"])))
+                    if new_uptime < int(
+                            self.pre_warmup_stats[bucket_name]["%s:%s" % (server.ip, server.port)]["uptime"]):
                         self.log.info("memcached restarted...")
                         memcached_restarted = True
                         break;
@@ -1518,7 +1633,7 @@ class BaseTestCase(unittest.TestCase):
         shell.disconnect()
         self.fail("Couchbase service is not running after {0} seconds".format(wait_time))
 
-    def _load_memcached_bucket(self, server, gen_load, bucket_name, collection=None):
+    def _load_memcached_bucket(self, server, gen_load, bucket_name, scope=None, collection=None):
         num_tries = 0
         while num_tries < 6:
             try:
@@ -1534,7 +1649,7 @@ class BaseTestCase(unittest.TestCase):
             key, value = next(gen_load)
             for v in range(1024):
                 try:
-                    client.set(key, 0, 0, value, v, collection=collection)
+                    client.set(key, 0, 0, value, v, scope=scope, collection=collection)
                     break
                 except:
                     pass
@@ -1542,7 +1657,7 @@ class BaseTestCase(unittest.TestCase):
 
     def get_nodes_in_cluster(self, master_node=None):
         rest = None
-        if master_node == None:
+        if master_node is None:
             rest = RestConnection(self.master)
         else:
             rest = RestConnection(master_node)
@@ -1550,8 +1665,23 @@ class BaseTestCase(unittest.TestCase):
         server_set = []
         for node in nodes:
             for server in self.servers:
-                if server.ip == node.ip:
-                    server_set.append(server)
+                if ":" not in server.ip and ":" not in node.ip:
+                    """ server.ip maybe Ipv4 or hostname and node.ip is Ipv4 or hostname """
+                    if server.ip == node.ip:
+                        server_set.append(server)
+                elif ":" not in server.ip and ":" in node.ip:
+                    """ server.ip maybe Ipv4 or hostname and node.ip is raw Ipv6 """
+                    shell = RemoteMachineShellConnection(server)
+                    serverIP = shell.get_ip_address()
+                    self.log.info("get raw IP from hostname. Hostname: {0} ; its IPs: {1}" \
+                                      .format(server.ip, serverIP))
+                    if node.ip in serverIP:
+                        server_set.append(server)
+                    shell.disconnect()
+                elif ":" in server.ip and ":" in node.ip:
+                    """ both server.ip and node.ip are raw Ipv6 """
+                    if server.ip == node.ip:
+                        server_set.append(server)
         return server_set
 
     def change_checkpoint_params(self):
@@ -1568,10 +1698,11 @@ class BaseTestCase(unittest.TestCase):
     def change_password(self, new_password="new_password"):
         nodes = RestConnection(self.master).node_statuses()
 
-
-        cli = CouchbaseCLI(self.master, self.master.rest_username, self.master.rest_password  )
-        output, err, result = cli.setting_cluster(data_ramsize=False, index_ramsize=False, fts_ramsize=False, cluster_name=None,
-                         cluster_username=None, cluster_password=new_password, cluster_port=False)
+        cli = CouchbaseCLI(self.master, self.master.rest_username, self.master.rest_password)
+        output, err, result = cli.setting_cluster(data_ramsize=False, index_ramsize=False, fts_ramsize=False,
+                                                  cluster_name=None,
+                                                  cluster_username=None, cluster_password=new_password,
+                                                  cluster_port=False)
 
         self.log.info(output)
         # MB-10136 & MB-9991
@@ -1611,7 +1742,7 @@ class BaseTestCase(unittest.TestCase):
                 dict = {}
                 if self.vbuckets:
                     dict["COUCHBASE_NUM_VBUCKETS"] = self.vbuckets
-                if self.upr != None:
+                if self.upr is not None:
                     if self.upr:
                         dict["COUCHBASE_REPL_TYPE"] = "upr"
                     else:
@@ -1905,7 +2036,7 @@ class BaseTestCase(unittest.TestCase):
                                " % (cbstat_command, node, command, "default", saslpassword)
                     output, error = shell.execute_command(commands)
                 elif versions[0][:5] in testconstants.COUCHBASE_VERSION_3 or \
-                                versions[0][:5] in testconstants.COUCHBASE_FROM_VERSION_4:
+                        versions[0][:5] in testconstants.COUCHBASE_FROM_VERSION_4:
                     command = "dcp"
                     if not info == 'windows':
                         commands = "%s %s:11210 %s -b %s -p \"%s\" | grep :replication:ns_1@%s |  grep vb_uuid | \
@@ -2262,10 +2393,10 @@ class BaseTestCase(unittest.TestCase):
             return
         if testuser is None:
             testuser = [{'id': 'cbadminbucket', 'name': 'cbadminbucket',
-                                                'password': 'password'}]
+                         'password': 'password'}]
         if rolelist is None:
             rolelist = [{'id': 'cbadminbucket', 'name': 'cbadminbucket',
-                                                      'roles': 'admin'}]
+                         'roles': 'admin'}]
 
         self.log.info("**** add built-in '%s' user to node %s ****" % (testuser[0]["name"],
                                                                        node.ip))
@@ -2326,25 +2457,54 @@ class BaseTestCase(unittest.TestCase):
                 shell.disconnect()
                 break
 
+    def reset_and_enable_ipv6(self, node):
+        """ Use the couchbase-cli to set the address family of the node to IPv6
+
+        Deletes all the configuration files to reset the cluster and sets the
+        address family to IPv6.
+        """
+        shell = RemoteMachineShellConnection(node)
+        data_path = RestConnection(node).get_data_path()
+
+        # Stop Couchbase
+        if shell.is_couchbase_installed():
+            shell.stop_couchbase()
+
+        self.sleep(5)
+
+        # Delete Path
+        shell.cleanup_all_configuration(data_path)
+
+        # Start Couchbase
+        if shell.is_couchbase_installed():
+            shell.start_couchbase()
+
+        self.assertTrue(RestHelper(RestConnection(node)).is_ns_server_running(), "Unable to restart Couchbase")
+
+        shell.set_address_family_to_ipv6()
+        shell.disconnect()
+
     def reset_cluster(self):
         if self.targetMaster or self.reset_services:
             try:
-                for node in self.servers:
-                    shell = RemoteMachineShellConnection(node)
-                    # Start node
-                    rest = RestConnection(node)
-                    data_path = rest.get_data_path()
-                    # Stop node
-                    self.stop_server(node)
-                    self.sleep(5)
-                    # Delete Path
-                    shell.cleanup_data_config(data_path)
-                    self.start_server(node)
+                # On IPv6 tests, delete all the configuration files and enable IPv6 on ALL nodes.
+                if self.input.param('enable_ipv6', False):
+                    # Note the list 'self.input.servers' is not the same as 'self.servers'
+                    for node in self.input.servers:
+                        self.reset_and_enable_ipv6(node)
+                else:
+                    for node in self.servers:
+                        shell = RemoteMachineShellConnection(node)
+                        # Start node
+                        rest = RestConnection(node)
+                        data_path = rest.get_data_path()
+                        # Stop node
+                        self.stop_server(node)
+                        self.sleep(5)
+                        # Delete Path
+                        shell.cleanup_data_config(data_path)
+                        self.start_server(node)
 
-                    # If Ipv6 update dist_cfg file post server restart to change distribution to IPv6
-                    if '.com' in node.ip or ':' in node.ip:
-                        self.log.info("Updating dist_cfg for IPv6 Machines")
-                        shell.update_dist_type()
                 self.sleep(10)
             except Exception as ex:
                 self.log.info(ex)
@@ -2438,7 +2598,7 @@ class BaseTestCase(unittest.TestCase):
             self.log.info("cannot find service node {0} in cluster " \
                           .format(service_type))
         else:
-            list = []
+            lst = []
             for server_info in self.services_map[service_type]:
                 tokens = server_info.rsplit(":", 1)
                 ip = tokens[0]
@@ -2463,7 +2623,7 @@ class BaseTestCase(unittest.TestCase):
 
                         for node in nodeList.items:
                             if node.metadata.namespace == currNamespace and \
-                               node.status.pod_ip == server.ip:
+                                    node.status.pod_ip == server.ip:
                                 ip = node.status.pod_ip
                                 break
                     elif "couchbase.com" in server.ip and "couchbase.com" not in ip:
@@ -2477,7 +2637,9 @@ class BaseTestCase(unittest.TestCase):
                                 node.ssh_username = server.ssh_username
                                 node.ssh_password = server.ssh_password
                                 break
-
+                        if node.ssh_username == "" or node.ssh_username == '\n':
+                            node.ssh_username = servers[0].ssh_username
+                            node.ssh_password = servers[0].ssh_password
                         shell = RemoteMachineShellConnection(node)
                         hostname = shell.get_full_hostname()
                         self.log.info("convert IP: {0} to hostname: {1}" \
@@ -2486,13 +2648,13 @@ class BaseTestCase(unittest.TestCase):
                         shell.disconnect()
                     if (port != 8091 and port == int(server.port)) or \
                             (port == 8091 and server.ip.lower() == ip.lower()):
-                        list.append(server)
-            self.log.info("list of {0} nodes in cluster: {1}".format(service_type, list))
+                        lst.append(server)
+            self.log.info("list of {0} nodes in cluster: {1}".format(service_type, lst))
             if get_all_nodes:
-                return list
+                return lst
             else:
                 try:
-                    return list[0]
+                    return lst[0]
                 except IndexError as e:
                     self.log.info(self.services_map)
                     raise e
@@ -2536,18 +2698,18 @@ class BaseTestCase(unittest.TestCase):
                         addNode = False
                         if (self.targetMaster and (not self.targetIndexManager)) \
                                 and (
-                                                compare_string_server == node_info and compare_string_master == compare_string_server):
+                                compare_string_server == node_info and compare_string_master == compare_string_server):
                             addNode = True
                             self.master = self.servers[1]
                         elif ((not self.targetMaster) and (not self.targetIndexManager)) \
                                 and (
-                                                    compare_string_server == node_info and compare_string_master != compare_string_server \
-                                                and compare_string_index_manager != compare_string_server):
+                                compare_string_server == node_info and compare_string_master != compare_string_server \
+                                and compare_string_index_manager != compare_string_server):
                             addNode = True
                         elif ((not self.targetMaster) and self.targetIndexManager) \
                                 and (
-                                                    compare_string_server == node_info and compare_string_master != compare_string_server
-                                        and compare_string_index_manager == compare_string_server):
+                                compare_string_server == node_info and compare_string_master != compare_string_server
+                                and compare_string_index_manager == compare_string_server):
                             addNode = True
                         if addNode and (server not in self.nodes_out_list) and count < service_type_count:
                             count += 1
@@ -2581,7 +2743,7 @@ class BaseTestCase(unittest.TestCase):
 
     def load(self, generators_load, buckets=None, exp=0, flag=0,
              kv_store=1, only_store_hash=True, batch_size=1, pause_secs=1,
-             timeout_secs=30, op_type='create', start_items=0, verify_data=True, collection=None):
+             timeout_secs=30, op_type='create', start_items=0, verify_data=True, scope=None, collection=None):
         if not buckets:
             buckets = self.buckets
         gens_load = {}
@@ -2596,12 +2758,13 @@ class BaseTestCase(unittest.TestCase):
             for gen_load in gens_load[bucket]:
                 items += (gen_load.end - gen_load.start)
         for bucket in buckets:
-            self.log.info("%s %s to %s documents..." % (op_type, items/len(buckets), bucket.name))
+            self.log.info("%s %s to %s documents..." % (op_type, items / len(buckets), bucket.name))
             tasks.append(self.cluster.async_load_gen_docs(self.master, bucket.name,
                                                           gens_load[bucket],
                                                           bucket.kvs[kv_store], op_type, exp, flag,
                                                           only_store_hash, batch_size, pause_secs,
-                                                          timeout_secs, compression=self.sdk_compression, collection=collection))
+                                                          timeout_secs, compression=self.sdk_compression,
+                                                          scope=scope, collection=collection))
         for task in tasks:
             task.result()
         self.num_items = items + start_items
@@ -2612,7 +2775,7 @@ class BaseTestCase(unittest.TestCase):
 
     def async_load(self, generators_load, exp=0, flag=0,
                    kv_store=1, only_store_hash=True, batch_size=1, pause_secs=1,
-                   timeout_secs=30, op_type='create', start_items=0, collection=None):
+                   timeout_secs=30, op_type='create', start_items=0, scope=None, collection=None):
         gens_load = {}
         for bucket in self.buckets:
             tmp_gen = []
@@ -2630,7 +2793,8 @@ class BaseTestCase(unittest.TestCase):
                                                           gens_load[bucket],
                                                           bucket.kvs[kv_store], op_type, exp, flag,
                                                           only_store_hash, batch_size, pause_secs,
-                                                          timeout_secs, compression=self.sdk_compression, collection=collection))
+                                                          timeout_secs, compression=self.sdk_compression,
+                                                          scope=scope, collection=collection))
         self.num_items = items + start_items
         return tasks
 
@@ -2753,7 +2917,8 @@ class BaseTestCase(unittest.TestCase):
                 return servers
         if servers is None:
             servers = self.servers
-        kv_servers = self.get_nodes_from_services_map(service_type="kv", get_all_nodes=True, servers=servers, master=master)
+        kv_servers = self.get_nodes_from_services_map(service_type="kv", get_all_nodes=True, servers=servers,
+                                                      master=master)
         new_servers = []
         for server in servers:
             for kv_server in kv_servers:
@@ -2806,7 +2971,6 @@ class BaseTestCase(unittest.TestCase):
             "ifconfig eth0 | grep 'inet addr:' | cut -d: -f2 |awk '{print $1}'")
         return ipAddress
 
-
     def enable_diag_eval_on_non_local_hosts(self):
         """
         Enable diag/eval to be run on non-local hosts.
@@ -2816,15 +2980,16 @@ class BaseTestCase(unittest.TestCase):
         output, error = remote.enable_diag_eval_on_non_local_hosts()
         if output is not None:
             if "ok" not in str(output):
-                self.log.error("Error in enabling diag/eval on non-local hosts on {}: Error: {}".format(self.master.ip, error))
-                raise Exception("Error in enabling diag/eval on non-local hosts on {}: Error: {}".format(self.master.ip, error))
+                self.log.error(
+                    "Error in enabling diag/eval on non-local hosts on {}: Error: {}".format(self.master.ip, error))
+                raise Exception(
+                    "Error in enabling diag/eval on non-local hosts on {}: Error: {}".format(self.master.ip, error))
             else:
                 self.log.info(
                     "Enabled diag/eval for non-local hosts from {}".format(
                         self.master.ip))
         else:
             self.log.info("Running in compatibility mode, not enabled diag/eval for non-local hosts")
-
 
     # get the dot version e.g. x.y
     def _get_version(self):
@@ -2837,9 +3002,9 @@ class BaseTestCase(unittest.TestCase):
         for bucket in self.buckets:
             self.log.info("Record vbucket for the bucket {0}"
                           .format(bucket.name))
-            map[bucket.name] = RestHelper(RestConnection(master))\
+            map[bucket.name] = RestHelper(RestConnection(master)) \
                 ._get_vbuckets(servers, bucket_name=bucket.name)
-        #self.log.info("Map: {0}".format(map))
+        # self.log.info("Map: {0}".format(map))
         return map
 
     def _validate_seq_no_stats(self, vbucket_stats):
@@ -2908,13 +3073,20 @@ class BaseTestCase(unittest.TestCase):
 
         for server in self.get_kv_nodes(master=self.master):
             for bucket in buckets:
-                mc = MemcachedClient(server.ip, 11210)
-                mc.sasl_auth_plain(self.master.rest_username,
-                                   self.master.rest_password)
-                mc.bucket_select(bucket.name)
+                try:
+                    mc = MemcachedClient(server.ip, 11210)
+                    mc.sasl_auth_plain(self.master.rest_username,
+                                       self.master.rest_password)
+                except:
+                    self.sleep(60)
+                    mc = MemcachedClient(server.ip, 11210)
+                    mc.sasl_auth_plain(self.master.rest_username,
+                                       self.master.rest_password)
+                self.log.info("going to select bucket")
+                mc.bucket_select(str(bucket.name))
                 stats = mc.stats()
                 self.assertEqual(int(stats['ep_flusher_total_batch_limit']),
-                                  flusher_total_batch_limit)
+                                 flusher_total_batch_limit)
 
     def check_retry_rebalance_succeeded(self):
         self.sleep(30)
@@ -2951,7 +3123,45 @@ class BaseTestCase(unittest.TestCase):
             else:
                 self.log.info("Retry rebalanced fixed the rebalance failure")
                 break
-    
+
     def setup_nton_encryption(self):
         self.log.info('Setting up node to node encyrption from ')
-        ntonencryptionBase().setup_nton_cluster(self.servers,clusterEncryptionLevel=self.ntonencrypt_level)
+        ntonencryptionBase().setup_nton_cluster(self.servers, clusterEncryptionLevel=self.ntonencrypt_level)
+
+    def _disable_ipv6_grub(self):
+        self.log.info('Disabling IPV6 Stack at Grub Level for all nodes')
+        IPv6_IPv4(self.servers).disable_IPV6_grub_level()
+
+    def _enable_ipv6_grub(self):
+        self.log.info('Enabling IPV6 Stack at Grub Level for all nodes')
+        IPv6_IPv4(self.servers).enable_IPV6_grub_level()
+
+    def _upgrade_addr_family(self,addr_family):
+        self.log.info('Upgrade Address Family to {0}'.format(addr_family))
+        IPv6_IPv4(self.servers).upgrade_addr_family(addr_family)
+
+    def data_ops_javasdk_loader_in_batches_to_collection(self, bucket,sdk_data_loader, batch_size):
+        start_document = sdk_data_loader.get_start_seq_num()
+        tot_num_items_in_collection = sdk_data_loader.get_num_ops()
+        batches = []
+        for start in range(0, tot_num_items_in_collection, batch_size):
+            end = start + batch_size
+            if end >= tot_num_items_in_collection:
+                end = tot_num_items_in_collection
+            num_ops = end - start
+            start_seq = start + start_document
+
+            loader_batch = copy.deepcopy(sdk_data_loader)
+            loader_batch.set_num_ops(num_ops)
+            loader_batch.set_start_seq_num(start_seq)
+            batches.append(loader_batch)
+
+        self.log.info("Number of batches : {0}".format(len(batches)))
+        self.sleep(10)
+        tasks = []
+        for batch in batches:
+            tasks.append(self.cluster.async_load_gen_docs(self.master, bucket, batch, pause_secs=1,
+                                                      timeout_secs=300))
+
+        self.log.info("done")
+        return tasks

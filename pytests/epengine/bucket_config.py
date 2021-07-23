@@ -167,7 +167,7 @@ class BucketConfig(BaseTestCase):
                 self.servers)
             info = self.rest.get_nodes_self()
             self.rest.create_bucket(bucket=self.bucket,
-                ramQuotaMB=512, authType='sasl', lww=self.lww)
+                ramQuotaMB=512, lww=self.lww)
             try:
                 ready = BucketOperationHelper.wait_for_memcached(self.master,
                     self.bucket)
@@ -182,7 +182,7 @@ class BucketConfig(BaseTestCase):
         info = self.rest.get_nodes_self()
 
         status, content = self.rest.change_bucket_props(bucket=self.bucket,
-            ramQuotaMB=512, authType='sasl', timeSynchronization='enabledWithOutDrift')
+            ramQuotaMB=512, timeSynchronization='enabledWithOutDrift')
         if re.search('TimeSyncronization not allowed in update bucket', content):
             self.log.info('[PASS]Expected modify bucket to disallow Time Synchronization.')
         else:
@@ -195,7 +195,7 @@ class BucketConfig(BaseTestCase):
             time.sleep(10)
             shell.start_couchbase()
             shell.disconnect()
-        time.sleep(30)
+        ClusterOperationHelper.wait_for_ns_servers_or_assert(servers, self, wait_if_warmup=True)
 
     # REBOOT
     def _reboot_server(self):
@@ -213,7 +213,7 @@ class BucketConfig(BaseTestCase):
                     shell.disconnect()
                     self.log.info("Node {0} is being stopped".format(server.ip))
 
-                    time.sleep(120)
+                    ClusterOperationHelper.wait_for_ns_servers_or_assert([server], self, wait_if_warmup=True)
                     shell = RemoteMachineShellConnection(server)
                     command = "/sbin/iptables -F"
                     o, r = shell.execute_command(command)
@@ -222,7 +222,7 @@ class BucketConfig(BaseTestCase):
                     self.log.info("Node {0} backup".format(server.ip))
         finally:
             self.log.info("Warming-up servers ..")
-            time.sleep(100)
+            ClusterOperationHelper.wait_for_ns_servers_or_assert(self.servers, self, wait_if_warmup=True)
 
 
 

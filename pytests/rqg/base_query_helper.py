@@ -952,7 +952,10 @@ class BaseRQGQueryHelper(object):
             value = self._random_char()
         if "NUMERIC_FIELD" in sql:
             field_name = new_sql.replace("NUMERIC_FIELD", random.choice(numeric_field_names))
-            value = str(self._random_int())
+            value = self._random_int()
+            if alias is None:
+               return "{0} = {1}".format(field_name, value)
+            return "{0} = {1}".format(alias+"."+field_name, value)
         if "DATETIME_FIELD" in sql:
             field_name = new_sql.replace("DATETIME_FIELD", random.choice(datetime_field_names))
             value = self._random_datetime()
@@ -993,10 +996,10 @@ class BaseRQGQueryHelper(object):
             projection = " "+table_map[list(table_map.keys())[0]]["alias_name"]+".* "
             new_sql = new_sql.replace("OUTER_BUCKET_NAME.*", projection)
         if "BUCKET_NAME.*" in new_sql:
-            projection = " "+table_map[table_map.keys()[0]]["alias_name"]+".* "
+            projection = " "+table_map[list(table_map.keys())[0]]["alias_name"]+".* "
             new_sql = new_sql.replace("BUCKET_NAME.*", projection)
         if "OUTER_BUCKET_NAME" in new_sql:
-            projection = " "+table_map[table_map.keys()[0]]+" "+table_map[table_map.keys()[0]]["outer_alias_name"]+" "
+            projection = " "+table_map[list(table_map.keys())[0]]+" "+table_map[list(table_map.keys())[0]]["outer_alias_name"]+" "
             new_sql = new_sql.replace("OUTER_BUCKET_NAME.*", projection)
         if "ORDER_BY_SEL_VAL" in sql:
             select_field_names_list = self.extract_field_names(sql_map['select_from'], all_field_names)
@@ -1601,10 +1604,10 @@ class BaseRQGQueryHelper(object):
     def _update_sql_template_to_values(self, target_table="simple_table", source_table="copy_simple_table", sql="", table_map={}):
         tokens = sql.split("WHERE")
         new_sql = " UPDATE {0} ".format(list(table_map.keys())[0])
-        list = []
+        token_list = []
         for field in tokens[0].split("SET")[1].split(","):
-            list.append(self._covert_field_template_for_update(field, table_map))
-        new_sql += " SET " + ",".join(list)
+            token_list.append(self._covert_field_template_for_update(field, table_map))
+        new_sql += " SET " + ",".join(token_list)
         new_sql += " WHERE "+self._convert_condition_template_to_value(tokens[1], table_map)
         return {"sql_query": new_sql, "n1ql_query": self._gen_sql_to_nql(new_sql)}
 
@@ -1826,10 +1829,12 @@ class BaseRQGQueryHelper(object):
         tokens = sql.split(" ")
         string_check = False
         numeric_check = False
+        closed_range = False
         bool_check = False
         datetime_check = False
         add_token = True
         new_sql = ""
+        same_field = ""
         space = " "
         values = ["DEFAULT"]
         for token in tokens:
@@ -1844,6 +1849,17 @@ class BaseRQGQueryHelper(object):
                     add_token = False
                     field_name, values = self._search_field(["varchar", "text", "tinytext", "char"], table_map)
                     new_sql += token.replace("STRING_FIELD", field_name)+space
+                elif "SAME_CLOSED_RANGE_NUMERIC_FIELD" in token:
+                    add_token = False
+                    new_sql += token.replace("SAME_CLOSED_RANGE_NUMERIC_FIELD", same_field)+space
+                    numeric_check = True
+                elif "CLOSED_RANGE_NUMERIC_FIELD" in token:
+                    add_token = False
+                    field_name, values = self._search_field(["int", "mediumint", "double", "float", "decimal"], table_map)
+                    same_field = field_name
+                    new_sql += token.replace("CLOSED_RANGE_NUMERIC_FIELD", field_name)+space
+                    numeric_check = True
+                    closed_range = True
                 elif "NUMERIC_FIELD" in token:
                     add_token = False
                     field_name, values = self._search_field(["int", "mediumint", "double", "float", "decimal"], table_map)
@@ -1909,9 +1925,12 @@ class BaseRQGQueryHelper(object):
                         new_sql += token.replace("NUMERIC_VALUE", str(values[mid_value_index]))+space
                     elif "UPPER_BOUND_VALUE" in token:
                         numeric_check = False
+                        closed_range = False
                         add_token = False
                         new_sql += token.replace("UPPER_BOUND_VALUE", str(values[len(values) - 1])) + space
                     elif "LOWER_BOUND_VALUE" in token:
+                        if closed_range:
+                            numeric_check = False
                         add_token = False
                         new_sql += token.replace("LOWER_BOUND_VALUE", str(values[0])) + space
                     else:

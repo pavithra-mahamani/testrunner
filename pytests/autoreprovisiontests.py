@@ -708,6 +708,7 @@ class AutoReprovisionTests(unittest.TestCase):
         num_buckets = self.input.param("num-buckets", 1)
         bucketType = self.input.param("bucketType", "ephemeral")
         evictionPolicy = self.input.param("evictionPolicy", "noEviction")  # fullEviction
+        self.bucket_storage = self.input.param("bucket_storage", 'couchstore')
 
         # master = self.servers[0]
         # credentials = self.input.membase_settings
@@ -723,16 +724,27 @@ class AutoReprovisionTests(unittest.TestCase):
         if num_buckets == 1:
             bucket_name = "default"
             bucket_ram = info.memoryQuota * 2 // 3
-            rest.create_bucket(bucket=bucket_name,
-                               ramQuotaMB=bucket_ram,
-                               replicaNumber=self.replicas,
-                               proxyPort=info.moxi,
-                               bucketType=bucketType,
-                               evictionPolicy=evictionPolicy)
+            try:
+                rest.create_bucket(bucket=bucket_name,
+                                   ramQuotaMB=bucket_ram,
+                                   replicaNumber=self.replicas,
+                                   proxyPort=info.moxi,
+                                   bucketType=bucketType,
+                                   evictionPolicy=evictionPolicy,
+                                   storageBackend=self.bucket_storage)
+            except Exception:
+                rest.create_bucket(bucket=bucket_name,
+                                   ramQuotaMB=100,
+                                   replicaNumber=self.replicas,
+                                   proxyPort=info.moxi,
+                                   bucketType=bucketType,
+                                   evictionPolicy=evictionPolicy,
+                                   storageBackend=self.bucket_storage)
         else:
             created = BucketOperationHelper.create_multiple_buckets(
                 self.master, self.replicas, howmany=num_buckets,
-                bucketType=bucketType, evictionPolicy=evictionPolicy)
+                bucketType=bucketType, evictionPolicy=evictionPolicy,
+                bucket_storage=self.bucket_storage)
             self.assertTrue(created, "unable to create multiple buckets")
 
         buckets = rest.get_buckets()

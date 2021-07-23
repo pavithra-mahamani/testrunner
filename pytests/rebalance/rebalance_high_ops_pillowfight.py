@@ -7,7 +7,10 @@ from membase.api.rest_client import RestConnection, RestHelper
 from membase.helper.cluster_helper import ClusterOperationHelper
 from couchbase.bucket import Bucket
 from couchbase.cluster import Cluster
-from couchbase.exceptions import NotFoundError
+try:
+    from couchbase.exceptions import DocumentNotFoundException
+except:
+    from couchbase.exceptions import NotFoundError as DocumentNotFoundException
 
 from lib.couchbase_helper.tuq_helper import N1QLHelper
 from lib.memcached.helper.data_helper import VBucketAwareMemcached
@@ -331,7 +334,7 @@ class RebalanceHighOpsWithPillowFight(BaseTestCase):
                 try:
                     for key in keys:
                         bkt.get(key)
-                except NotFoundError:
+                except DocumentNotFoundException:
                     vBucketId = VBucketAware._get_vBucket_id(key)
                     errors.append("Missing key: {0}, VBucketId: {1}".
                                   format(key, vBucketId))
@@ -375,7 +378,9 @@ class RebalanceHighOpsWithPillowFight(BaseTestCase):
                                                  self.servers[
                                                  self.nodes_init:self.nodes_init + self.nodes_in],
                                                  [])
-        # rebalance.result()
+        reached = RestHelper(rest).rebalance_reached(retry_count=150)
+        self.assertTrue(reached, "rebalance failed, stuck or did not complete")
+        rebalance.result()
         rest.monitorRebalance(stop_if_loop=False)
         load_thread.join()
         if self.flusher_total_batch_limit:
@@ -386,8 +391,7 @@ class RebalanceHighOpsWithPillowFight(BaseTestCase):
         errors = self.check_data(self.master, bucket, num_items=num_items_to_validate)
         if errors:
             self.log.info("Missing keys count : {0}".format(len(errors)))
-        # for error in errors:
-        #     print error
+        self.sleep(120)
         if num_items_to_validate != rest.get_active_key_count(bucket):
             self.fail(
                 "FATAL: Data loss detected!! Docs loaded : {0}, docs present: {1}".
@@ -428,7 +432,9 @@ class RebalanceHighOpsWithPillowFight(BaseTestCase):
                                                  self.servers[
                                                  self.nodes_init:self.nodes_init + self.nodes_in],
                                                  [])
-        # rebalance.result()
+        reached = RestHelper(rest).rebalance_reached(retry_count=150)
+        self.assertTrue(reached, "rebalance failed, stuck or did not complete")
+        rebalance.result()
         rest.monitorRebalance(stop_if_loop=False)
         update_thread.join()
         if self.flusher_total_batch_limit:
@@ -439,8 +445,7 @@ class RebalanceHighOpsWithPillowFight(BaseTestCase):
         errors = self.check_data(self.master, bucket, num_items_to_validate, 0, True, self.num_items * 2)
         if errors:
             self.log.info("Missing keys count : {0}".format(len(errors)))
-        # for error in errors:
-        #     print error
+        self.sleep(120)
         if num_items_to_validate != rest.get_active_key_count(bucket):
             self.fail(
                 "FATAL: Data loss detected!! Docs loaded : {0}, docs present: {1}".

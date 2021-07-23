@@ -66,6 +66,8 @@ class FailoverTests(FailoverBaseTest):
             self.log.error("Please check configuration parameters: SKIPPING TEST.")
             return
 
+        # See MB-44548
+        self.sleep(120)
         # Find nodes that will under go failover
         if self.failoverMaster:
             self.chosen = RebalanceHelper.pick_nodes(
@@ -208,7 +210,11 @@ class FailoverTests(FailoverBaseTest):
             self.compare_vbucketseq_failoverlogs(new_vbucket_stats, new_failover_stats)
         # Verify Active and Replica Bucket Count
         if self.num_replicas > 0:
-            nodes = self.get_nodes_in_cluster(self.master)
+            if '.com' in self.master.ip or ':' in self.master.ip:
+                # for ipv6 hostnames, self.get_nodes_in_cluster is not working properly
+                nodes = self.filter_servers(self.servers, chosen)
+            else:
+                nodes = self.get_nodes_in_cluster(self.master)
             self.vb_distribution_analysis(servers=nodes, buckets=self.buckets, std=20.0 , total_vbuckets=self.total_vbuckets)
         self.log.info("End VERIFICATION for Rebalance after Failover Only")
 
@@ -298,7 +304,12 @@ class FailoverTests(FailoverBaseTest):
 
         # Verify Active and Replica Bucket Count
         if self.num_replicas > 0:
-            nodes = self.get_nodes_in_cluster(self.master)
+            if '.com' in self.master.ip or ':' in self.master.ip:
+                # for ipv6 hostnames, self.get_nodes_in_cluster is not working properly. Since its addback,all nodes
+                # must be in cluster
+                nodes = self.servers
+            else:
+                nodes = self.get_nodes_in_cluster(self.master)
             self.vb_distribution_analysis(servers=nodes, buckets=self.buckets, std=20.0 , total_vbuckets=self.total_vbuckets)
 
         self.log.info("End VERIFICATION for Add-back and rebalance")
@@ -458,7 +469,7 @@ class FailoverTests(FailoverBaseTest):
         failed_over.result()
         for task in compact_tasks:
             task.result()
-        msg = "rebalance failed while removing failover nodes {0}".format(node.id)
+        msg = "rebalance failed while removing failover nodes {0}".format([node.id for node in chosen])
         self.assertTrue(self.rest.monitorRebalance(stop_if_loop=True), msg=msg)
 
 
@@ -603,7 +614,7 @@ class FailoverTests(FailoverBaseTest):
         query["connectionTimeout"] = 60000
         query["full_set"] = "true"
         expected_rows = None
-        timeout = None
+        timeout = 1200
         if self.active_resident_threshold == 0:
             timeout = 2400
         if self.max_verify:

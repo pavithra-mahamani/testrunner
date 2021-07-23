@@ -1,20 +1,20 @@
-from basetestcase import BaseTestCase
-
-from couchbase_helper.documentgenerator import BlobGenerator
-from mc_bin_client import MemcachedError, MemcachedClient
-from collection.collections_rest_client import Collections_Rest
-from collection.collections_cli_client import Collections_CLI
-
-from TestInput import TestInputSingleton, TestInputServer
-from membase.api.rest_client import RestConnection
-from couchbase_helper.cluster import Cluster
-import logger
 import time
 
+import logger
+from gsi.newtuq import QueryTests
+from basetestcase import BaseTestCase
+from collection.collections_cli_client import CollectionsCLI
+from collection.collections_rest_client import CollectionsRest
+from collection.collections_stats import CollectionsStats
+from couchbase_helper.cluster import Cluster
 from lib.couchbase_helper.documentgenerator import SDKDataLoader
+from mc_bin_client import MemcachedError, MemcachedClient
+from membase.api.rest_client import RestConnection
+
+from TestInput import TestInputSingleton
 
 
-class basic_collections(BaseTestCase):
+class BasicCollections(QueryTests):
 
     def suite_setUp(self):
         pass
@@ -27,33 +27,35 @@ class basic_collections(BaseTestCase):
         self.master = self.servers[0]
         self.use_rest = self.input.param("use_rest", True)
         self.use_cli = self.input.param("use_cli", False)
-        self.num_items = self.input.param("items", 100000)
+        self.num_items = self.input.param("items", 100)
         self.value_size = self.input.param("value_size", 512)
-        self.rest = Collections_Rest(self.master)
-        self.cli = Collections_CLI(self.master)
-        #self.cli.enable_dp()
+        self.rest = CollectionsRest(self.master)
+        self.cli = CollectionsCLI(self.master)
+        # self.cli.enable_dp()
         self.conn = RestConnection(self.master)
-        #self.conn.delete_all_buckets()
+        self.stat = CollectionsStats(self.master)
+        self.conn.delete_all_buckets()
         time.sleep(5)
         try:
             self.conn.create_bucket(bucket=self.default_bucket_name,
-                               ramQuotaMB=256,
-                               proxyPort=11220)
+                                    ramQuotaMB=256,
+                                    proxyPort=11220)
         except Exception as e:
             pass
-        time.sleep(5)
+        # time.sleep(5)
+        self.skip_load = True
+        super(BasicCollections, self).setUp()
 
     def tearDown(self):
-        pass
-        #self.conn.delete_all_buckets()
+         self.conn.delete_all_buckets()
 
     def suite_tearDown(self):
         pass
 
     def test_valid_scope_name(self):
-        # epengine.basic_collections.basic_collections.test_valid_scope_name
+        # epengine.basic_collections.BasicCollections.test_valid_scope_name
         # bucket is created, create scope with valid and invalid names
-        valid_scope_names = ["MYSCPOE", "MY_SCOPE", "MY-Scope_27%", "Scope_With-Largename_81%Scope%abcdef1234",
+        valid_scope_names = ["MY_SCOPE", "MYSCOPE", "Scope__With--Exactly__30--Char", "Scope_With-Less_Than-30_Chars",
                              "8a", "A", "a", "aaa9999%"]
         for name in valid_scope_names:
             if self.use_rest:
@@ -69,7 +71,7 @@ class basic_collections(BaseTestCase):
                 self.fail("Scope creation failed, name={}".format(name))
 
     def test_invalid_scope_name(self):
-        invalid_scope_names = ["$scope", "%scope", "_myscope", "{scope", "s{[]/,.", "scope!@#^&*()", "!SCOPE"]
+        invalid_scope_names = ["$scope", "%scope", "_myscope", "{scope", "s{[]/,.", "scope!@#^&*()", "!SCOPE", "Scope_With-Largename_81%Scope%abcdef1234"]
         for name in invalid_scope_names:
             try:
                 if self.use_rest:
@@ -84,7 +86,6 @@ class basic_collections(BaseTestCase):
                 self.fail("Scope creation passed for invalid name={}".format(name))
             else:
                 self.log.info("Scope creation failed as expected for name={}".format(name))
-
 
     def test_valid_collection_name(self):
         scope_name = "myscope"
@@ -113,15 +114,15 @@ class basic_collections(BaseTestCase):
 
         invalid_collection_names = ["$collection", "%collection", "_mycollection",
                                     "{collection", "s{[]/,.",
-                                   "collection!@#^&*()", "!COLLECTIONS"]
+                                    "collection!@#^&*()", "!COLLECTIONS"]
         for name in invalid_collection_names:
             try:
                 if self.use_rest:
                     self.rest.create_collection(scope=scope_name, collection=name,
-                                                         bucket=self.default_bucket_name)
+                                                bucket=self.default_bucket_name)
                 elif self.use_cli:
                     self.cli.create_collection(scope=scope_name, collection=name,
-                                                        bucket=self.default_bucket_name)
+                                               bucket=self.default_bucket_name)
             except:
                 pass
 
@@ -155,21 +156,23 @@ class basic_collections(BaseTestCase):
                       .format(self.scope_num, self.collection_num, round(time.time() - start)))
 
     def test_delete_default_collection(self):
-        # epengine.basic_collections.basic_collections.test_delete_default_collection
+        # epengine.basic_collections.BasicCollections.test_delete_default_collection
         if self.use_rest:
-            status = self.rest.delete_collection(self.default_bucket_name, "_default", "_default")
+            status = self.rest.delete_collection(self.default_bucket_name, "_default", "default")
         elif self.use_cli:
-            status = self.cli.delete_collection(self.default_bucket_name, "_default", "_default")
-        if status is True:
-            self.log.fail("default collection deleted!")
+            status = self.cli.delete_collection(self.default_bucket_name, "_default", "default")
         else:
-            self.log.info("default collection delete failed as expected")
+            raise Exception("Choose either REST or CLI")
+        if status is False:
+            self.log.fail("Failed to delete default collection!")
+        else:
+            self.log.info("Default collection delete passed")
 
-    def test_load_collection(self):
+    def test_load_collections_in_bucket(self):
         import time
         start = time.time()
-        self.scope_num = self.input.param("num_scopes", 5)
-        self.collection_num = self.input.param("num_collections", 5)
+        self.scope_num = self.input.param("num_scopes", 2)
+        self.collection_num = self.input.param("num_collections", 2)
         self.bucket_name = self.input.param("bucket", self.default_bucket_name)
         try:
             self.rest.async_create_scope_collection(self.scope_num, self.collection_num, self.bucket_name)
@@ -191,22 +194,23 @@ class basic_collections(BaseTestCase):
         load = time.time()
         self.log.info("Done loading {} collections in bucket {} in {}s"
                       .format(self.collection_num, self.bucket_name, round(load - create)))
+        for bkt in self.buckets:
+            print(self.stat.get_collection_stats(bkt))
 
     def test_load_collections_in_scope(self):
         pass
 
-    def test_load_collections_in_bucket(self):
+    def test_load_collection(self):
         pass
 
     def test_memecached_basic_api(self):
-        # epengine.basic_collections.basic_collections.test_memecached_basic_api
+        # epengine.basic_collections.BasicCollections.test_memecached_basic_api
         scope_name = "ScopeWith30CharactersinName123"
-        Collection_name = "CollectionsWithLargeNamechecki"
+        collection_name = "CollectionsWithLargeNamechecki"
         self.rest.create_scope(scope=scope_name)
-        self.rest.create_collection(scope=scope_name, collection=Collection_name, bucket=self.default_bucket_name)
+        self.rest.create_collection(scope=scope_name, collection=collection_name, bucket=self.default_bucket_name)
 
-        collection = scope_name + "." + Collection_name
-        self.log.info("collection name is {}".format(collection))
+        self.log.info(f"scope name is {scope_name} and collection name is {collection_name}")
 
         self.sleep(10)
 
@@ -224,10 +228,44 @@ class basic_collections(BaseTestCase):
         self.log.info("get collections completed")
 
         try:
-            mc.set("key", 0, 0, "value", collection=collection)
-            flag, keyx, value = mc.get(key="key", collection=collection)
+            mc.set("key", 0, 0, "value", scope=scope_name, collection=collection_name)
+            flag, keyx, value = mc.get(key="key", scope=scope_name, collection=collection_name)
             print("flag:{} keyx:{} value:{}".format(flag, keyx, value))
 
         except MemcachedError as exp:
             self.fail("Exception with setting and getting the key in collections {0}".format(exp))
 
+    def test_collection_doc_count(self):
+        self.test_load_collections_in_bucket()
+        self.buckets = self.conn.get_buckets()
+        for bkt in self.buckets:
+            bkt_scopes = self.rest.get_bucket_scopes(bkt)
+            print(bkt_scopes)
+            for scope in bkt_scopes:
+                print("Items in {}->{} = {}".format(bkt, scope,
+                                                    self.stat.get_scope_item_count(bkt, scope)))
+                bkt_collections = self.rest.get_scope_collections(bkt, scope)
+                for collection in bkt_collections:
+                    print("Items in {}->{}->{} = {}"
+                          .format(bkt, scope, collection,
+                                  self.stat.get_collection_item_count(bkt, scope, collection)))
+
+    def test_load_data_to_collection_using_python_sdk(self):
+        scope = 'test_scope'
+        collection = 'test_collection'
+        for bucket in self.buckets:
+            self.rest.create_scope_collection(bucket=bucket.name, scope=scope, collection=collection)
+            gens_load = self.generate_docs(self.docs_per_day)
+            self.load(gens_load, flag=self.item_flag, verify_data=False, batch_size=1000, scope=scope,
+                      collection=collection)
+
+            count = 0
+            stat = 0
+            while count < 5:
+                stat = self.stat.get_collection_item_count(bucket, scope, collection)
+                if stat == 98784:
+                    break
+                self.sleep(2, "Stat not matching with expected value. Retrying")
+                count += 1
+            else:
+                self.fail(f"Actual docs {stat}, Expected docs 98784")

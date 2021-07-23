@@ -60,6 +60,11 @@ class HANDLER_CODE:
     BUCKET_OP_SOURCE_BUCKET_MUTATION_WITH_TIMERS_RECOVERY= 'handler_code/bucket_op_source_bucket_mutation_with_timer_recovery.js'
     BUCKET_OP_SOURCE_BUCKET_MUTATION_DELETE='handler_code/bucket_op_with_source_bucket_mutation_delete.js'
     BUCKET_OP_SOURCE_BUCKET_MUTATION_TIMERS_DELETE='handler_code/bucket_op_source_bucket_mutation_with_timer_delete.js'
+    CANCEL_TIMER_REBALANCE='handler_code/cancel_timer_rebalance.js'
+    BUCKET_OP_EXPIRED='handler_code/bucket_op_expired.js'
+    CANCEL_TIMER_RECOVERY='handler_code/cancel_timer_recovery.js'
+    BUCKET_OP_EXPIRED_RECOVERY='handler_code/bucket_op_expired_recovery.js'
+    N1QL_DELETE_QUERY_TEST='handler_code/n1ql_delete_query_test.js'
 
 class HANDLER_CODE_CURL:
     BUCKET_OP_WITH_CURL = 'handler_code/curl/bucket_op_curl.js'
@@ -97,3 +102,6 @@ class EXPORTED_FUNCTION:
     SBM_BUCKET_OP ='exported_functions/bucket_op_sbm.json'
     CURL_BUCKET_OP='exported_functions/bucket_op_curl.json'
     N1QL_OP='exported_functions/n1ql_op.json'
+    EXPIRY='exported_functions/expiry.json'
+    CANCEL_TIMERS='exported_functions/cancel_timers.json'
+    ADVANCE_OP='exported_functions/advance_bucket_op.json'

@@ -197,17 +197,22 @@ class RQGTestsNew(BaseRQGTests):
 
         n1ql_result = new_n1ql_result
         actual_result = n1ql_result
+        expected_result = sql_result
 
-        actual_result = sorted(actual_result)
-        expected_result = sorted(sql_result)
+        sort_key = None
+        if len(actual_result) > 0:
+           sort_key = list(actual_result[0].keys())[0]
+        actual_result.sort(key=lambda item: str(item.get(sort_key)) or "")
+        sql_result.sort(key=lambda item: str(item.get(sort_key)) or "")
 
         if len(actual_result) != len(expected_result):
             extra_msg = self._get_failure_message(expected_result, actual_result)
             raise Exception("Results are incorrect. Actual num %s. Expected num: %s. :: %s \n" % (len(actual_result), len(expected_result), extra_msg))
 
-        diffs = DeepDiff(actual_result, expected_result, ignore_order=True)
+        diffs = DeepDiff(actual_result, expected_result, ignore_order=True, ignore_string_case=True)
         if diffs:
-            raise Exception("Results are incorrect. " + diffs)
+            self.log.error(diffs)
+            raise Exception("Results are incorrect")
 
         msg = "The number of rows match but the results mismatch, please check"
         sorted_actual = self._sort_data(actual_result)
@@ -290,7 +295,7 @@ class RQGTestsNew(BaseRQGTests):
                 self.log.info(" N1QL QUERY :: {0}".format(prepared_query))
                 actual_result = self.n1ql_query_runner_wrapper(n1ql_query=prepared_query, server=self.n1ql_server, query_params=query_params, scan_consistency="request_plus")
             n1ql_result = actual_result["results"]
-
+            self._round_float_results(n1ql_result, self.float_round_level)
             # Run SQL Query
             sql_result = expected_result
 
@@ -305,7 +310,7 @@ class RQGTestsNew(BaseRQGTests):
                 if self.aggregate_pushdown:
                     sql_result = client._gen_json_from_results_repeated_columns(columns, rows)
                 else:
-                    sql_result = client._gen_json_from_results(columns, rows)
+                    sql_result = client._gen_json_from_results(columns, rows, round_level=self.float_round_level)
             client._close_connection()
             self.log.info(" result from n1ql query returns {0} items".format(len(n1ql_result)))
             self.log.info(" result from sql query returns {0} items".format(len(sql_result)))
@@ -319,7 +324,9 @@ class RQGTestsNew(BaseRQGTests):
                         return {"success": True, "result": "Pass"}
                 return {"success": False, "result": str("different results")}
             try:
-                self.n1ql_helper._verify_results_rqg(subquery, aggregate, sql_result=sql_result, n1ql_result=n1ql_result, hints=hints, aggregate_pushdown=self.aggregate_pushdown)
+                self.n1ql_helper._verify_results_rqg(subquery, aggregate, sql_result=sql_result, n1ql_result=n1ql_result,
+                                                     hints=hints, aggregate_pushdown=self.aggregate_pushdown,
+                                                     window_function_test=self.window_function_test, delta=self.delta)
             except Exception as ex:
                 self.log.info(ex)
                 traceback.print_exc()

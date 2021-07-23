@@ -25,7 +25,6 @@ class ntonencryptionTest(BaseTestCase):
 
     def setUp(self):
         super(ntonencryptionTest, self).setUp()
-        self._reset_original()
         self.bucket_list = RestConnection(self.master).get_buckets()
         self.shell = RemoteMachineShellConnection(self.master)
         self.item_flag = self.input.param("item_flag", 4042322160)
@@ -36,13 +35,21 @@ class ntonencryptionTest(BaseTestCase):
         self.hostname = self.input.param('hostname',False)
         self.x509enable = self.input.param("x509enable",False)
         self.wildcard_dns = self.input.param("wildcard_dns",None)
-        #ntonencryptionBase().setup_nton_cluster(self.servers,clusterEncryptionLevel=self.ntonencrypt_level)
+        if self.ntonencrypt == 'enable' and not self.x509enable:
+            ntonencryptionBase().setup_nton_cluster(self.servers,clusterEncryptionLevel=self.ntonencrypt_level)
     
     def tearDown(self):
         super(ntonencryptionTest, self).tearDown()
         ntonencryptionBase().disable_nton_cluster(self.servers)
         self._reset_original()
-    
+
+    def suite_setUp(self):
+        self.log.info("---------------Suite Setup---------------")
+
+    def suite_tearDown(self):
+        self.log.info("---------------Suite Teardown---------------")
+
+
     def _reset_original(self):
         self.log.info ("Reverting to original state - regenerating certificate and removing inbox folder")
         tmp_path = "/tmp/abcd.pem"

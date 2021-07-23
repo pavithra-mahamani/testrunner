@@ -10,12 +10,12 @@ from memcached.helper.kvstore import KVStore
 from fts.stable_topology_fts import StableTopFTS
 from pytests.fts.fts_callable import FTSCallable
 from cbas.cbas_functional_tests import CBASFunctionalTests
-# from 2i.indexscans_2i import SecondaryIndexingScanTests
+# from gsi.indexscans_gsi import SecondaryIndexingScanTests
 from testconstants import COUCHBASE_VERSION_2
 from testconstants import COUCHBASE_VERSION_3, COUCHBASE_FROM_VERSION_3
 from testconstants import SHERLOCK_VERSION, COUCHBASE_FROM_SHERLOCK,\
                           COUCHBASE_FROM_SPOCK, COUCHBASE_FROM_WATSON,\
-                          COUCHBASE_FROM_VULCAN
+                          COUCHBASE_FROM_VULCAN, COUCHBASE_FROM_CHESHIRE_CAT
 from couchbase.cluster import Cluster, PasswordAuthenticator
 from couchbase.exceptions import CouchbaseError, CouchbaseNetworkError, CouchbaseTransientError
 from security.rbac_base import RbacBase
@@ -571,11 +571,15 @@ class MultiNodesUpgradeTests(NewUpgradeBaseTest):
 
     def online_upgrade(self, services=None):
         servers_in = self.servers[self.nodes_init:self.num_servers]
-        self.cluster.rebalance(self.servers[:self.nodes_init], servers_in, [], services=services)
+        servers_out = self.servers[:self.nodes_init]
+        self.cluster.rebalance(self.servers[:self.nodes_init], servers_in, servers_out, services=services)
+        self.sleep(60)
+
         self.log.info("Rebalance in all {0} nodes" \
                       .format(self.input.param("upgrade_version", "")))
-        self.sleep(self.sleep_time)
-        status, content = ClusterOperationHelper.find_orchestrator(self.master)
+        self.log.info("Rebalanced out all old version nodes")
+
+        status, content = ClusterOperationHelper.find_orchestrator(servers_in[0])
         self.assertTrue(status, msg="Unable to find orchestrator: {0}:{1}". \
                         format(status, content))
         FIND_MASTER = False
@@ -591,10 +595,6 @@ class MultiNodesUpgradeTests(NewUpgradeBaseTest):
             raise Exception( \
                 "After rebalance in {0} nodes, {0} node doesn't become master" \
                     .format(self.input.param("upgrade_version", "")))
-
-        servers_out = self.servers[:self.nodes_init]
-        self.log.info("Rebalanced out all old version nodes")
-        self.cluster.rebalance(self.servers[:self.num_servers], [], servers_out)
 
     def online_upgrade_swap_rebalance(self):
         self._install(self.servers[:self.nodes_init])
@@ -826,6 +826,7 @@ class MultiNodesUpgradeTests(NewUpgradeBaseTest):
         self.cluster.rebalance(self.servers, [], upgrade_servers)
         # install the new version on the swapped out servers
         self._install(self.servers[self.swap_num_servers:self.nodes_init])
+        self.sleep(20, "wait for server is up after install")
         self.n1ql_server = self.get_nodes_from_services_map(
             service_type="n1ql")
         # Run during upgrade operations
@@ -834,13 +835,17 @@ class MultiNodesUpgradeTests(NewUpgradeBaseTest):
         for i in range(0, len(upgrade_servers)):
             self.cluster.rebalance(self.servers, [upgrade_servers[i]], [],
                                    services=[upgrade_services[i]])
+        self.sleep(30, "wait for rebalance complete")
 
         self._new_master(self.servers[self.swap_num_servers])
         # swap out the remaining half of the servers and rebalance
+        self.log.info("start to remove old version nodes")
         upgrade_servers = self.servers[:self.swap_num_servers]
-        self.cluster.rebalance(self.servers, [], upgrade_servers)
+        reb_status  = self.cluster.rebalance(self.servers, [], upgrade_servers)
+        self.assertTrue(reb_status, 'Rebalance out old nodes did not complete')
         # install the new version on the swapped out servers
         self._install(self.servers[:self.swap_num_servers])
+        self.sleep(20, "wait for server is up after install")
         for i in range(0, len(upgrade_servers)):
             self.cluster.rebalance(self.servers[self.swap_num_servers:self.nodes_init],
                                    [upgrade_servers[i]], [],
@@ -903,6 +908,7 @@ class MultiNodesUpgradeTests(NewUpgradeBaseTest):
         # Install initial version on the specified nodes
         self._install(self.servers[:self.nodes_init])
         # Configure the nodes with services
+        self.sleep(30, "wait for servers up")
         self.operations(self.servers[:self.nodes_init], services="kv,index,n1ql,kv,kv,index,n1ql,kv")
         # get the n1ql node which will be used in pre,during and post upgrade for running n1ql commands
         self.n1ql_server = self.get_nodes_from_services_map(
@@ -943,6 +949,7 @@ class MultiNodesUpgradeTests(NewUpgradeBaseTest):
 
         # rebalance in the failed over nodes
         self.cluster.rebalance(self.servers[:self.nodes_init], [], [])
+        self.sleep(20, "wait for rebalance complete")
 
         # failover another node, this is done so that the conditions of graceful failover are met, otherwise
         # hard failover will be implemented
@@ -968,6 +975,15 @@ class MultiNodesUpgradeTests(NewUpgradeBaseTest):
         self.cluster.rebalance(self.servers[:self.nodes_init], [], [])
         self._new_master(self.servers[self.swap_num_servers])
         upgrade_servers = self.servers[:self.swap_num_servers]
+        sleep_time = 0
+        reb_done = self.rest.monitorRebalance()
+        print("\nrebalance status: ", reb_done)
+        while not reb_done:
+            self.sleep(20, "wait for rebalance done")
+            sleep_time += 20
+            reb_done = self.rest.monitorRebalance()
+            if sleep_time == self.wait_timeout:
+                self.fail("Rebalance status does not update more than 60 secs after finish")
         # do a graceful failover of remaining nodes except 1
         self.rest.fail_over('ns_1@' + upgrade_servers[0].ip, graceful=True)
         self.sleep(timeout=60)
@@ -2388,11 +2404,13 @@ class MultiNodesUpgradeTests(NewUpgradeBaseTest):
             self.pre_upgrade(self.servers[:nodes_init])
         seqno_expected = 1
         if self.ddocs_num:
+            self.sleep(10)
             self.create_ddocs_and_views()
             if self.input.param('run_index', False):
                 self.verify_all_queries()
         """ from 5.5 we support replica index.  Need to test this feature. """
         if 5.5 <= float(self.initial_version[:3]) and self.num_index_replicas > 0:
+            self.sleep(10)
             self.create_index_with_replica_and_query()
             self.is_replica_index_in_pre_upgrade = True
 
@@ -2410,6 +2428,15 @@ class MultiNodesUpgradeTests(NewUpgradeBaseTest):
             if self.offline_failover_upgrade:
                 total_nodes = len(upgrade_nodes)
                 for server in upgrade_nodes:
+                    sleep_time = 0
+                    reb_done = self.rest.monitorRebalance()
+                    print("\nrebalance status: ", reb_done)
+                    while not reb_done:
+                        self.sleep(20, "wait for rebalance done")
+                        sleep_time += 20
+                        reb_done = self.rest.monitorRebalance()
+                        if sleep_time == self.wait_timeout:
+                            self.fail("Rebalance status does not update more than 60 secs after finish")
                     self.rest.fail_over('ns_1@' + upgrade_nodes[total_nodes - 1].ip,
                                                                       graceful=True)
                     self.sleep(timeout=60)
@@ -2523,9 +2550,13 @@ class MultiNodesUpgradeTests(NewUpgradeBaseTest):
                         RestConnection(self.master).delete_bucket("travel-sample")
                         self.sleep(10)
                         break
+                items_travel_sample = 63182
+                if cb_version[:5] in COUCHBASE_FROM_CHESHIRE_CAT:
+                    items_travel_sample = 63288
                 self.load_sample_buckets(servers=self.servers[:nodes_init],
                                          bucketName="travel-sample",
-                                         total_items=31591, rest=cbas_rest)
+                                         total_items=items_travel_sample,
+                                         rest=cbas_rest)
                 self.test_create_dataset_on_bucket()
         if after_upgrade_buckets_in is not False:
             self.bucket_size = 100
