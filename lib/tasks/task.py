@@ -6391,6 +6391,7 @@ class SDKLoadDocumentsTask(Task):
         else:
             self.bucket = bucket
         self.sdk_docloader = sdk_docloader
+        self.proc = None
 
     def execute_for_collection(self, collection, start_seq_num_shift=0):
         import subprocess
@@ -6414,18 +6415,18 @@ class SDKLoadDocumentsTask(Task):
                 command = command + ",".join(arr_fields_to_update)
         self.log.info(command)
         try:
-            proc = subprocess.Popen(command, stdout=subprocess.PIPE, shell=True)
-            out = proc.communicate(timeout=self.sdk_docloader.timeout)
+            self.proc = subprocess.Popen(command, stdout=subprocess.PIPE, shell=True)
+            out = self.proc.communicate(timeout=self.sdk_docloader.timeout)
             if self.sdk_docloader.get_sdk_logs:
                 self.sdk_docloader.set_sdk_results(out)
                 self.log.info(out[0].decode("utf-8"))
-            if proc.returncode != 0:
+            if self.proc.returncode != 0:
                 raise Exception("Exception in java sdk client to {}:{}\n{}".format(self.server.ip, self.bucket, out))
         except Exception as e:
-            proc.terminate()
+            self.proc.terminate()
             self.state = FINISHED
             self.set_exception(e)
-        proc.terminate()
+        self.proc.terminate()
         self.state = FINISHED
         self.set_result(True)
 
@@ -6445,6 +6446,11 @@ class SDKLoadDocumentsTask(Task):
         self.set_result(True)
         self.state = FINISHED
         task_manager.schedule(self)
+
+    def terminate(self):
+        if self.proc:
+            self.proc.terminate()
+            self.state = FINISHED
 
 # Runs java sdk client on a docker container on slave
 class DockerSDKLoadDocumentsTask(Task):

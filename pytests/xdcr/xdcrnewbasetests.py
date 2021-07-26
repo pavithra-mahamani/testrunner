@@ -234,7 +234,7 @@ class BUCKET_COLLECTIONS_DENSITY:
         self.density_map = {
             "low": {"num_scopes": 1, "num_collections_per_scope": 1, "num_docs_per_collection": 1000},
             "medium": {"num_scopes": 5, "num_collections_per_scope": 10, "num_docs_per_collection": 1000},
-            "high": {"num_scopes": 10, "num_collections_per_scope": 20, "num_docs_per_collection": 1000}
+            "high": {"num_scopes": 10, "num_collections_per_scope": 20, "num_docs_per_collection": 10000}
         }
         self.density = density
         self.num_scopes = 0
@@ -1738,6 +1738,50 @@ class CouchbaseCluster:
             )
         return tasks
 
+    def catapult_load_all_buckets_till_dgm(self, active_resident_threshold, items=10000, doc_size=512, timeout_mins=60):
+        self.__log.info("Loading keys to reach dgm limit using catapult")
+        items = int(items)
+        timeout = time.time() + timeout_mins * 60
+        start = items
+        loop = 1
+        for bucket in self.__buckets:
+            tasks = []
+            while time.time() < timeout:
+                items = items*loop
+                kv_gen = SDKDataLoader(doc_size=doc_size, num_ops=items, start_seq_num=start, percent_create=100, percent_update=0,
+                                  percent_delete=0, all_collections=True)
+                tasks.append(self.__clusterop.async_load_gen_docs(
+                    self.__master_node, bucket.name, kv_gen))
+                time.sleep(60*loop)
+                current_active_resident = StatsCommon.get_stats(
+                    [self.__master_node],
+                    bucket,
+                    '',
+                    'vb_active_perc_mem_resident')[self.__master_node]
+                self.__log.info(
+                    "Current resident ratio: %s, desired: %s bucket %s" % (
+                        current_active_resident,
+                        active_resident_threshold,
+                        bucket.name))
+                if int(current_active_resident) <= active_resident_threshold:
+                    for task in tasks:
+                        if task:
+                            task.terminate()
+                    self.__log.info(
+                        "Current resident ratio: %s, desired: %s bucket %s" % (
+                            current_active_resident,
+                            active_resident_threshold,
+                            bucket.name))
+                    break
+                start += items
+                loop += 1
+            else:
+                self.__log.error(
+                    "Timed out waiting for desired dgm%. Current resident ratio: %s, desired: %s bucket %s" % (
+                        current_active_resident,
+                        active_resident_threshold,
+                        bucket.name))
+
     def load_all_buckets_till_dgm(self, active_resident_threshold, items=0,
                                   value_size=512, exp=0, kv_store=1, flag=0,
                                   only_store_hash=True, batch_size=1000,
@@ -1754,60 +1798,63 @@ class CouchbaseCluster:
         @param pause_secs: pause for next batch load.
         @param timeout_secs: timeout
         """
-        items = int(items)
-        self.__log.info("First loading \"items\" {0} number keys to handle "
-                      "update/deletes in dgm cases".format(items))
-        self.load_all_buckets(items)
+        if self.use_java_sdk:
+            self.catapult_load_all_buckets_till_dgm(active_resident_threshold, items=10000, doc_size=value_size, timeout_mins=60)
+        else:
+            items = int(items)
+            self.__log.info("First loading \"items\" {0} number keys to handle "
+                          "update/deletes in dgm cases".format(items))
+            self.load_all_buckets(items)
 
-        self.__log.info("Now loading extra keys to reach dgm limit")
-        seed = "%s-key-" % self.__name
-        end = 0
-        for bucket in self.__buckets:
-            current_active_resident = StatsCommon.get_stats(
-                [self.__master_node],
-                bucket,
-                '',
-                'vb_active_perc_mem_resident')[self.__master_node]
-            start = items
-            end = start + batch_size * 10
-            while int(current_active_resident) > active_resident_threshold:
-                self.__log.info("loading %s keys ..." % (end-start))
-
-                kv_gen = BlobGenerator(
-                    seed,
-                    seed,
-                    value_size,
-                    start=start,
-                    end=end)
-
-                tasks = []
-                tasks.append(self.__clusterop.async_load_gen_docs(
-                    self.__master_node, bucket.name, kv_gen, bucket.kvs[kv_store],
-                    OPS.CREATE, exp, flag, only_store_hash, batch_size,
-                    pause_secs, timeout_secs, compression=self.sdk_compression))
-
-                for task in tasks:
-                    task.result()
-                start = end
-                end = start + batch_size * 10
+            self.__log.info("Now loading extra keys to reach dgm limit")
+            seed = "%s-key-" % self.__name
+            end = 0
+            for bucket in self.__buckets:
                 current_active_resident = StatsCommon.get_stats(
                     [self.__master_node],
                     bucket,
                     '',
                     'vb_active_perc_mem_resident')[self.__master_node]
-                self.__log.info(
-                    "Current resident ratio: %s, desired: %s bucket %s" % (
-                        current_active_resident,
-                        active_resident_threshold,
-                        bucket.name))
-            self.__log.info("Loaded a total of %s keys into bucket %s"
-                            % (end, bucket.name))
-        self.__kv_gen[OPS.CREATE] = BlobGenerator(
-                seed,
-                seed,
-                value_size,
-                start = 0,
-                end=end)
+                start = items
+                end = start + batch_size * 10
+                while int(current_active_resident) > active_resident_threshold:
+                    self.__log.info("loading %s keys ..." % (end-start))
+
+                    kv_gen = BlobGenerator(
+                        seed,
+                        seed,
+                        value_size,
+                        start=start,
+                        end=end)
+
+                    tasks = []
+                    tasks.append(self.__clusterop.async_load_gen_docs(
+                        self.__master_node, bucket.name, kv_gen, bucket.kvs[kv_store],
+                        OPS.CREATE, exp, flag, only_store_hash, batch_size,
+                        pause_secs, timeout_secs, compression=self.sdk_compression))
+
+                    for task in tasks:
+                        task.result()
+                    start = end
+                    end = start + batch_size * 10
+                    current_active_resident = StatsCommon.get_stats(
+                        [self.__master_node],
+                        bucket,
+                        '',
+                        'vb_active_perc_mem_resident')[self.__master_node]
+                    self.__log.info(
+                        "Current resident ratio: %s, desired: %s bucket %s" % (
+                            current_active_resident,
+                            active_resident_threshold,
+                            bucket.name))
+                self.__log.info("Loaded a total of %s keys into bucket %s"
+                                % (end, bucket.name))
+            self.__kv_gen[OPS.CREATE] = BlobGenerator(
+                    seed,
+                    seed,
+                    value_size,
+                    start = 0,
+                    end=end)
 
     def async_update_delete(
             self, op_type, perc=30, expiration=0, kv_store=1, num_items=1000):
@@ -2842,6 +2889,8 @@ class XDCRNewBaseTest(unittest.TestCase):
         sdk_compression = self._input.param("sdk_compression", True)
 
         collection_density = self._input.param("collection_density", "low")
+        if self._dgm_run:
+            collection_density = "medium"
         scope_num = BUCKET_COLLECTIONS_DENSITY(collection_density).num_scopes
         collection_num = BUCKET_COLLECTIONS_DENSITY(collection_density).num_collections
         if scope_num or collection_num:
@@ -2849,6 +2898,11 @@ class XDCRNewBaseTest(unittest.TestCase):
         counter = 1
         for _, nodes in self._input.clusters.items():
             cluster_nodes = copy.deepcopy(nodes)
+            if self.__bucket_storage == "magma":
+                for node in cluster_nodes:
+                    print("Enabling DP for %s" % node)
+                    cli = CouchbaseCLI(node)
+                    cli.enable_dp()
             if len(self.__cb_clusters) == int(self.__chain_length):
                 break
             self.__cb_clusters.append(
