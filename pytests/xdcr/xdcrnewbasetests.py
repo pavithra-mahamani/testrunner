@@ -2964,7 +2964,11 @@ class XDCRNewBaseTest(unittest.TestCase):
             counter += 1
 
         self.__cleanup_previous()
-        self.__init_clusters()
+
+        # if clusters are not initialized by install script
+        self.init_clusters = self._input.param("init_clusters", True)
+        if not self.init_clusters:
+            self.__init_clusters()
 
         self.builtin_user_id = self._input.param("builtin_user_id", "cbadminbucket")
         self.builtin_user_name = self._input.param("builtin_user_name", "cbadminbucket")
